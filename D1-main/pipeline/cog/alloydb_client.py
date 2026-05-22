@@ -13,7 +13,7 @@ Schema (created by setup_alloydb.sql or auto-created here):
         sub_id      TEXT,
         collection  TEXT NOT NULL,
         text        TEXT,
-        embedding   vector(768),
+        embedding   vector(3072),
         metadata    JSONB DEFAULT '{}'
     )
 
@@ -86,13 +86,14 @@ def _ensure_schema():
 
             if not table_exists:
                 # Fresh install — create with all columns
+                # gemini-embedding-001 outputs 3072-dimensional vectors
                 cur.execute("""
                     CREATE TABLE embeddings (
                         unique_id   TEXT PRIMARY KEY,
                         sub_id      TEXT DEFAULT '',
                         collection  TEXT NOT NULL DEFAULT '',
                         text        TEXT DEFAULT '',
-                        embedding   vector(768),
+                        embedding   vector(3072),
                         metadata    JSONB DEFAULT '{}'
                     )
                 """)
@@ -128,10 +129,21 @@ def _ensure_schema():
                 CREATE INDEX IF NOT EXISTS idx_embeddings_metadata_filename
                 ON embeddings ((metadata->>'filename'))
             """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_embeddings_hnsw
-                ON embeddings USING hnsw (embedding vector_cosine_ops)
-            """)
+
+            # Drop old HNSW index if it exists (HNSW has 2000-dim limit,
+            # gemini-embedding-001 outputs 3072 dims)
+            cur.execute("DROP INDEX IF EXISTS idx_embeddings_hnsw")
+
+            # IVFFlat supports >2000 dims but requires rows to exist
+            # for cluster computation. Skip gracefully if table is empty.
+            try:
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_embeddings_ivfflat
+                    ON embeddings USING ivfflat (embedding vector_cosine_ops)
+                    WITH (lists = 100)
+                """)
+            except Exception as e:
+                print(f"[ALLOYDB] IVFFlat index skipped (will retry when data exists): {e}")
     finally:
         conn.close()
 
