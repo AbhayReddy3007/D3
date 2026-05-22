@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-run_all.py — Local parallel pipeline orchestrator
-──────────────────────────────────────────────────
-Runs the full LOE pipeline locally, parallelising drug-level work
+run_all.py — Pipeline orchestrator (Cloud Run Jobs + local)
+──────────────────────────────────────────────────────────────
+Runs the full LOE pipeline, parallelising drug-level work
 within each stage using a process pool.
+
+Cloud Run Jobs support:
+  When CLOUD_RUN_TASK_COUNT > 1 each container only processes its
+  shard of drugs (determined by CLOUD_RUN_TASK_INDEX). This avoids
+  every task duplicating the full workload.
 
 Pipeline order (sequential between stages):
   1. Patents   — patent pipeline + BQ upload, parallelised across drugs
@@ -47,6 +52,36 @@ YELLOW = "\033[93m"
 BOLD   = "\033[1m"
 RESET  = "\033[0m"
 PY     = sys.executable
+
+
+# ── Cloud Run Jobs sharding ───────────────────────────────────────────────────
+
+def shard_drugs(drugs: list) -> list:
+    """
+    Return only this task's slice of drugs when running inside a
+    Cloud Run Job with multiple tasks.
+
+    Cloud Run sets:
+      CLOUD_RUN_TASK_INDEX  — 0-based index of this task
+      CLOUD_RUN_TASK_COUNT  — total number of tasks
+
+    If these vars are absent (local run) the full list is returned.
+    """
+    task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
+    task_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0"))
+
+    if task_count <= 1:
+        return drugs  # local / single-task — process everything
+
+    # Distribute drugs round-robin so the load is even when len(drugs)
+    # is not evenly divisible by task_count.
+    shard = [d for i, d in enumerate(drugs) if i % task_count == task_index]
+
+    print(
+        f"[SHARD] task {task_index + 1}/{task_count} → "
+        f"{len(shard)} of {len(drugs)} drug(s): {shard}"
+    )
+    return shard
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -207,7 +242,7 @@ def run_parallel(label, worker_fn, drugs, workers, dry_run=False):
     Prints progress and aborts if any drug fails.
     """
     if not drugs:
-        print(f"{YELLOW}No drugs to process. Skipping.{RESET}\n")
+        print(f"{YELLOW}No drugs to process for this task. Skipping.{RESET}\n")
         return
 
     total    = len(drugs)
@@ -274,6 +309,18 @@ def run_forecast(drugs, workers, dry_run=False):
 
 
 def run_merge(dry_run=False):
+    """
+    Merge runs once globally.  When sharded across Cloud Run tasks,
+    only task 0 executes the merge; other tasks skip it.
+    """
+    task_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0"))
+    task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
+
+    if task_count > 1 and task_index != 0:
+        print(f"{YELLOW}[SHARD] Merge skipped on task {task_index} "
+              f"(only task 0 runs merge){RESET}\n")
+        return
+
     banner("MERGE → Master_LOE")
     run_step("merge_to_master_loe.py", [PY, str(MERGE_SCRIPT)], dry_run=dry_run)
 
@@ -316,10 +363,21 @@ def main():
     args = parser.parse_args()
 
     t0 = time.time()
-    banner(f"LOE PIPELINE — mode={args.mode} | workers={args.workers}")
 
-    # Discover drugs once, reuse across stages
-    drugs = discover_drugs()
+    task_index = os.environ.get("CLOUD_RUN_TASK_INDEX", "N/A")
+    task_count = os.environ.get("CLOUD_RUN_TASK_COUNT", "N/A")
+    banner(
+        f"LOE PIPELINE — mode={args.mode} | workers={args.workers} | "
+        f"task={task_index}/{task_count}"
+    )
+
+    # Discover ALL drugs once, then shard for this task
+    all_drugs = discover_drugs()
+    drugs = shard_drugs(all_drugs)
+
+    if not drugs:
+        print(f"{YELLOW}This task has no drugs to process. Exiting cleanly.{RESET}")
+        return
 
     if args.mode == "all":
         run_patents(drugs, args.workers, args.dry_run)
