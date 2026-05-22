@@ -4,20 +4,17 @@ main.py — CLI entry point for the patent analysis pipeline.
 Runs without Google ADK — plain asyncio from the terminal.
 
 Usage:
-    # Process a single drug (10 patents indexed in parallel)
+    # Process a single drug
     python -m cog.main semaglutide
 
     # Process a single drug, specific jurisdictions
     python -m cog.main semaglutide --jurisdictions US EP
 
-    # Process ALL drugs found in GCS (one drug at a time, 10 patents in parallel each)
+    # Process ALL drugs found in GCS (one drug at a time)
     python -m cog.main --all
 
     # Force re-index (ignore cache)
     python -m cog.main semaglutide --reindex
-
-    # Override parallel patent count (default: 10)
-    python -m cog.main semaglutide --concurrency 5
 """
 
 import argparse
@@ -32,11 +29,6 @@ try:
     load_dotenv()
 except ImportError:
     pass  # Not needed on Cloud Run
-
-# Default number of patents to index in parallel within a single drug.
-# Matches MAX_CONCURRENCY in indexer.py — override via --concurrency or
-# the INDEXER_CONCURRENCY env var.
-DEFAULT_CONCURRENCY = 10
 
 
 def _print_single_drug_result(result: dict):
@@ -114,23 +106,22 @@ def _print_all_drugs_result(result: dict):
     print()
 
 
-async def run_single(drug_name: str, reindex: bool, jurisdictions: list, concurrency: int):
+async def run_single(drug_name: str, reindex: bool, jurisdictions: list):
     from .tools import get_dimension_i_patent_data
 
     result = await get_dimension_i_patent_data(
         drug_name=drug_name,
         reindex=reindex,
         jurisdictions=jurisdictions or None,
-        max_concurrency=concurrency,
     )
     _print_single_drug_result(result)
     return result
 
 
-async def run_all(concurrency: int):
+async def run_all():
     from .agent import process_all_drugs
 
-    result = await process_all_drugs(max_concurrency=concurrency)
+    result = await process_all_drugs()
     _print_all_drugs_result(result)
     return result
 
@@ -161,14 +152,6 @@ def main():
         default=None,
         help="Filter to specific jurisdictions (e.g. US EP).",
     )
-    parser.add_argument(
-        "--concurrency",
-        type=int,
-        default=DEFAULT_CONCURRENCY,
-        help=f"Number of patents to index in parallel within a single drug "
-             f"(default: {DEFAULT_CONCURRENCY}). Also controllable via the "
-             f"INDEXER_CONCURRENCY env var.",
-    )
 
     args = parser.parse_args()
 
@@ -181,10 +164,10 @@ def main():
     t0 = time.time()
 
     if args.all:
-        result = asyncio.run(run_all(concurrency=args.concurrency))
+        result = asyncio.run(run_all())
     else:
         result = asyncio.run(
-            run_single(args.drug_name, args.reindex, args.jurisdictions, args.concurrency)
+            run_single(args.drug_name, args.reindex, args.jurisdictions)
         )
 
     elapsed = time.time() - t0
