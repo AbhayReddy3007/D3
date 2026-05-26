@@ -28,9 +28,11 @@ $VPC_CONNECTOR = "pipeline-connector"     # your VPC connector for AlloyDB acces
 # Fill in ALL values below
 $ENV_VARS = @(
     "PROJECT_ID=$GCP_PROJECT",
+    "BQ_PROJECT_ID=$GCP_PROJECT",
     "BQ_UPLOAD_PROJECT=$GCP_PROJECT",
     "BQ_UPLOAD_DATASET=cognito_prod_datamart",
     "BQ_DATASET_ID=cognito_prod_datamart",
+    "BQ_TABLE_NAME=clinical_efficacy",
     "BQ_UPLOAD_LOCATION=$GCP_REGION",
     "GCS_BUCKET_NAME=YOUR_BUCKET_NAME_HERE",
     "GCS_PATENTS_PREFIX=patents",
