@@ -453,6 +453,158 @@ async def cleanup_uploaded_file(uploaded_file: object):
 
 
 # ─────────────────────────────────────────────
+# Fallback text extraction for image-only PDFs
+# ─────────────────────────────────────────────
+
+def extract_text_via_pymupdf(file_path: str, filename: str) -> Optional[str]:
+    """
+    Extract text from a PDF using PyMuPDF's built-in text extractor.
+
+    Returns the concatenated text from all pages, or None if the PDF
+    is image-only (no embedded text layer) or extraction fails.
+    """
+    try:
+        import fitz
+    except ImportError:
+        print(f"[PYMUPDF] pymupdf not available — cannot extract text for {filename}")
+        return None
+
+    try:
+        doc = fitz.open(file_path)
+        all_text = []
+        for page_num in range(len(doc)):
+            page_text = doc[page_num].get_text("text")
+            if page_text and page_text.strip():
+                all_text.append(page_text.strip())
+        doc.close()
+
+        combined = "\n\n".join(all_text)
+        if len(combined.strip()) < 100:
+            print(f"[PYMUPDF] {filename}: text layer too short ({len(combined)} chars) — likely image-only PDF")
+            return None
+
+        print(f"[PYMUPDF] {filename}: extracted {len(combined)} chars from text layer")
+        return combined
+    except Exception as e:
+        print(f"[PYMUPDF] Text extraction failed for {filename}: {e}")
+        return None
+
+
+def render_all_pages_as_pngs(
+    file_path: str, dpi: int = 200, max_pages: int = 50
+) -> List[bytes]:
+    """
+    Render all pages (up to max_pages) of a PDF as PNG byte strings.
+
+    Uses a moderate DPI (200) to balance OCR quality with file size,
+    since we're sending potentially many pages to Gemini Vision.
+    """
+    try:
+        import fitz
+    except ImportError:
+        raise ImportError("pymupdf is required for OCR text extraction")
+
+    doc = fitz.open(file_path)
+    pages_to_render = min(max_pages, len(doc))
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pngs = []
+    for i in range(pages_to_render):
+        pix = doc[i].get_pixmap(matrix=mat, alpha=False)
+        pngs.append(pix.tobytes("png"))
+    doc.close()
+    print(f"[OCR RENDER] Rendered {pages_to_render} page(s) at {dpi} DPI for {Path(file_path).name}")
+    return pngs
+
+
+_OCR_TEXT_EXTRACTION_PROMPT = (
+    "This is a scanned patent document (image-only PDF with no embedded text). "
+    "Please carefully OCR every page and extract ALL text exactly as it appears. "
+    "Include every section: cover page, patent number, all dates, inventors, "
+    "assignee, claims, description, abstract. "
+    "Return only plain text with no commentary or formatting."
+)
+
+
+async def extract_text_via_ocr(file_path: str, filename: str) -> Optional[str]:
+    """
+    OCR fallback for image-only PDFs.
+
+    Renders all pages as PNGs and sends them to Gemini Vision in batches
+    to extract the full text content. Pages are batched (up to 10 per call)
+    to stay within Gemini's input limits.
+    """
+    loop = asyncio.get_running_loop()
+
+    try:
+        png_list = await loop.run_in_executor(
+            None, render_all_pages_as_pngs, file_path
+        )
+    except ImportError as e:
+        print(f"[OCR] {e}")
+        return None
+    except Exception as e:
+        print(f"[OCR] Page rendering failed for {filename}: {e}")
+        return None
+
+    if not png_list:
+        return None
+
+    print(f"[OCR] Sending {len(png_list)} page(s) to Gemini Vision for {filename}...")
+
+    # Process pages in batches to avoid hitting input size limits
+    BATCH_SIZE = 10
+    all_text_parts = []
+
+    for batch_start in range(0, len(png_list), BATCH_SIZE):
+        batch = png_list[batch_start:batch_start + BATCH_SIZE]
+        batch_end = batch_start + len(batch)
+
+        contents = []
+        for png_bytes in batch:
+            contents.append(
+                types.Part.from_bytes(data=png_bytes, mime_type="image/png")
+            )
+
+        if len(png_list) > BATCH_SIZE:
+            contents.append(
+                f"{_OCR_TEXT_EXTRACTION_PROMPT}\n\n"
+                f"These are pages {batch_start + 1}-{batch_end} of {len(png_list)}."
+            )
+        else:
+            contents.append(_OCR_TEXT_EXTRACTION_PROMPT)
+
+        try:
+            response = await gemini_client.aio.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    temperature=0,
+                    max_output_tokens=65536,
+                ),
+            )
+            batch_text = response.text if response.text else ""
+            if batch_text.strip():
+                all_text_parts.append(batch_text.strip())
+                print(
+                    f"[OCR] Batch pages {batch_start + 1}-{batch_end}: "
+                    f"extracted {len(batch_text)} chars"
+                )
+            else:
+                print(f"[OCR] Batch pages {batch_start + 1}-{batch_end}: no text returned")
+
+        except Exception as e:
+            print(f"[OCR] Batch pages {batch_start + 1}-{batch_end} failed: {e}")
+
+    if not all_text_parts:
+        print(f"[OCR] No text extracted from any page of {filename}")
+        return None
+
+    combined = "\n\n".join(all_text_parts)
+    print(f"[OCR] {filename}: extracted {len(combined)} chars total via OCR")
+    return combined
+
+
+# ─────────────────────────────────────────────
 # Date extraction
 # ─────────────────────────────────────────────
 
@@ -1129,12 +1281,21 @@ async def _process_single_patent(
                 extract_dates_from_pdf(pf["path"], filename),
             )
 
+            # ── Fallback chain for image-only / scanned PDFs ─────────────
+            if not text:
+                print(f"[FALLBACK] Gemini text extraction returned nothing for {filename} — trying PyMuPDF text layer...")
+                text = extract_text_via_pymupdf(pf["path"], filename)
+
+            if not text:
+                print(f"[FALLBACK] No text layer found for {filename} — trying Gemini Vision OCR on rendered pages...")
+                text = await extract_text_via_ocr(pf["path"], filename)
+
             if text:
                 await index_text(drug_name, filename, text, collection, dates=dates)
                 if completed is not None:
                     _mark_completed(drug_name, filename, completed)
             else:
-                print(f"[WARNING] No text extracted from {filename}")
+                print(f"[WARNING] No text extracted from {filename} — all methods failed (Gemini / PyMuPDF / OCR)")
 
             await cleanup_uploaded_file(uploaded_file)
             await asyncio.sleep(0.5 + random.uniform(0, 0.5))
