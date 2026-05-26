@@ -5,6 +5,11 @@ run_all.py — Pipeline orchestrator (Cloud Run Jobs + local)
 Runs the full LOE pipeline, parallelising drug-level work
 within each stage using a process pool.
 
+Drug discovery:
+  Drugs are sourced from the `clinical_efficacy` BigQuery table
+  (the same table used by phase_fetcher.py). Only drugs present
+  in that table are processed.
+
 Cloud Run Jobs support:
   When CLOUD_RUN_TASK_COUNT > 1 each container only processes its
   shard of drugs (determined by CLOUD_RUN_TASK_INDEX). This avoids
@@ -111,43 +116,73 @@ def run_step(label, cmd, cwd=None, dry_run=False):
     print(f"  {GREEN}✓ Done in {elapsed:.1f}s{RESET}\n")
 
 
-# ── GCS drug discovery ───────────────────────────────────────────────────────
+# ── Drug discovery from BigQuery clinical_efficacy ────────────────────────────
 
 def discover_drugs():
-    """Discover all drug folders from GCS."""
+    """
+    Discover drugs from the clinical_efficacy BigQuery table.
+
+    Uses the same env vars as phase_fetcher.py:
+      BQ_PROJECT_ID  — GCP project  (fallback: PROJECT_ID)
+      BQ_DATASET_ID  — BQ dataset
+      BQ_TABLE_NAME  — table name   (fallback: 'clinical_efficacy')
+
+    Returns a sorted list of distinct, non-empty molecule names.
+    """
     try:
         from dotenv import load_dotenv
         load_dotenv()
     except ImportError:
         pass
 
-    from google.cloud import storage
+    from google.cloud import bigquery
     from google.oauth2 import service_account
 
-    bucket_name = os.getenv("GCS_BUCKET_NAME")
-    prefix      = os.getenv("GCS_PATENTS_PREFIX", "patents").rstrip("/") + "/"
+    project_id = (
+        os.getenv("BQ_PROJECT_ID")
+        or os.getenv("PROJECT_ID")
+        or os.getenv("BQ_UPLOAD_PROJECT")
+    )
+    dataset_id = os.getenv("BQ_DATASET_ID")
+    table_name = os.getenv("BQ_TABLE_NAME", "clinical_efficacy")
 
-    if not bucket_name:
-        print(f"{RED}ERROR: GCS_BUCKET_NAME not set{RESET}")
+    if not project_id or not dataset_id:
+        print(f"{RED}ERROR: BQ_PROJECT_ID / PROJECT_ID and BQ_DATASET_ID must be set{RESET}")
         sys.exit(1)
+
+    fq_table = f"{project_id}.{dataset_id}.{table_name}"
+    print(f"[DISCOVERY] Querying distinct drugs from {fq_table} ...")
 
     creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     if creds_path and os.path.exists(creds_path):
         creds  = service_account.Credentials.from_service_account_file(creds_path)
-        client = storage.Client(credentials=creds)
+        client = bigquery.Client(credentials=creds, project=project_id)
     else:
-        client = storage.Client()
+        client = bigquery.Client(project=project_id)
 
-    blobs = list(client.list_blobs(bucket_name, prefix=prefix))
-    prefix_depth = len(prefix.split("/")) - 1
-    folders = {}
-    for blob in blobs:
-        parts = blob.name.split("/")
-        if len(parts) > prefix_depth + 1:
-            folders[parts[prefix_depth]] = True
+    query = f"""
+    SELECT DISTINCT TRIM(molecule_name) AS drug
+    FROM `{fq_table}`
+    WHERE molecule_name IS NOT NULL
+      AND TRIM(molecule_name) != ''
+    ORDER BY drug
+    """
 
-    drugs = sorted(folders.keys())
-    print(f"[DISCOVERY] {len(drugs)} drug(s) in gs://{bucket_name}/{prefix}")
+    try:
+        rows = client.query(query).result()
+        drugs = [row.drug for row in rows]
+    except Exception as e:
+        print(f"{RED}ERROR: Failed to query {fq_table}: {e}{RESET}")
+        sys.exit(1)
+
+    if not drugs:
+        print(f"{RED}ERROR: No drugs found in {fq_table}{RESET}")
+        sys.exit(1)
+
+    print(f"[DISCOVERY] {len(drugs)} drug(s) from {fq_table}")
+    for i, d in enumerate(drugs):
+        print(f"  {i + 1:>3}. {d}")
+
     return drugs
 
 
@@ -371,7 +406,7 @@ def main():
         f"task={task_index}/{task_count}"
     )
 
-    # Discover ALL drugs once, then shard for this task
+    # Discover drugs from clinical_efficacy BQ table, then shard for this task
     all_drugs = discover_drugs()
     drugs = shard_drugs(all_drugs)
 
