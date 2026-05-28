@@ -57,9 +57,9 @@ def _print_single_drug_result(result: dict):
         print(f"  {'-'*84}")
         for p in patents:
             print(
-                f"  {p.get('patent_number','?'):<20} "
-                f"{p.get('jurisdiction','?'):<5} "
-                f"{p.get('tag','?'):<15} "
+                f"  {(p.get('patent_number') or '?'):<20} "
+                f"{(p.get('jurisdiction') or '?'):<5} "
+                f"{(p.get('tag') or '?'):<15} "
                 f"{(p.get('blocking_category') or 'N/A'):<20} "
                 f"{(p.get('filing_date') or '?'):<12} "
                 f"{(p.get('grant_date') or '?'):<12}"
