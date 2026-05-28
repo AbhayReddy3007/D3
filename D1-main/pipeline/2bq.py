@@ -214,6 +214,37 @@ def sanitise_bq_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# Columns that BigQuery expects to be numeric. Their build_rows() fallback is
+# the string "N/A", which breaks the DataFrame -> Parquet conversion
+# (ArrowInvalid: Could not convert 'N/A' ... to double). Coerce these to real
+# numbers so "N/A"/blank become NULL instead of a string.
+# Names are given post-sanitisation (spaces/punctuation -> "_").
+_NUMERIC_BQ_COLUMNS = [
+    "PTE_months",
+    "Est_Approval_Year",
+    "Exclusivity_Year",
+    "Controlling_Patent_Expiry_Year",
+    "Years_to_Entry",
+    "Avg_Years_to_Entry",
+    "Score",
+    "Avg_Years_to_Entry_US_EP",
+    "IP_Dimension_1_Score",
+]
+
+
+def coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert known-numeric columns to a numeric dtype, turning non-numeric
+    sentinels like 'N/A' into NaN (which BigQuery loads as NULL).
+    Run AFTER sanitise_bq_columns so the column names line up.
+    """
+    df = df.copy()
+    for col in _NUMERIC_BQ_COLUMNS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
 def table_exists(project_id: str, dataset_id: str, table_id: str) -> bool:
     try:
         from google.cloud import bigquery
@@ -286,6 +317,7 @@ def upload_to_bigquery(
         return False
 
     df = sanitise_bq_columns(df)
+    df = coerce_numeric_columns(df)
     table_ref = f"{project_id}.{dataset_id}.{table_id}"
 
     print(f"\n{'─'*50}")
@@ -465,4 +497,3 @@ Examples:
 
 if __name__ == "__main__":
     main()
-    
