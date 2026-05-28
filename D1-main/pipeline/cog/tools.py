@@ -64,6 +64,8 @@ from .approval_date_fetcher import fetch_approval_dates
 
 from .excel_exporter import export_to_excel, export_combined_excel
 
+from . import gcs_cache
+
 # ── Environment config ───────────────────────────────────────────────────────
 
 BQ_TABLE_NAME      = os.getenv("BQ_TABLE_NAME")
@@ -71,10 +73,10 @@ BQ_PROJECT_ID      = os.getenv("BQ_PROJECT_ID")
 BQ_DATASET_ID      = os.getenv("BQ_DATASET_ID")
 BQ_SERVICE_ACCOUNT = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 
-# ── Results cache (JSON file) ─────────────────────────────────────────────
+# ── Results cache (GCS-backed JSON) ──────────────────────────────────────────
 #
-# Structure:
-#   <RESULTS_CACHE_DIR>/<drug_name>.json
+# Structure in GCS:
+#   gs://{bucket}/pipeline_cache/results_cache/{drug_name}.json
 #     {
 #       "drug": "...",
 #       "analysis_date": "...",
@@ -82,19 +84,16 @@ BQ_SERVICE_ACCOUNT = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 #       "patents": [ {patent_dict}, ... ]
 #     }
 
-RESULTS_CACHE_DIR = Path(
-    os.getenv("RESULTS_CACHE_DIR", Path(__file__).parent / "results_cache")
-)
-RESULTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+_RESULTS_CACHE_SUBFOLDER = "results_cache"
 
 
-def _results_cache_path(drug_name: str) -> Path:
+def _results_cache_filename(drug_name: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name.strip().lower())
-    return RESULTS_CACHE_DIR / f"{safe}.json"
+    return f"{safe}.json"
 
 
 def _store_results(drug_name: str, patents: list, analysis_date: str, source_files: list):
-    """Stores the full analysis results for a drug as a JSON file."""
+    """Stores the full analysis results for a drug as a JSON file in GCS."""
     try:
         payload = {
             "drug":          drug_name,
@@ -102,9 +101,12 @@ def _store_results(drug_name: str, patents: list, analysis_date: str, source_fil
             "source_files":  sorted(source_files),
             "patents":       patents,
         }
-        path = _results_cache_path(drug_name)
-        path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-        print(f"[RESULTS CACHE] Stored {len(patents)} patent(s) for '{drug_name}' → {path.name}")
+        uri = gcs_cache.write_json(
+            _RESULTS_CACHE_SUBFOLDER,
+            _results_cache_filename(drug_name),
+            payload,
+        )
+        print(f"[RESULTS CACHE] Stored {len(patents)} patent(s) for '{drug_name}' → {uri}")
     except Exception as e:
         print(f"[RESULTS CACHE] Failed to store results: {e}")
 
@@ -115,7 +117,7 @@ def _load_cached_results(
     current_files: Optional[List[str]] = None,
 ) -> Optional[list]:
     """
-    Loads cached results for a drug if they exist and are not stale.
+    Loads cached results for a drug from GCS if they exist and are not stale.
 
     Staleness detection:
       - If the EXACT SAME set of files → full cache hit (return all results)
@@ -126,12 +128,14 @@ def _load_cached_results(
     Returns:
         List of patent dicts if fully cached, None otherwise.
     """
-    path = _results_cache_path(drug_name)
-    if not path.exists():
+    payload = gcs_cache.read_json(
+        _RESULTS_CACHE_SUBFOLDER,
+        _results_cache_filename(drug_name),
+    )
+    if payload is None:
         return None
 
     try:
-        payload      = json.loads(path.read_text(encoding="utf-8"))
         cached_files = set(payload.get("source_files", []))
         cached_date  = payload.get("analysis_date", "")
         patents      = payload.get("patents", [])
@@ -144,7 +148,6 @@ def _load_cached_results(
             current_files_set = set(current_files)
 
             if current_files_set == cached_files:
-                # Exact match — full cache hit
                 print(f"[RESULTS CACHE] Full cache hit for '{drug_name}' "
                       f"({len(patents)} patent(s), analysed: {cached_date})")
                 return patents
@@ -162,7 +165,6 @@ def _load_cached_results(
                       f"→ full re-analysis")
                 return None
         else:
-            # Fallback: count-based check
             if len(cached_files) != current_file_count:
                 print(f"[RESULTS CACHE] Cache stale for '{drug_name}': "
                       f"cached {len(cached_files)} vs current {current_file_count}")
@@ -172,7 +174,7 @@ def _load_cached_results(
                   f"(analysed: {cached_date})")
             return patents
 
-    except (json.JSONDecodeError, OSError) as e:
+    except Exception as e:
         print(f"[RESULTS CACHE] Failed to load cache for '{drug_name}': {e}")
 
     return None
