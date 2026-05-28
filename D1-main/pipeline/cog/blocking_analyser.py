@@ -2698,28 +2698,17 @@ async def _run_steps2_plus(
 
 
 # ─────────────────────────────────────────────
-# Per-patent analysis cache (JSON file)
+# Per-patent analysis cache (GCS-backed JSON)
 # ─────────────────────────────────────────────
-# Stores completed blocking analysis results per patent as JSON files
+# Stores completed blocking analysis results per patent as JSON files in GCS
 # so that re-runs only analyse NEW patents.
 #
-# Structure:
-#   <CACHE_DIR>/<drug_name>/
-#       <filename>.json        — one file per patent with the full result dict
-#
-# Simple, human-readable, no database dependency.
+# Structure in GCS:
+#   gs://{bucket}/pipeline_cache/analysis_cache/{drug_name}/{filename}.json
 
-_ANALYSIS_CACHE_DIR = Path(
-    os.getenv("ANALYSIS_CACHE_DIR", Path(__file__).parent / "analysis_cache")
-)
+from . import gcs_cache
 
-
-def _drug_cache_dir(drug_name: str) -> Path:
-    """Returns the cache directory for a specific drug, creating it if needed."""
-    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name.strip().lower())
-    d = _ANALYSIS_CACHE_DIR / safe_name
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+_ANALYSIS_CACHE_SUBFOLDER = "analysis_cache"
 
 
 def _cache_filename(filename: str) -> str:
@@ -2730,41 +2719,50 @@ def _cache_filename(filename: str) -> str:
 
 
 def store_patent_analysis(drug_name: str, filename: str, result: Dict) -> None:
-    """Store a single patent's completed analysis result as a JSON file."""
+    """Store a single patent's completed analysis result as a JSON file in GCS."""
     try:
-        cache_dir  = _drug_cache_dir(drug_name)
-        cache_file = cache_dir / _cache_filename(filename)
-        cache_file.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+        safe_drug = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name.strip().lower())
+        gcs_cache.write_json(
+            _ANALYSIS_CACHE_SUBFOLDER,
+            _cache_filename(filename),
+            result,
+            drug_name=safe_drug,
+        )
     except Exception as e:
         print(f"[ANALYSIS CACHE] Store failed for {filename}: {e}")
 
 
 def load_cached_patent_analysis(drug_name: str, filename: str) -> Optional[Dict]:
-    """Load a single patent's cached analysis result. Returns None if not cached."""
+    """Load a single patent's cached analysis result from GCS. Returns None if not cached."""
     try:
-        cache_file = _drug_cache_dir(drug_name) / _cache_filename(filename)
-        if cache_file.exists():
-            return json.loads(cache_file.read_text(encoding="utf-8"))
+        safe_drug = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name.strip().lower())
+        return gcs_cache.read_json(
+            _ANALYSIS_CACHE_SUBFOLDER,
+            _cache_filename(filename),
+            drug_name=safe_drug,
+        )
     except Exception:
-        pass
-    return None
+        return None
 
 
 def load_cached_patents_bulk(drug_name: str, filenames: List[str]) -> Dict[str, Dict]:
     """
-    Load cached analysis results for multiple filenames at once.
+    Load cached analysis results for multiple filenames at once from GCS.
     Returns {filename: patent_dict} for files that have cached results.
     """
-    cache_dir = _drug_cache_dir(drug_name)
+    safe_drug = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name.strip().lower())
     cached    = {}
 
     for filename in filenames:
-        cache_file = cache_dir / _cache_filename(filename)
         try:
-            if cache_file.exists():
-                patent = json.loads(cache_file.read_text(encoding="utf-8"))
+            patent = gcs_cache.read_json(
+                _ANALYSIS_CACHE_SUBFOLDER,
+                _cache_filename(filename),
+                drug_name=safe_drug,
+            )
+            if patent is not None:
                 cached[filename] = patent
-        except (json.JSONDecodeError, OSError) as e:
+        except Exception as e:
             print(f"[ANALYSIS CACHE] Failed to read cache for {filename}: {e}")
             continue
 
@@ -2772,23 +2770,24 @@ def load_cached_patents_bulk(drug_name: str, filenames: List[str]) -> Dict[str, 
 
 
 def invalidate_patent_cache(drug_name: str, filename: str) -> None:
-    """Remove a single patent's cached analysis."""
+    """Remove a single patent's cached analysis from GCS."""
     try:
-        cache_file = _drug_cache_dir(drug_name) / _cache_filename(filename)
-        if cache_file.exists():
-            cache_file.unlink()
+        safe_drug = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name.strip().lower())
+        gcs_cache.delete_blob(
+            _ANALYSIS_CACHE_SUBFOLDER,
+            _cache_filename(filename),
+            drug_name=safe_drug,
+        )
     except Exception:
         pass
 
 
 def invalidate_drug_cache(drug_name: str) -> None:
-    """Remove ALL cached analysis results for a drug."""
-    import shutil as _shutil
+    """Remove ALL cached analysis results for a drug from GCS."""
     try:
-        cache_dir = _drug_cache_dir(drug_name)
-        if cache_dir.exists():
-            count = len(list(cache_dir.glob("*.json")))
-            _shutil.rmtree(cache_dir)
+        safe_drug = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name.strip().lower())
+        count = gcs_cache.delete_prefix(_ANALYSIS_CACHE_SUBFOLDER, drug_name=safe_drug)
+        if count > 0:
             print(f"[ANALYSIS CACHE] Invalidated {count} cached result(s) for '{drug_name}'")
     except Exception as e:
         print(f"[ANALYSIS CACHE] Invalidation failed for '{drug_name}': {e}")
