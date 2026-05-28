@@ -72,13 +72,11 @@ try:
     _exporter = importlib.import_module(f"{_pkg}.excel_exporter")
     get_or_create_collection = _indexer.get_or_create_collection
     get_all_chunks           = _analyser.get_all_chunks
-    EXCEL_OUTPUT_DIR         = _exporter.EXCEL_OUTPUT_DIR
     _CHROMA_AVAILABLE        = True
 except Exception as _e:
     print(f"[WARNING] ChromaDB/local imports unavailable: {_e}")
     print("[WARNING] Step 2 will use Excel context only — no full patent text.")
     _CHROMA_AVAILABLE = False
-    EXCEL_OUTPUT_DIR = Path("patent_exports")
     def get_or_create_collection(*a, **kw): return None
     def get_all_chunks(*a, **kw): return []
 
@@ -1899,15 +1897,21 @@ def print_step3(df: pd.DataFrame) -> None:
 # Output paths & BQ target
 # ─────────────────────────────────────────────
 
-OUTPUT_DIR        = Path("patent_exports")
-OUTPUT_FILE       = OUTPUT_DIR / "forecast_s3.xlsx"
+OUTPUT_DIR        = None  # No longer used — output goes to GCS
+OUTPUT_FILE       = None
 _FORECAST_S3_BQ   = "cognito-prod-394707.cognito_prod_datamart.forecast_s3"
 
 
 def _save_excel(df: pd.DataFrame, path: str, sheet_name: str) -> None:
+    """Write an Excel file to GCS instead of local disk."""
     try:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        import sys, io
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from cog import gcs_cache
+
+        filename = Path(path).name
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name=sheet_name)
             ws = writer.sheets[sheet_name]
             ws.freeze_panes = "B2"
@@ -1917,7 +1921,17 @@ def _save_excel(df: pd.DataFrame, path: str, sheet_name: str) -> None:
                     for cell in col_cells
                 )
                 ws.column_dimensions[col_cells[0].column_letter].width = min(length + 4, 60)
-        print(f"Saved to: {path}")
+        buf.seek(0)
+
+        uri = gcs_cache.write_bytes(
+            "forecast_exports",
+            filename,
+            buf.getvalue(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        print(f"Saved to GCS: {uri}")
+    except Exception as e:
+        print(f"[ERROR] Failed to save Excel to GCS: {e}")
     except Exception as e:
         print(f"Export failed: {e}")
 
@@ -2086,9 +2100,8 @@ if __name__ == "__main__":
     forecast_s3 = merge_to_forecast_s3(step1_result, step2_result, step3_result)
 
     if not forecast_s3.empty:
-        # Save to Excel
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        _save_excel(forecast_s3, str(OUTPUT_FILE), "forecast_s3")
+        # Save to GCS
+        _save_excel(forecast_s3, "forecast_s3.xlsx", "forecast_s3")
 
         # Upload to BigQuery if requested
         if args.upload:
