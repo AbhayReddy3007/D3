@@ -303,6 +303,22 @@ def load_all_from_cache() -> List[dict]:
 # Upload
 # ─────────────────────────────────────────────
 
+def _is_rate_limit_error_message(msg: str) -> bool:
+    """Detect BigQuery 429 / rate-limit errors by message content.
+
+    pandas-gbq translates google.api_core.TooManyRequests into its own
+    GenericGBQException, so type-based catching is unreliable across
+    versions; we match on the message instead.
+    """
+    msg = msg.lower()
+    return (
+        "ratelimitexceeded" in msg
+        or "exceeded rate limits" in msg
+        or "too many table update" in msg
+        or "429" in msg
+    )
+
+
 def upload_to_bigquery(
     df: pd.DataFrame,
     project_id: str,
@@ -364,8 +380,12 @@ def upload_to_bigquery(
 
         # BigQuery throttles frequent table-update/load operations
         # (429 rateLimitExceeded). Retry with exponential backoff.
+        #
+        # NOTE: pandas-gbq translates the underlying google.api_core
+        # TooManyRequests into its own GenericGBQException, so we cannot
+        # rely on catching the google exception type. Instead we catch
+        # broadly and decide whether to retry by inspecting the message.
         import time
-        from google.api_core.exceptions import TooManyRequests, ServiceUnavailable
 
         max_retries = 6
         delay = 5  # seconds; doubles each attempt: 5,10,20,40,80,160
@@ -380,7 +400,9 @@ def upload_to_bigquery(
                     progress_bar=True,
                 )
                 break  # success
-            except (TooManyRequests, ServiceUnavailable) as e:
+            except Exception as e:
+                if not _is_rate_limit_error_message(str(e)):
+                    raise  # not a rate-limit error — fail immediately
                 if attempt == max_retries:
                     print(f"[BQ] ✗ Rate limit not cleared after {max_retries} attempts.")
                     raise
@@ -395,8 +417,17 @@ def upload_to_bigquery(
         return True
 
     except Exception as e:
-        print(f"[BQ] ✗ Upload FAILED: {e}")
-        traceback.print_exc()
+        if _is_rate_limit_error_message(str(e)):
+            print(f"[BQ] ✗ Upload FAILED — persistent rate limit on table {table_ref}.")
+            print("[BQ]   This table hit BigQuery's per-table modification limit")
+            print("[BQ]   (~1,500 load/append/DML ops per day, plus burst limits).")
+            print("[BQ]   Retries cannot clear a daily-quota exhaustion — it resets")
+            print("[BQ]   at 00:00 US/Pacific. To avoid this structurally, reduce how")
+            print("[BQ]   often this table is written (batch runs, or stage into a")
+            print("[BQ]   temp table and MERGE into the master less frequently).")
+        else:
+            print(f"[BQ] ✗ Upload FAILED: {e}")
+            traceback.print_exc()
         return False
 
 
