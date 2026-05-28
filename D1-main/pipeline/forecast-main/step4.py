@@ -35,14 +35,19 @@ DATASET_ID = "cognito_prod_datamart"
 TABLE_ID = "filing_pattern_table"
 CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 
-OUTPUT_DIR = Path("innovator_patterns")
+OUTPUT_DIR = None  # No longer used — output goes to GCS
+
+# Import GCS cache
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from cog import gcs_cache
+
+_STEP4_SUBFOLDER = "innovator_patterns"
 
 # ─────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────
 def log_error(msg):
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(msg + "\n")
+    print(f"[STEP4 ERROR] {msg}")
 
 # ─────────────────────────────────────────────
 # IMPORT LOCAL MODULES
@@ -150,19 +155,28 @@ def list_all_gcs_drugs():
 # CSV
 # ─────────────────────────────────────────────
 def save_drug_csv(drug, result):
-    file = OUTPUT_DIR / f"{drug}.csv"
-    with open(file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["Drug", "Company", "Characterization", "Confidence"])
+    """Write CSV to GCS instead of local disk."""
+    import io as _io
+    buf = _io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Drug", "Company", "Characterization", "Confidence"])
 
-        for inv in result.get("innovators", []):
-            writer.writerow([
-                drug,
-                inv.get("company"),
-                inv.get("characterization"),
-                inv.get("confidence"),
-            ])
-    return file
+    for inv in result.get("innovators", []):
+        writer.writerow([
+            drug,
+            inv.get("company"),
+            inv.get("characterization"),
+            inv.get("confidence"),
+        ])
+
+    uri = gcs_cache.write_bytes(
+        _STEP4_SUBFOLDER,
+        f"{drug}.csv",
+        buf.getvalue().encode("utf-8"),
+        content_type="text/csv",
+    )
+    print(f"[STEP4] CSV saved to GCS: {uri}")
+    return uri
 
 # ─────────────────────────────────────────────
 # PROCESS DRUG
@@ -204,8 +218,6 @@ async def process_drug(i, total, drug, semaphore, bq_client, results, failed):
 # RUN ALL
 # ─────────────────────────────────────────────
 async def run_all(drugs):
-
-    OUTPUT_DIR.mkdir(exist_ok=True)
 
     # ✅ INIT BIGQUERY
     bq_client = get_bq_client()
