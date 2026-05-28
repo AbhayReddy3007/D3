@@ -330,14 +330,34 @@ def upload_to_bigquery(
         action = "Appending to existing" if exists else "Creating new"
         print(f"\n[BQ] {action} table...")
 
-        pandas_gbq.to_gbq(
-            df,
-            destination_table=f"{dataset_id}.{table_id}",
-            project_id=project_id,
-            location=location,
-            if_exists="append",
-            progress_bar=True,
-        )
+        # BigQuery throttles frequent table-update/load operations
+        # (429 rateLimitExceeded). Retry with exponential backoff.
+        import time
+        from google.api_core.exceptions import TooManyRequests, ServiceUnavailable
+
+        max_retries = 6
+        delay = 5  # seconds; doubles each attempt: 5,10,20,40,80,160
+        for attempt in range(1, max_retries + 1):
+            try:
+                pandas_gbq.to_gbq(
+                    df,
+                    destination_table=f"{dataset_id}.{table_id}",
+                    project_id=project_id,
+                    location=location,
+                    if_exists="append",
+                    progress_bar=True,
+                )
+                break  # success
+            except (TooManyRequests, ServiceUnavailable) as e:
+                if attempt == max_retries:
+                    print(f"[BQ] ✗ Rate limit not cleared after {max_retries} attempts.")
+                    raise
+                print(
+                    f"[BQ] Rate limited (attempt {attempt}/{max_retries}): {e}. "
+                    f"Retrying in {delay}s..."
+                )
+                time.sleep(delay)
+                delay *= 2
 
         print(f"[BQ] ✓ Upload complete — {len(df)} row(s) → {table_ref}")
         return True
@@ -445,3 +465,4 @@ Examples:
 
 if __name__ == "__main__":
     main()
+    
