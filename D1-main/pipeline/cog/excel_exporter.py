@@ -2,13 +2,14 @@
 excel_exporter.py
 ──────────────────
 Handles:
-  - Per-drug Excel export  (_export_to_excel)
-  - Combined multi-drug Excel export  (_export_combined_excel)
+  - Per-drug Excel export  (export_to_excel)
+  - Combined multi-drug Excel export  (export_combined_excel)
 
-Output directory defaults to `patent_exports/` next to this file,
-or can be overridden via the EXCEL_OUTPUT_DIR env var.
+Output is written to GCS under:
+    gs://{bucket}/pipeline_cache/patent_exports/
 """
 
+import io
 import os
 import re
 from datetime import datetime
@@ -17,14 +18,13 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
+from . import gcs_cache
+
 # ─────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────
 
-EXCEL_OUTPUT_DIR = Path(
-    os.getenv("EXCEL_OUTPUT_DIR", Path(__file__).parent / "patent_exports")
-)
-EXCEL_OUTPUT_DIR.mkdir(exist_ok=True)
+_EXCEL_SUBFOLDER = "patent_exports"
 
 
 # ─────────────────────────────────────────────
@@ -38,7 +38,8 @@ def _format_approval_date(raw: Optional[str]) -> Optional[str]:
     raw = str(raw).strip()
     formats = [
         "%Y%m%d", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y",
-        "%d %B %Y", "%B %d, %Y", "%B %d %Y", "%d-%b-%Y", "%b %d, %Y",
+        "%B %d, %Y", "%b. %d, %Y", "%b %d, %Y",
+        "%d %B %Y", "%d-%b-%Y", "%b %d, %Y",
     ]
     for fmt in formats:
         try:
@@ -68,20 +69,12 @@ def export_to_excel(
     analysis_date: str,
 ) -> Optional[str]:
     """
-    Exports patent analysis results for a single drug to an Excel file.
-
-    Args:
-        drug_name:     Drug name string
-        patents:       List of patent dicts (fully enriched by pipeline)
-        analysis_date: ISO date string used in the filename (e.g. "2025-07-01")
+    Exports patent analysis results for a single drug to an Excel file in GCS.
 
     Returns:
-        Absolute path to the created Excel file, or None on failure.
+        GCS URI of the created Excel file, or None on failure.
     """
     try:
-        EXCEL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        print(f"[EXCEL] Output directory: {EXCEL_OUTPUT_DIR.resolve()}")
-
         rows = []
         for p in patents:
             jurisdiction = (p.get("jurisdiction") or "").upper()
@@ -105,16 +98,13 @@ def export_to_excel(
                 "Blocking Category":              p.get("blocking_category") or "N/A",
                 "Reason":                         p.get("reason") or "N/A",
 
-                # ── Step 1 ──
                 "Step 1 Claim Category":          p.get("claim_category") or "N/A",
 
-                # ── Step 2 summary ──
                 "Step 2 Matched Elements":        (
                     ", ".join(k for k, v in (p.get("step2_elements_present") or {}).items() if v)
                     or ("N/A" if p.get("tag") == "BLOCKING" else "None matched")
                 ),
 
-                # ── Step 2 individual element columns ──
                 "S2: Active Ingredient & Form":   (
                     str((p.get("step2_elements_present") or {}).get("active_ingredient_and_form", "N/A"))
                     if p.get("step2_elements_present") is not None else "N/A"
@@ -136,7 +126,6 @@ def export_to_excel(
                     if p.get("step2_elements_present") is not None else "N/A"
                 ),
 
-                # ── Step 3 ──
                 "Step 3 Technical Barrier":       (
                     "Yes" if p.get("step3_is_technical_barrier") is True
                     else "No" if p.get("step3_is_technical_barrier") is False
@@ -146,7 +135,6 @@ def export_to_excel(
                 "Step 3 Evidence Type":           p.get("step3_evidence_type") or "N/A",
                 "Step 3 Evidence Summary":        p.get("step3_evidence_summary") or "N/A",
 
-                # ── Step 4 ──
                 "Step 4 Blocking Indicator":      (
                     "Yes" if p.get("step4_is_blocking_indicator") is True
                     else "No" if p.get("step4_is_blocking_indicator") is False
@@ -170,7 +158,6 @@ def export_to_excel(
                 ),
                 "Step 4 Reason":                  p.get("step4_reason") or "N/A",
 
-                # ── Step 5 ──
                 "Step 5 Novel & Difficult":       (
                     "Yes" if p.get("step5_is_novel_and_difficult") is True
                     else "No" if p.get("step5_is_novel_and_difficult") is False
@@ -217,21 +204,28 @@ def export_to_excel(
         df          = pd.DataFrame(rows)
         safe_drug   = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name)
         safe_date   = analysis_date.replace("-", "")
-        output_path = EXCEL_OUTPUT_DIR / f"{safe_drug}_{safe_date}.xlsx"
+        filename    = f"{safe_drug}_{safe_date}.xlsx"
 
-        print(f"[EXCEL] Writing to: {output_path.resolve()}")
+        print(f"[EXCEL] Writing to GCS: {_EXCEL_SUBFOLDER}/{filename}")
 
-        with pd.ExcelWriter(str(output_path), engine="openpyxl") as writer:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Patents")
             _auto_width(writer.sheets["Patents"])
+        buf.seek(0)
 
-        print(f"[EXCEL] ✓ Exported: {output_path.resolve()}")
-        return str(output_path.resolve())
+        uri = gcs_cache.write_bytes(
+            _EXCEL_SUBFOLDER,
+            filename,
+            buf.getvalue(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+        print(f"[EXCEL] ✓ Exported: {uri}")
+        return uri
 
     except ImportError as e:
         print(f"[EXCEL] Missing dependency: {e}")
-    except PermissionError as e:
-        print(f"[EXCEL] Permission denied: {e}")
     except Exception as e:
         import traceback
         print(f"[EXCEL] Export failed: {e}")
@@ -246,22 +240,20 @@ def export_to_excel(
 
 def export_combined_excel(analysis_date: str) -> Optional[str]:
     """
-    Reads all per-drug Excel files from EXCEL_OUTPUT_DIR for the given analysis_date
+    Reads all per-drug Excel files from GCS for the given analysis_date
     and combines them into a single 'combined_<date>.xlsx' file.
 
-    Args:
-        analysis_date: ISO date string (e.g. "2025-07-01")
-
     Returns:
-        Absolute path to the combined Excel file, or None on failure.
+        GCS URI of the combined Excel file, or None on failure.
     """
     try:
-        EXCEL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         safe_date = analysis_date.replace("-", "")
 
+        # List all Excel files in the GCS cache subfolder
+        all_files = gcs_cache.list_blobs(_EXCEL_SUBFOLDER, suffix=".xlsx")
         excel_files = [
-            f for f in EXCEL_OUTPUT_DIR.glob(f"*_{safe_date}.xlsx")
-            if not f.name.startswith("combined_")
+            f for f in all_files
+            if f.endswith(f"_{safe_date}.xlsx") and not f.startswith("combined_")
         ]
 
         if not excel_files:
@@ -271,30 +263,41 @@ def export_combined_excel(analysis_date: str) -> Optional[str]:
         print(f"[COMBINED EXCEL] Combining {len(excel_files)} file(s)...")
 
         dfs = []
-        for f in sorted(excel_files):
+        for fname in sorted(excel_files):
             try:
-                df = pd.read_excel(f, sheet_name="Patents")
-                dfs.append(df)
-                print(f"[COMBINED EXCEL] + {f.name} ({len(df)} rows)")
+                data = gcs_cache.read_bytes(_EXCEL_SUBFOLDER, fname)
+                if data:
+                    df = pd.read_excel(io.BytesIO(data), sheet_name="Patents")
+                    dfs.append(df)
+                    print(f"[COMBINED EXCEL] + {fname} ({len(df)} rows)")
             except Exception as e:
-                print(f"[COMBINED EXCEL] Could not read {f.name}: {e}")
+                print(f"[COMBINED EXCEL] Could not read {fname}: {e}")
 
         if not dfs:
             print("[COMBINED EXCEL] No data to combine.")
             return None
 
-        combined    = pd.concat(dfs, ignore_index=True, join="outer").fillna("N/A")
-        output_path = EXCEL_OUTPUT_DIR / f"combined_{safe_date}.xlsx"
+        combined = pd.concat(dfs, ignore_index=True, join="outer").fillna("N/A")
+        combined_filename = f"combined_{safe_date}.xlsx"
 
-        with pd.ExcelWriter(str(output_path), engine="openpyxl") as writer:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             combined.to_excel(writer, index=False, sheet_name="All Patents")
             _auto_width(writer.sheets["All Patents"])
+        buf.seek(0)
+
+        uri = gcs_cache.write_bytes(
+            _EXCEL_SUBFOLDER,
+            combined_filename,
+            buf.getvalue(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
         print(
-            f"[COMBINED EXCEL] ✓ Saved: {output_path.resolve()} "
+            f"[COMBINED EXCEL] ✓ Saved: {uri} "
             f"({len(combined)} total rows)"
         )
-        return str(output_path.resolve())
+        return uri
 
     except Exception as e:
         import traceback
