@@ -193,7 +193,6 @@ def discover_drugs():
 def _patent_worker(drug, dry_run):
     """Patent pipeline + BQ upload for a single drug."""
     try:
-        cache_dir = BASE_DIR / "cog" / "results_cache"
         run_step(
             f"Patent pipeline: {drug}",
             [PY, "-m", "cog.main", drug],
@@ -201,7 +200,7 @@ def _patent_worker(drug, dry_run):
         )
         run_step(
             f"BQ upload: {drug}",
-            [PY, str(BQ_SCRIPT), "--drug", drug, "--cache-dir", str(cache_dir)],
+            [PY, str(BQ_SCRIPT), "--drug", drug],
             dry_run=dry_run,
         )
         return (drug, True, None)
