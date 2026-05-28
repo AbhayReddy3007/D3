@@ -37,9 +37,11 @@ import pandas as pd
 # Default config (matches excel_exporter.py)
 # ─────────────────────────────────────────────
 
-RESULTS_CACHE_DIR = Path(
-    os.getenv("RESULTS_CACHE_DIR", Path(__file__).parent / "results_cache")
-)
+# GCS-backed results cache
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cog import gcs_cache
+
+_RESULTS_CACHE_SUBFOLDER = "results_cache"
 
 DEFAULT_PROJECT  = os.getenv("BQ_UPLOAD_PROJECT",  "cognito-prod-394707")
 DEFAULT_DATASET  = os.getenv("BQ_UPLOAD_DATASET",  "cognito_prod_datamart")
@@ -223,52 +225,45 @@ def table_exists(project_id: str, dataset_id: str, table_id: str) -> bool:
 
 
 # ─────────────────────────────────────────────
-# Load from results cache
+# Load from GCS results cache
 # ─────────────────────────────────────────────
 
 def load_drug_from_cache(drug_name: str) -> Optional[dict]:
-    """Load a single drug's results from the JSON cache."""
+    """Load a single drug's results from the GCS JSON cache."""
     safe = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name.strip().lower())
-    path = RESULTS_CACHE_DIR / f"{safe}.json"
+    filename = f"{safe}.json"
 
-    if not path.exists():
-        print(f"[ERROR] Cache file not found: {path}")
+    payload = gcs_cache.read_json(_RESULTS_CACHE_SUBFOLDER, filename)
+    if payload is None:
+        print(f"[ERROR] Cache not found in GCS for: {drug_name}")
         print(f"[ERROR] Run the pipeline first: get_dimension_i_patent_data(\"{drug_name}\")")
         return None
 
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        drug = payload.get("drug", drug_name)
-        patents = payload.get("patents", [])
-        analysis_date = payload.get("analysis_date", "")
-        print(f"[CACHE] Loaded '{drug}' — {len(patents)} patent(s), analysed: {analysis_date}")
-        return payload
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"[ERROR] Failed to read cache: {e}")
-        return None
+    drug = payload.get("drug", drug_name)
+    patents = payload.get("patents", [])
+    analysis_date = payload.get("analysis_date", "")
+    print(f"[CACHE] Loaded '{drug}' — {len(patents)} patent(s), analysed: {analysis_date}")
+    return payload
 
 
 def load_all_from_cache() -> List[dict]:
-    """Load all drug results from the JSON cache."""
-    if not RESULTS_CACHE_DIR.exists():
-        print(f"[ERROR] Results cache directory not found: {RESULTS_CACHE_DIR}")
-        return []
-
-    cache_files = sorted(RESULTS_CACHE_DIR.glob("*.json"))
+    """Load all drug results from the GCS JSON cache."""
+    cache_files = gcs_cache.list_blobs(_RESULTS_CACHE_SUBFOLDER, suffix=".json")
     if not cache_files:
-        print(f"[ERROR] No cached results found in: {RESULTS_CACHE_DIR}")
+        print(f"[ERROR] No cached results found in GCS: {_RESULTS_CACHE_SUBFOLDER}")
         return []
 
     results = []
-    for path in cache_files:
+    for fname in sorted(cache_files):
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            drug = payload.get("drug", path.stem)
-            patents = payload.get("patents", [])
-            print(f"[CACHE] {drug}: {len(patents)} patent(s)")
-            results.append(payload)
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"[WARN] Skipping {path.name}: {e}")
+            payload = gcs_cache.read_json(_RESULTS_CACHE_SUBFOLDER, fname)
+            if payload:
+                drug = payload.get("drug", Path(fname).stem)
+                patents = payload.get("patents", [])
+                print(f"[CACHE] {drug}: {len(patents)} patent(s)")
+                results.append(payload)
+        except Exception as e:
+            print(f"[WARN] Skipping {fname}: {e}")
 
     return results
 
@@ -377,8 +372,6 @@ Examples:
 
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview rows without uploading")
-    parser.add_argument("--cache-dir", type=str, default=None,
-                        help=f"Results cache dir. Default: {RESULTS_CACHE_DIR}")
 
     parser.add_argument("--project", type=str, default=DEFAULT_PROJECT,
                         help=f"BQ project. Default: {DEFAULT_PROJECT}")
@@ -391,14 +384,10 @@ Examples:
 
     args = parser.parse_args()
 
-    global RESULTS_CACHE_DIR
-    if args.cache_dir:
-        RESULTS_CACHE_DIR = Path(args.cache_dir)
-
     print(f"\n{'='*60}")
     print(f"  LOE → BigQuery (direct upload)")
-    print(f"  Cache dir: {RESULTS_CACHE_DIR}")
-    print(f"  Target:    {args.project}.{args.dataset}.{args.table}")
+    print(f"  Cache:   GCS ({_RESULTS_CACHE_SUBFOLDER})")
+    print(f"  Target:  {args.project}.{args.dataset}.{args.table}")
     if args.dry_run:
         print(f"  Mode:      DRY RUN")
     print(f"{'='*60}\n")
