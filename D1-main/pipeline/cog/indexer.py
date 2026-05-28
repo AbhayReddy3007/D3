@@ -44,39 +44,46 @@ chroma_client = AlloyDBClient()
 print("[ALLOYDB] Client initialized")
 
 # ─────────────────────────────────────────────
-# Progress tracking — survives crashes
+# Progress tracking — GCS-backed (survives container restarts)
 # ─────────────────────────────────────────────
 
-PROGRESS_DIR = Path(__file__).parent / ".indexer_progress"
-PROGRESS_DIR.mkdir(exist_ok=True)
+from . import gcs_cache
+
+_PROGRESS_SUBFOLDER = "indexer_progress"
 
 
-def _progress_file_path(drug_name: str) -> Path:
-    """Return the path to the progress file for a given drug."""
+def _progress_filename(drug_name: str) -> str:
+    """Return the progress filename for a given drug."""
     safe = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name.strip())
-    return PROGRESS_DIR / f"progress_{safe}.json"
+    return f"progress_{safe}.json"
 
 
 def _load_progress(drug_name: str) -> set:
-    """Load the set of filenames already completed for this drug batch."""
-    pf = _progress_file_path(drug_name)
-    if pf.exists():
-        try:
-            data = json.loads(pf.read_text())
+    """Load the set of filenames already completed for this drug batch from GCS."""
+    try:
+        data = gcs_cache.read_json(
+            _PROGRESS_SUBFOLDER,
+            _progress_filename(drug_name),
+        )
+        if data is not None:
             completed = set(data.get("completed", []))
-            print(f"[RESUME] Found progress file for '{drug_name}': {len(completed)} patents already done")
+            print(f"[RESUME] Found progress for '{drug_name}': {len(completed)} patents already done")
             return completed
-        except (json.JSONDecodeError, KeyError):
-            return set()
+    except Exception:
+        pass
     return set()
 
 
 def _save_progress(drug_name: str, completed: set):
-    """Atomically save the set of completed filenames for this drug batch."""
-    pf = _progress_file_path(drug_name)
-    tmp = pf.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"completed": sorted(completed)}))
-    tmp.replace(pf)  # atomic rename on POSIX
+    """Save the set of completed filenames for this drug batch to GCS."""
+    try:
+        gcs_cache.write_json(
+            _PROGRESS_SUBFOLDER,
+            _progress_filename(drug_name),
+            {"completed": sorted(completed)},
+        )
+    except Exception as e:
+        print(f"[RESUME] Failed to save progress for '{drug_name}': {e}")
 
 
 def _mark_completed(drug_name: str, filename: str, completed: set):
@@ -87,10 +94,15 @@ def _mark_completed(drug_name: str, filename: str, completed: set):
 
 def _clear_progress(drug_name: str):
     """Remove progress file when the entire batch finishes successfully."""
-    pf = _progress_file_path(drug_name)
-    if pf.exists():
-        pf.unlink()
-        print(f"[RESUME] Cleared progress file for '{drug_name}' — batch complete")
+    try:
+        deleted = gcs_cache.delete_blob(
+            _PROGRESS_SUBFOLDER,
+            _progress_filename(drug_name),
+        )
+        if deleted:
+            print(f"[RESUME] Cleared progress for '{drug_name}' — batch complete")
+    except Exception:
+        pass
 
 # ─────────────────────────────────────────────
 # Constants
