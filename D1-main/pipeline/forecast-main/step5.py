@@ -939,17 +939,31 @@ def export_to_excel(assessment: Dict, output_path: str) -> Optional[str]:
 
     try:
         import openpyxl
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        import io as _io
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from cog import gcs_cache
+
         df = pd.DataFrame(rows)
-        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        buf = _io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Business Strategy")
             ws = writer.sheets["Business Strategy"]
             ws.freeze_panes = "A2"
             for col in ws.columns:
                 width = max((len(str(c.value or "")) for c in col), default=10)
                 ws.column_dimensions[col[0].column_letter].width = min(width + 4, 120)
-        print(f"[EXPORT] Saved: {output_path}")
-        return output_path
+        buf.seek(0)
+
+        filename = Path(output_path).name
+        uri = gcs_cache.write_bytes(
+            "company_analysis",
+            filename,
+            buf.getvalue(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        print(f"[EXPORT] Saved to GCS: {uri}")
+        return uri
     except Exception as e:
         print(f"[EXPORT] Failed: {e}")
         return None
@@ -992,8 +1006,6 @@ def _fetch_all_companies(therapy: str = "GLP-1") -> List[str]:
 
 
 async def _run_batch(companies: List[str], therapy_area: str, export: bool):
-    _OUTPUT_DIR = Path("company_analysis")
-    _OUTPUT_DIR.mkdir(exist_ok=True)
 
     succeeded, failed = 0, []
     for i, company in enumerate(companies, 1):
@@ -1009,7 +1021,7 @@ async def _run_batch(companies: List[str], therapy_area: str, export: bool):
             print_assessment(assessment)
             if export:
                 safe = company.lower().replace(" ", "_").replace("/", "_")
-                export_to_excel(assessment, str(_OUTPUT_DIR / f"{safe}.xlsx"))
+                export_to_excel(assessment, f"{safe}.xlsx")
             succeeded += 1
         except Exception as e:
             print(f"[ERROR] {company}: {e}")
@@ -1054,7 +1066,7 @@ if __name__ == "__main__":
         print_assessment(assessment)
         if args.export:
             safe = args.company.lower().replace(" ", "_")
-            export_to_excel(assessment, args.output or f"company_analysis/{safe}.xlsx")
+            export_to_excel(assessment, args.output or f"{safe}.xlsx")
 
     else:
         # ── Batch ─────────────────────────────────────────────────────────────
