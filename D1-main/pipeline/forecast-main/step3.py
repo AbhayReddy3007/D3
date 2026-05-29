@@ -55,21 +55,20 @@ load_dotenv(override=True)
 # ── Make local modules importable when run as a standalone script ─────────────
 _here   = Path(__file__).resolve().parent
 _parent = _here.parent
-_pkg    = _here.name
 
 for _p in [str(_here), str(_parent)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-_init = _here / "__init__.py"
-if not _init.exists():
-    _init.touch()
-
-import importlib
+# Note: `forecast-main` cannot be a Python package (hyphen in the directory
+# name makes it unimportable), so all helpers we need live in the sibling
+# `cog/` package. Importing from `cog` works for both interactive runs
+# (script mode, after sys.path insert above) and pipeline orchestration.
+import importlib  # still used below for optional/dynamic loads
 try:
-    _indexer  = importlib.import_module(f"{_pkg}.indexer")
-    _analyser = importlib.import_module(f"{_pkg}.blocking_analyser")
-    _exporter = importlib.import_module(f"{_pkg}.excel_exporter")
+    from cog import indexer as _indexer
+    from cog import blocking_analyser as _analyser
+    from cog import excel_exporter as _exporter
     get_or_create_collection = _indexer.get_or_create_collection
     get_all_chunks           = _analyser.get_all_chunks
     _CHROMA_AVAILABLE        = True
@@ -407,8 +406,9 @@ def _parse_date_or_year(val):
 _APPROVAL_FETCH_AVAILABLE = False
 _fetch_approval_for_molecules = None
 try:
-    _pkg_name_phase = Path(__file__).resolve().parent.name
-    _fetcher_mod = importlib.import_module(f"{_pkg_name_phase}.approval_date_fetcher")
+    # approval_date_fetcher lives in cog/, not in forecast-main/ (which can
+    # never be a Python package — the hyphen makes it unimportable).
+    from cog import approval_date_fetcher as _fetcher_mod
     _raw_fetch = _fetcher_mod.fetch_approval_dates
 
     async def _fetch_approval_for_molecules(molecules: list) -> dict:
@@ -424,8 +424,8 @@ try:
         return results
 
     _APPROVAL_FETCH_AVAILABLE = True
-except Exception:
-    pass
+except Exception as _e:
+    print(f"[WARNING] approval_date_fetcher unavailable: {_e}")
 
 
 # ─────────────────────────────────────────────
@@ -435,7 +435,8 @@ except Exception:
 _GCS_DRUG_LIST_AVAILABLE = False
 _list_gcs_drug_names_fn = None
 try:
-    _gcs_mod = importlib.import_module(f"{_pkg_name_phase}.gcs_lister")
+    # gcs_lister lives in cog/, not in forecast-main/
+    from cog import gcs_lister as _gcs_mod
     _gcs_client_fn     = _gcs_mod.get_gcs_client
     _gcs_bucket        = _gcs_mod.GCS_BUCKET_NAME
     _gcs_prefix        = _gcs_mod.GCS_PATENTS_PREFIX
