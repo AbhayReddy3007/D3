@@ -199,6 +199,35 @@ def load_loe_table() -> pd.DataFrame:
         rename_map = {k: v for k, v in _BQ_COL_MAP.items() if k in df.columns}
         df = df.rename(columns=rename_map)
 
+        # ── Deduplicate ───────────────────────────────────────────────────
+        # loe_table is written with `if_exists="append"` (see 2bq.py), so
+        # every pipeline run for a drug appends a fresh copy of every patent
+        # row. Over multiple runs this accumulates duplicates and silently
+        # inflates downstream calculations. Drop duplicates on the natural
+        # key (Drug Name, Patent Number, Jurisdiction). keep='last' favours
+        # whichever row pandas received last from BigQuery — that ordering
+        # isn't strictly deterministic without ORDER BY in the SQL, but it
+        # is consistent within a single load and definitively better than
+        # double-counting. A timestamp column on the table would let us
+        # pick "newest" properly; without one this is the safe fix.
+        dedupe_keys = [k for k in ("Drug Name", "Patent Number", "Jurisdiction") if k in df.columns]
+        if dedupe_keys:
+            before = len(df)
+            df = df.drop_duplicates(subset=dedupe_keys, keep="last").reset_index(drop=True)
+            removed = before - len(df)
+            if removed:
+                print(
+                    f"[INPUT 1] Dropped {removed} duplicate row(s) on "
+                    f"{dedupe_keys} (kept last); {len(df)} unique row(s) remain."
+                )
+            else:
+                print(f"[INPUT 1] No duplicates found on {dedupe_keys}.")
+        else:
+            print(
+                f"[INPUT 1] Skipping dedupe — none of "
+                f"['Drug Name','Patent Number','Jurisdiction'] present in columns."
+            )
+
         print(f"[INPUT 1] Renamed columns: {list(df.columns)}\n")
         return df
     except Exception as e:
