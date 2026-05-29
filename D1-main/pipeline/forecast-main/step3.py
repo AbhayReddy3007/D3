@@ -447,8 +447,10 @@ def _process_phase_input(clinical_df: pd.DataFrame) -> pd.DataFrame:
     Steps:
       1. Normalise phases (3a→3, III→3)
       2. Keep earliest date per molecule per phase
-      3. Drop original Phase 1/2/4
-      4. Calculate Phase 2 = Phase 3 − 3 years, Phase 1 = Phase 3 − 4 years
+      3. Drop Phase 4 (handled via Marketed)
+      4. Use real Phase 1 / Phase 2 trial_start_date when present;
+         only derive missing ones from Phase 3
+         (Phase 2 = P3 − 3 yrs, Phase 1 = P3 − 4 yrs)
       5. Fetch approval dates for marketed drugs only
       6. Filter to GCS drugs only
 
@@ -479,12 +481,27 @@ def _process_phase_input(clinical_df: pd.DataFrame) -> pd.DataFrame:
     result = df.groupby([mol_col, "Normalised Phase"], sort=False).first().reset_index()
     result = result.drop(columns=["_parsed_date"])
 
-    # Drop original Phase 1, 2, 4
-    result = result[~result["Normalised Phase"].isin(["Phase 1", "Phase 2", "Phase 4"])]
+    # Drop Phase 4 (handled separately via Marketed). Keep Phase 1 and Phase 2
+    # rows if clinical_efficacy provides their own trial_start_date — those
+    # are real observed values and should be preferred over derived ones.
+    result = result[result["Normalised Phase"] != "Phase 4"]
 
-    # Calculate Phase 1/2 from Phase 3
+    # Track which (molecule, phase) combinations already have a REAL start
+    # date from clinical_efficacy. We will only synthesise Phase 1 or Phase 2
+    # rows for drugs where the real value is missing.
+    real_phases_by_mol: Dict[str, set] = {}
+    for _, row in result.iterrows():
+        m = str(row[mol_col]).strip()
+        p = str(row["Normalised Phase"]).strip()
+        if p in ("Phase 1", "Phase 2"):
+            real_phases_by_mol.setdefault(m, set()).add(p)
+
+    # Calculate Phase 1/2 from Phase 3 ONLY when the real value is missing
+    # for that drug. Phase 2 = Phase 3 − 3 years, Phase 1 = Phase 3 − 4 years.
     phase3_rows = result[result["Normalised Phase"] == "Phase 3"].copy()
     new_rows = []
+    derived_count = 0
+    skipped_count = 0
     for _, row in phase3_rows.iterrows():
         p3_date = _parse_date_or_year(row[date_col])
         if pd.isna(p3_date):
@@ -500,26 +517,52 @@ def _process_phase_input(clinical_df: pd.DataFrame) -> pd.DataFrame:
         p2_date = p3_date - relativedelta(years=3)
         p1_date = p3_date - relativedelta(years=4)
 
-        p2_row = row.copy()
-        p2_row["Normalised Phase"] = "Phase 2"
-        p2_row[date_col] = p2_date.year if is_year else p2_date
-        p2_row[phase_col] = "Phase 2 (calculated)"
-        new_rows.append(p2_row)
+        have_real = real_phases_by_mol.get(str(mol_name).strip(), set())
 
-        p1_row = row.copy()
-        p1_row["Normalised Phase"] = "Phase 1"
-        p1_row[date_col] = p1_date.year if is_year else p1_date
-        p1_row[phase_col] = "Phase 1 (calculated)"
-        new_rows.append(p1_row)
+        if "Phase 2" not in have_real:
+            p2_row = row.copy()
+            p2_row["Normalised Phase"] = "Phase 2"
+            p2_row[date_col] = p2_date.year if is_year else p2_date
+            p2_row[phase_col] = "Phase 2 (calculated)"
+            new_rows.append(p2_row)
+            derived_count += 1
+        else:
+            skipped_count += 1
+
+        if "Phase 1" not in have_real:
+            p1_row = row.copy()
+            p1_row["Normalised Phase"] = "Phase 1"
+            p1_row[date_col] = p1_date.year if is_year else p1_date
+            p1_row[phase_col] = "Phase 1 (calculated)"
+            new_rows.append(p1_row)
+            derived_count += 1
+        else:
+            skipped_count += 1
 
         if is_year:
-            print(f"  [PHASE] {mol_name}: P3={p3_date.year} → P2={p2_date.year} → P1={p1_date.year}")
+            print(
+                f"  [PHASE] {mol_name}: P3={p3_date.year} "
+                f"→ P2={p2_date.year}{' (real exists, skipped)' if 'Phase 2' in have_real else ''} "
+                f"→ P1={p1_date.year}{' (real exists, skipped)' if 'Phase 1' in have_real else ''}"
+            )
         else:
-            print(f"  [PHASE] {mol_name}: P3={p3_date.strftime('%d-%m-%Y')} → P2={p2_date.strftime('%d-%m-%Y')} → P1={p1_date.strftime('%d-%m-%Y')}")
+            print(
+                f"  [PHASE] {mol_name}: P3={p3_date.strftime('%d-%m-%Y')} "
+                f"→ P2={p2_date.strftime('%d-%m-%Y')}{' (real exists, skipped)' if 'Phase 2' in have_real else ''} "
+                f"→ P1={p1_date.strftime('%d-%m-%Y')}{' (real exists, skipped)' if 'Phase 1' in have_real else ''}"
+            )
 
     if new_rows:
         result = pd.concat([result, pd.DataFrame(new_rows)], ignore_index=True)
-        print(f"[PHASE] Added {len(new_rows)} calculated Phase 1/Phase 2 rows")
+        print(
+            f"[PHASE] Added {derived_count} calculated Phase 1/2 row(s); "
+            f"kept {skipped_count} real Phase 1/2 date(s) from clinical_efficacy"
+        )
+    elif skipped_count:
+        print(
+            f"[PHASE] Used {skipped_count} real Phase 1/2 date(s) from clinical_efficacy "
+            f"— no derivation needed"
+        )
 
     # Fetch approval dates for marketed drugs only
     if _APPROVAL_FETCH_AVAILABLE:
@@ -1221,8 +1264,9 @@ async def step2_patent_layering() -> pd.DataFrame:
 # This step OWNS the phase timeline construction:
 #   1. Loads clinical trial data from BigQuery (clinical_efficacy)
 #   2. Normalises phases (3a→3, III→3, etc.)
-#   3. Drops original Phase 1/2/4; calculates Phase 2 = Phase 3 − 3 yrs,
-#      Phase 1 = Phase 3 − 4 yrs
+#   3. Drops Phase 4 (handled via Marketed). Keeps real Phase 1 / Phase 2
+#      trial_start_date from clinical_efficacy when present, and only
+#      derives missing ones from Phase 3 (Phase 2 = P3 − 3 yrs, Phase 1 = P3 − 4 yrs)
 #   4. Fetches live approval dates for marketed drugs (approval_date_fetcher)
 #   5. Fetches regulatory submission dates via Gemini Search
 #   6. Filters to GCS drugs
@@ -1235,7 +1279,8 @@ async def step3_build_phase_timelines(drug_names: List[str]) -> Dict[str, List]:
 
     Pipeline:
       1. Load clinical_efficacy from BigQuery
-      2. Normalise phases, calculate Phase 1/2 from Phase 3
+      2. Normalise phases. Keep real Phase 1/2 trial_start_date when
+         present; only calculate from Phase 3 (P2=P3−3y, P1=P3−4y) when missing.
       3. Fetch approval dates for marketed drugs
       4. Fetch regulatory submission dates via Gemini Search
       5. Filter to GCS drugs
