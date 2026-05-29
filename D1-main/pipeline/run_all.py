@@ -33,6 +33,7 @@ Usage:
 """
 
 import argparse
+import functools
 import os
 import subprocess
 import sys
@@ -208,8 +209,15 @@ def _patent_worker(drug, dry_run):
         return (drug, False, str(e))
 
 
-def _forecast_step_worker(drug, step_script, step_label, extra_args=None, dry_run=False):
-    """Run a single forecast step for one drug."""
+def _forecast_step_worker(drug, dry_run, step_script=None, step_label=None, extra_args=None):
+    """Run a single forecast step for one drug.
+
+    Parameter order matches run_parallel's convention: (drug, dry_run, ...).
+    The step_script/step_label/extra_args are bound via functools.partial
+    in run_forecast (a top-level function + partial is picklable, whereas
+    a nested closure is not — that's what causes
+    "Can't pickle local object 'run_forecast.<locals>._step_worker'").
+    """
     try:
         cmd = [PY, str(step_script), "--drug", drug]
         if extra_args:
@@ -336,10 +344,17 @@ def run_forecast(drugs, workers, dry_run=False):
     for step_label, step_script, extra_args in forecast_steps:
         print(f"{BOLD}  {step_label}{RESET}")
 
-        def _step_worker(drug, dry_run, _script=step_script, _label=step_label, _extra=extra_args):
-            return _forecast_step_worker(drug, _script, _label, _extra, dry_run)
+        # Use functools.partial over a top-level function so the worker is
+        # picklable for ProcessPoolExecutor. A nested closure here would
+        # raise "Can't pickle local object 'run_forecast.<locals>._step_worker'".
+        step_worker = functools.partial(
+            _forecast_step_worker,
+            step_script=step_script,
+            step_label=step_label,
+            extra_args=extra_args,
+        )
 
-        run_parallel(step_label, _step_worker, drugs, workers, dry_run)
+        run_parallel(step_label, step_worker, drugs, workers, dry_run)
 
 
 def run_merge(dry_run=False):
