@@ -690,75 +690,79 @@ def _resolve_phase_at_filing(
 # LLM classification — per patent row (Step 1)
 # ─────────────────────────────────────────────
 
+_COMBO_KEYWORDS = (
+    "combination", "co-administer", "co-therapy", "combined with",
+    "together with", "adjunct", "metabolic agent", "dual therapy",
+)
+
+
+_LOE_CATEGORY_TO_FORECAST = {
+    "composition of matter":  "API Patent",
+    "salt/polymorph":         "API Patent",
+    "formulation":            "Formulation",
+    "manufacturing process":  "Formulation",
+    "method of treatment":    "Method",
+    "device":                 "Device",
+    "dosage regimen":         "Dosing",
+}
+
+
+def _classify_patent_from_loe(patent_info: Dict) -> Dict[str, str]:
+    """
+    Deterministic Step 1 classification using the existing
+    `Step 1 Claim Category` field from loe_table (produced by the
+    upstream pipeline). No LLM call required.
+
+    Returns a dict like {"API Patent": "✓ (Composition of Matter)", ...}
+    where keys are a subset of _FORECAST_COLS.
+
+    Mapping (loe -> forecast bucket):
+      Composition of Matter  -> API Patent
+      Salt/Polymorph         -> API Patent
+      Formulation            -> Formulation
+      Manufacturing Process  -> Formulation
+      Method of Treatment    -> Method
+      Device                 -> Device
+      Dosage Regimen         -> Dosing
+
+    Combination is not a loe category — it is inferred from the
+    Blocking Category / Reason text only when an explicit co-therapy
+    keyword is present (matches the prior rule in _classify_patent).
+    """
+    result: Dict[str, str] = {}
+
+    raw_cat = str(patent_info.get("Step 1 Claim Category", "")).strip()
+    if raw_cat and raw_cat.lower() not in ("n/a", "nan", "none", ""):
+        bucket = _LOE_CATEGORY_TO_FORECAST.get(raw_cat.lower())
+        if bucket:
+            result[bucket] = f"✓ ({raw_cat})"
+
+    # Combination: only mark when an explicit co-therapy signal appears
+    # in Blocking Category or Reason. Mirrors the prior LLM rule.
+    combo_text = " ".join(
+        str(patent_info.get(k, "")) for k in ("Blocking Category", "Reason")
+    ).lower()
+    if any(kw in combo_text for kw in _COMBO_KEYWORDS):
+        result["Combination"] = "✓ (co-administration with another agent)"
+
+    patent_num = patent_info.get("Patent Number", "")
+    print(f"[STEP 1]   {patent_num} → {list(result.keys()) or 'no match'} "
+          f"(loe category: {raw_cat or '—'})")
+    return result
+
+
 async def _classify_patent(drug_name: str, patent_info: Dict) -> Dict[str, str]:
     """
-    Sends a single patent's info to Gemini for 6-category classification.
+    DEPRECATED: previously sent each patent to Gemini for 6-category
+    classification. Now delegates to the deterministic mapping based on
+    the `Step 1 Claim Category` already present in loe_table.
+
+    Kept as an async wrapper so existing call sites continue to work.
+    The `drug_name` argument is unused but retained for signature
+    compatibility.
     """
-    categories_block = "\n".join(
-        f"  - {col}: {desc}"
-        for col, desc in _CATEGORY_DESCRIPTIONS.items()
-    )
-
-    info_block = "\n".join(
-        f"  {k}: {v}"
-        for k, v in patent_info.items()
-        if v and str(v).strip() not in ("N/A", "nan", "None", "")
-    )
-
-    prompt = f"""You are a pharmaceutical patent analyst.
-
-Drug: {drug_name}
-
-Here is the analysis information for one patent:
-{info_block}
-
-Classify this patent into one or more of these 6 categories:
-
-{categories_block}
-
-RULES:
-- A patent can belong to MORE than one category.
-- "Combination" ONLY applies if the patent explicitly claims or describes using {drug_name} TOGETHER WITH another metabolic agent (e.g. insulin, metformin, SGLT2 inhibitor, statin, another GLP-1 agonist). Do not infer this — it must be clearly described in the Reason or Blocking Category.
-- For each matching category, write ONE short phrase (max 10 words) describing what is protected.
-- Set null for categories that do not apply.
-
-Respond ONLY with valid JSON, no markdown, no explanation:
-{{
-  "API Patent":  "<description or null>",
-  "Formulation": "<description or null>",
-  "Device":      "<description or null>",
-  "Method":      "<description or null>",
-  "Dosing":      "<description or null>",
-  "Combination": "<description or null>"
-}}
-"""
-
-    try:
-        response = await _gemini.aio.models.generate_content(
-            model    = _GEMINI_MODEL,
-            contents = prompt,
-        )
-        raw = response.text.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
-
-        parsed = json.loads(raw)
-        result = {}
-        for col in _FORECAST_COLS:
-            val = parsed.get(col)
-            if val and str(val).strip().lower() not in ("null", "none", ""):
-                result[col] = f"✓ ({val.strip()})"
-
-        patent_num = patent_info.get("Patent Number", "")
-        print(f"[STEP 1]   {patent_num} → {list(result.keys()) or 'no match'}")
-        return result
-
-    except Exception as e:
-        print(f"[STEP 1]   LLM failed for {patent_info.get('Patent Number', '?')}: {e}")
-        return {}
+    del drug_name  # unused
+    return _classify_patent_from_loe(patent_info)
 
 
 async def _lookup_innovator(drug_name: str) -> str:
@@ -861,11 +865,6 @@ async def step1_ip_landscape() -> pd.DataFrame:
 # ─────────────────────────────────────────────
 # Step 2: Patent Layering Pattern (with ChromaDB + branching)
 # ─────────────────────────────────────────────
-
-_COMBO_KEYWORDS = (
-    "combination", "co-administer", "co-therapy", "combined with",
-    "together with", "adjunct", "metabolic agent", "dual therapy",
-)
 
 
 def _get_patent_text_from_chroma(drug_name: str, patent_filename: str) -> str:
