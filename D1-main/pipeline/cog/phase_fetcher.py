@@ -92,8 +92,48 @@ def canonicalise_drug_name(drug_name: str) -> str:
     return drug_name
 
 
+_PHASE_NORMAL_MAP = {
+    # canonical
+    "preclinical":      "Preclinical",
+    "phase 1":          "Phase 1",
+    "phase 2":          "Phase 2",
+    "phase 3":          "Phase 3",
+    "pre-registration": "Pre-registration",
+    "preregistration":  "Pre-registration",
+    "marketed":         "Marketed",
+    # Roman numerals (BigQuery SQL CASE outputs these)
+    "phase i":          "Phase 1",
+    "phase ii":         "Phase 2",
+    "phase iii":        "Phase 3",
+    # bare forms
+    "i":   "Phase 1", "1": "Phase 1",
+    "ii":  "Phase 2", "2": "Phase 2",
+    "iii": "Phase 3", "3": "Phase 3",
+    "4":   "Marketed",
+}
+
+
+def _normalize_phase(p: Optional[str]) -> Optional[str]:
+    """Canonicalise phase strings (e.g. 'Phase III' -> 'Phase 3') so they
+    can be compared via _STAGE_RANK.  Returns None for falsy / unknown input.
+    """
+    if p is None:
+        return None
+    s = str(p).strip()
+    if not s:
+        return None
+    return _PHASE_NORMAL_MAP.get(s.lower(), s)
+
+
 def _highest_phase(a: Optional[str], b: Optional[str]) -> Optional[str]:
-    """Returns whichever phase is further along. None is lower than any real stage."""
+    """Returns whichever phase is further along. None is lower than any real stage.
+
+    Both inputs are normalised first (Roman numerals, varying case/spacing) so
+    e.g. 'Phase III' from BigQuery and 'Phase 3' from the fallback Excel
+    compare correctly.
+    """
+    a = _normalize_phase(a)
+    b = _normalize_phase(b)
     if a is None:
         return b
     if b is None:
@@ -142,7 +182,13 @@ def import_from_gbq(
         WITH filtered AS (
           SELECT
             molecule_name                                AS cleaned_generic_name,
-            TRIM(trial_location_part)                    AS Drug_Geography,
+            -- Tag rows with no usable trial_location so we still surface the
+            -- phase, instead of dropping the row via UNNEST on a NULL/empty list.
+            CASE
+              WHEN COALESCE(NULLIF(TRIM(trial_location), ''), NULL) IS NULL
+                THEN '__UNKNOWN__'
+              ELSE TRIM(trial_location_part)
+            END                                          AS Drug_Geography,
             CASE
               WHEN REGEXP_CONTAINS(LOWER(TRIM(phase)), r'^4')   THEN 'Marketed'
               WHEN REGEXP_CONTAINS(LOWER(TRIM(phase)), r'^iii') THEN 'Phase III'
@@ -163,8 +209,11 @@ def import_from_gbq(
               WHEN REGEXP_CONTAINS(LOWER(TRIM(phase)), r'^1')   THEN 1
               ELSE 0
             END                                          AS stage_rank
-          FROM `{fq_table}`,
-          UNNEST(SPLIT(trial_location, ',')) AS trial_location_part
+          FROM `{fq_table}`
+          -- LEFT JOIN against the split so rows with NULL/empty trial_location
+          -- still appear (with trial_location_part = NULL, which the CASE
+          -- above turns into '__UNKNOWN__').
+          LEFT JOIN UNNEST(SPLIT(COALESCE(NULLIF(TRIM(trial_location), ''), ''), ',')) AS trial_location_part
           WHERE LOWER(REGEXP_REPLACE(
                   COALESCE(molecule_name, ''),
                   r'[\s\-_]+', ''
@@ -237,10 +286,26 @@ def _match_drug_name_in_bq(drug_name: str, df: pd.DataFrame) -> Dict[str, str]:
     _US_GEOS = {"united states", "us", "usa", "united states of america"}
     _EU_GEOS = {"eu", "europe", "european union"}
 
+    # Track the best (highest) stage we've seen for this drug across ALL rows
+    # — used to fall back to US/EP when trial_location is missing or only
+    # lists non-US/EU geographies. Many drugs in clinical_efficacy have
+    # phase data but no usable geography; without this fallback, those
+    # drugs end up with empty phase in loe_table.
+    best_overall_stage: Optional[str] = None
+
     for row in matched_rows:
         raw_geo = str(row.get("Drug_Geography") or "")
         stage   = str(row.get("highest_development_stage") or "")
-        geos    = [g.strip() for g in re.split(r"[,;]", raw_geo) if g.strip()]
+
+        # Always feed the overall pool, even for unknown/other geographies.
+        best_overall_stage = _highest_phase(best_overall_stage, stage)
+
+        # __UNKNOWN__ is the sentinel for rows whose trial_location was
+        # NULL/empty in BigQuery. Don't try to match it as a real geo.
+        if raw_geo.strip() == "__UNKNOWN__":
+            continue
+
+        geos = [g.strip() for g in re.split(r"[,;]", raw_geo) if g.strip()]
         for geo in geos:
             geo_lower = geo.lower()
             if geo_lower in _US_GEOS:
@@ -249,9 +314,25 @@ def _match_drug_name_in_bq(drug_name: str, df: pd.DataFrame) -> Dict[str, str]:
                 canonical = "EU"
             else:
                 continue
-            if canonical not in geography_stages:
-                geography_stages[canonical] = stage
-                print(f"[BQ MATCH] Geography: '{geo}' → '{canonical}' | Stage: {stage}")
+            # Keep the highest stage seen per canonical geography
+            existing = geography_stages.get(canonical)
+            best = _highest_phase(existing, stage)
+            if best != existing:
+                geography_stages[canonical] = best
+                print(f"[BQ MATCH] Geography: '{geo}' → '{canonical}' | Stage: {best}")
+
+    # Fallback: if the drug has phase data in BQ but no row tagged US/EU
+    # (e.g. trial_location is NULL, or only lists Japan/China/Worldwide),
+    # apply the highest seen stage to BOTH US and EP. Clinical development
+    # stage is generally a global property; better to surface it than to
+    # leave the field blank.
+    if best_overall_stage and not geography_stages:
+        geography_stages["United States"] = best_overall_stage
+        geography_stages["EU"]            = best_overall_stage
+        print(
+            f"[BQ MATCH] No US/EU geography found — applying overall phase "
+            f"'{best_overall_stage}' to both US and EP as a fallback"
+        )
 
     return geography_stages
 
