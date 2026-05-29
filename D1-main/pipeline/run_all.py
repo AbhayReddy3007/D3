@@ -209,17 +209,21 @@ def _patent_worker(drug, dry_run):
         return (drug, False, str(e))
 
 
-def _forecast_step_worker(drug, dry_run, step_script=None, step_label=None, extra_args=None):
+def _forecast_step_worker(drug, dry_run, step_script=None, step_label=None,
+                          extra_args=None, drug_flag="--drug"):
     """Run a single forecast step for one drug.
 
     Parameter order matches run_parallel's convention: (drug, dry_run, ...).
-    The step_script/step_label/extra_args are bound via functools.partial
-    in run_forecast (a top-level function + partial is picklable, whereas
-    a nested closure is not — that's what causes
+    The remaining kwargs are bound via functools.partial in run_forecast
+    (a top-level function + partial is picklable, whereas a nested closure
+    is not — that's what causes
     "Can't pickle local object 'run_forecast.<locals>._step_worker'").
+
+    drug_flag controls how the drug is passed to the script
+    (e.g. "--drug" for step4/6, "--drugs" for step5).
     """
     try:
-        cmd = [PY, str(step_script), "--drug", drug]
+        cmd = [PY, str(step_script), drug_flag, drug]
         if extra_args:
             cmd.extend(extra_args)
         run_step(
@@ -230,6 +234,17 @@ def _forecast_step_worker(drug, dry_run, step_script=None, step_label=None, extr
         return (drug, True, None)
     except Exception as e:
         return (drug, False, str(e))
+
+
+def _run_forecast_step_global(step_label, step_script, extra_args=None, dry_run=False):
+    """Run a forecast step that operates on the whole dataset (no --drug).
+
+    Used for step3.py, which processes all drugs in one invocation.
+    """
+    cmd = [PY, str(step_script)]
+    if extra_args:
+        cmd.extend(extra_args)
+    run_step(step_label, cmd, dry_run=dry_run)
 
 
 def _ipd_worker(drug, dry_run):
@@ -330,20 +345,39 @@ def run_patents(drugs, workers, dry_run=False):
 def run_forecast(drugs, workers, dry_run=False):
     banner("FORECASTING PIPELINE")
 
+    # Each entry: (label, script, extra_args, drug_flag)
+    #   drug_flag = None  -> run ONCE globally (script processes all drugs)
+    #   drug_flag = "--drug"  -> run per drug, pass `--drug <name>`
+    #   drug_flag = "--drugs" -> run per drug, pass `--drugs <name>`
+    #
+    # step3 does not accept --drug at all (it processes the whole dataset
+    # in one go via step1_ip_landscape/step2_patent_layering/step3_filing).
+    # step5 accepts --drugs (plural, comma-separated), not --drug.
     forecast_steps = [
         ("Step 3 — IP Landscape + Layering + Filing Analysis",
-         FORECAST_DIR / "step3.py", ["--upload"]),
+         FORECAST_DIR / "step3.py", ["--upload"], None),
         ("Step 4 — Innovator Filing Patterns",
-         FORECAST_DIR / "step4.py", None),
+         FORECAST_DIR / "step4.py", None, "--drug"),
         ("Step 5 — Business Strategy Review",
-         FORECAST_DIR / "step5.py", None),
+         FORECAST_DIR / "step5.py", None, "--drugs"),
         ("Step 6 — Patent Forecast Generator",
-         FORECAST_DIR / "step6.py", None),
+         FORECAST_DIR / "step6.py", None, "--drug"),
     ]
 
-    for step_label, step_script, extra_args in forecast_steps:
+    for step_label, step_script, extra_args, drug_flag in forecast_steps:
         print(f"{BOLD}  {step_label}{RESET}")
 
+        if drug_flag is None:
+            # Global step: run once, ignoring the per-drug list.
+            try:
+                _run_forecast_step_global(step_label, step_script, extra_args, dry_run)
+                print(f"  {GREEN}✓ {step_label}{RESET}")
+            except Exception as e:
+                print(f"  {RED}✗ {step_label}: {e}{RESET}")
+                sys.exit(1)
+            continue
+
+        # Per-drug step: parallelise across drugs.
         # Use functools.partial over a top-level function so the worker is
         # picklable for ProcessPoolExecutor. A nested closure here would
         # raise "Can't pickle local object 'run_forecast.<locals>._step_worker'".
@@ -352,6 +386,7 @@ def run_forecast(drugs, workers, dry_run=False):
             step_script=step_script,
             step_label=step_label,
             extra_args=extra_args,
+            drug_flag=drug_flag,
         )
 
         run_parallel(step_label, step_worker, drugs, workers, dry_run)
