@@ -326,8 +326,17 @@ def upload_to_bigquery(
     table_id: str,
     location: str,
     dry_run: bool = False,
+    replace_drugs: bool = False,
 ) -> bool:
-    """Upload a DataFrame to BigQuery."""
+    """Upload a DataFrame to BigQuery.
+
+    Args:
+        replace_drugs: If True, DELETE any existing rows for the drugs in
+            this upload before appending. This is a row-level upsert keyed on
+            Drug_Name and prevents duplicate accumulation across re-runs.
+            Note: DELETE is a table-modification operation and counts toward
+            the per-table daily quota (see also the rate-limit retry below).
+    """
     if df.empty:
         print("[SKIP] Empty DataFrame — nothing to upload")
         return False
@@ -377,6 +386,44 @@ def upload_to_bigquery(
         exists = table_exists(project_id, dataset_id, table_id)
         action = "Appending to existing" if exists else "Creating new"
         print(f"\n[BQ] {action} table...")
+
+        # Pre-delete prior rows for these drugs so the append doesn't
+        # accumulate duplicates across re-runs.
+        if replace_drugs and exists and "Drug_Name" in df.columns:
+            drugs_to_replace = [
+                str(d) for d in df["Drug_Name"].dropna().unique()
+                if str(d).strip()
+            ]
+            if drugs_to_replace:
+                try:
+                    from google.cloud import bigquery as _bq
+                    client = _bq.Client(project=project_id, location=location)
+                    delete_sql = (
+                        f"DELETE FROM `{project_id}.{dataset_id}.{table_id}` "
+                        f"WHERE Drug_Name IN UNNEST(@drugs)"
+                    )
+                    job_config = _bq.QueryJobConfig(
+                        query_parameters=[
+                            _bq.ArrayQueryParameter("drugs", "STRING", drugs_to_replace),
+                        ]
+                    )
+                    print(
+                        f"[BQ] --replace-drugs: deleting prior rows for "
+                        f"{len(drugs_to_replace)} drug(s): {drugs_to_replace}"
+                    )
+                    job = client.query(delete_sql, job_config=job_config)
+                    job.result()
+                    deleted = job.num_dml_affected_rows or 0
+                    print(f"[BQ]   deleted {deleted} prior row(s).")
+                except Exception as e:
+                    if _is_rate_limit_error_message(str(e)):
+                        print(
+                            f"[BQ] ✗ DELETE hit rate limit: {e}. "
+                            f"Aborting upload to avoid creating duplicates."
+                        )
+                        return False
+                    print(f"[BQ] ✗ DELETE failed: {e}. Aborting upload.")
+                    return False
 
         # BigQuery throttles frequent table-update/load operations
         # (429 rateLimitExceeded). Retry with exponential backoff.
@@ -456,6 +503,16 @@ Examples:
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview rows without uploading")
 
+    parser.add_argument(
+        "--replace-drugs",
+        action="store_true",
+        help=(
+            "Before appending, DELETE any existing rows in the target table "
+            "for the drugs being uploaded. Prevents duplicate accumulation "
+            "across re-runs. Off by default."
+        ),
+    )
+
     parser.add_argument("--project", type=str, default=DEFAULT_PROJECT,
                         help=f"BQ project. Default: {DEFAULT_PROJECT}")
     parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET,
@@ -513,6 +570,7 @@ Examples:
         table_id=args.table,
         location=args.location,
         dry_run=args.dry_run,
+        replace_drugs=args.replace_drugs,
     )
 
     if success:
