@@ -328,9 +328,28 @@ def run_parallel(label, worker_fn, drugs, workers, dry_run=False):
                 failed.append(drug_name)
 
     if failed:
-        print(f"\n{RED}✗ {label} — {len(failed)} drug(s) failed: {failed}{RESET}")
-        print(f"  Pipeline halted.")
-        sys.exit(1)
+        # Per-drug failures should not nuke the whole pipeline run — a flaky
+        # PDF, a transient BQ glitch, or a single drug with weird data
+        # shouldn't kill the work for every other drug. Only halt if
+        # every drug failed (i.e. it's clearly a systemic issue).
+        succeeded = total - len(failed)
+        print(
+            f"\n{YELLOW}⚠ {label} — {len(failed)}/{total} drug(s) failed: "
+            f"{failed}{RESET}"
+        )
+        if succeeded == 0:
+            print(
+                f"{RED}  All drugs failed for this stage — pipeline halted "
+                f"(likely a systemic issue, not per-drug data).{RESET}"
+            )
+            sys.exit(1)
+        else:
+            print(
+                f"  {GREEN}Continuing with {succeeded}/{total} successful "
+                f"drug(s).{RESET} Re-run the pipeline for failed drugs "
+                f"individually to investigate."
+            )
+            return
 
     print(f"\n  {GREEN}✓ {label} — all {total} drug(s) completed{RESET}\n")
 
