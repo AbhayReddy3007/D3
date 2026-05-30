@@ -37,7 +37,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -302,9 +302,89 @@ def _canonicalise_drug(name: str) -> str:
 # ─────────────────────────────────────────────
 # Regulatory submission dates — via Gemini Search
 # ─────────────────────────────────────────────
+#
+# These dates change rarely (an NDA/BLA/MAA filing date is a one-time
+# historical event) but are expensive to fetch — each lookup is a
+# Gemini-with-Google-Search call per drug. With Cloud Run sharding the
+# pipeline across multiple tasks, every task was independently fetching
+# the same dates for the same drugs, multiplying cost and time by the
+# task count. We cache results in GCS so the first task that resolves
+# a drug's date persists it, and every subsequent task (this run or any
+# future run) reads it back instead of re-querying Gemini.
+#
+# Cache layout:
+#   <GCS_CACHE_PREFIX>/regulatory_submissions/<drug_slug>/submission.json
+# Contents:
+#   {"drug": "<original>", "date": "YYYY-MM-DD" or null, "fetched_at": "..."}
+#
+# A null `date` is also cached — that's a real lookup result ("Gemini
+# couldn't find a submission") and we don't want to retry it forever.
+# If you ever need to force a refresh, delete the cache subfolder via
+# gcs_cache.delete_prefix("regulatory_submissions").
+
+_SUBMISSION_CACHE_SUBFOLDER = "regulatory_submissions"
+_SUBMISSION_CACHE_FILENAME  = "submission.json"
+
+try:
+    from cog import gcs_cache as _submission_cache
+except Exception as _e:
+    print(f"[SUBMISSION CACHE] gcs_cache unavailable ({_e}); will fetch every time")
+    _submission_cache = None
+
+
+def _submission_cache_get(drug_name: str):
+    """Return (hit: bool, date_or_none).
+
+    hit=True means we have a cached answer for this drug (which may
+    itself be None — meaning "we asked and found nothing").
+    """
+    if _submission_cache is None:
+        return False, None
+    try:
+        cached = _submission_cache.read_json(
+            _SUBMISSION_CACHE_SUBFOLDER,
+            _SUBMISSION_CACHE_FILENAME,
+            drug_name=drug_name,
+        )
+    except Exception as e:
+        print(f"[SUBMISSION CACHE] read failed for '{drug_name}': {e}")
+        return False, None
+    if cached is None:
+        return False, None
+    return True, cached.get("date")
+
+
+def _submission_cache_put(drug_name: str, date_str):
+    if _submission_cache is None:
+        return
+    payload = {
+        "drug": drug_name,
+        "date": date_str,
+        "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    try:
+        _submission_cache.write_json(
+            _SUBMISSION_CACHE_SUBFOLDER,
+            _SUBMISSION_CACHE_FILENAME,
+            payload,
+            drug_name=drug_name,
+        )
+    except Exception as e:
+        print(f"[SUBMISSION CACHE] write failed for '{drug_name}': {e}")
+
 
 async def _fetch_regulatory_submission_date(drug_name: str) -> Optional[str]:
-    """Uses Gemini web search to find the regulatory submission (NDA/BLA/MAA) date for a drug."""
+    """Uses Gemini web search to find the regulatory submission (NDA/BLA/MAA) date for a drug.
+
+    Cached in GCS so the same drug isn't looked up more than once across
+    parallel tasks or repeated runs. Returns the cached value (even if it
+    is None) when present; otherwise fetches, caches, and returns.
+    """
+    hit, cached_date = _submission_cache_get(drug_name)
+    if hit:
+        print(f"[SUBMISSION] '{drug_name}': {cached_date or 'None'} (cache hit)")
+        return cached_date
+
     prompt = f"""What is the earliest regulatory submission date (NDA, BLA, or MAA filing date) for the drug "{drug_name}"?
 
 Search the web and return ONLY the date in YYYY-MM-DD format. If you cannot find an exact date, return your best estimate.
@@ -324,13 +404,16 @@ Return ONLY the date string, nothing else.
         )
         raw = (response.text or "").strip().strip(".")
         if raw.lower() in ("none", "n/a", "unknown", ""):
+            _submission_cache_put(drug_name, None)
             return None
         # Validate it looks like a date
         pd.to_datetime(raw, errors="raise")
-        print(f"[SUBMISSION] '{drug_name}': {raw}")
+        print(f"[SUBMISSION] '{drug_name}': {raw} (fresh)")
+        _submission_cache_put(drug_name, raw)
         return raw
     except Exception as e:
         print(f"[SUBMISSION] Failed for '{drug_name}': {e}")
+        # Don't cache transient failures — let the next task retry.
         return None
 
 
@@ -862,7 +945,7 @@ Examples: "Novo Nordisk", "Eli Lilly", "AstraZeneca"
         return "Unknown"
 
 
-async def step1_ip_landscape() -> pd.DataFrame:
+async def step1_ip_landscape(drug_filter: Optional[set] = None) -> pd.DataFrame:
     """
     Step 1: IP Landscape of All Drugs.
 
@@ -870,13 +953,26 @@ async def step1_ip_landscape() -> pd.DataFrame:
       1. Filters patents belonging to that drug.
       2. Sends each patent's analysis info to Gemini for 6-category classification.
       3. Aggregates into one row per drug.
+
+    Args:
+        drug_filter: Optional set of drug names. When provided, only these
+            drugs are processed (case-insensitive). When None, all drugs in
+            loe_table are processed. Used by the orchestrator to shard
+            step3 across Cloud Run tasks.
     """
     df = load_loe_table()
     if df.empty:
         return pd.DataFrame()
 
     all_drugs = sorted(df["Drug Name"].dropna().unique().tolist())
-    print(f"[STEP 1] Drugs found: {all_drugs}\n")
+
+    if drug_filter:
+        wanted = {d.strip().lower() for d in drug_filter if d and str(d).strip()}
+        before = len(all_drugs)
+        all_drugs = [d for d in all_drugs if d.lower() in wanted]
+        print(f"[STEP 1] Shard filter applied: {before} → {len(all_drugs)} drug(s)")
+
+    print(f"[STEP 1] Drugs to process: {all_drugs}\n")
 
     if not all_drugs:
         print("[STEP 1] No drugs found.")
@@ -1078,7 +1174,7 @@ Respond ONLY with valid JSON, no markdown:
         }
 
 
-async def step2_patent_layering() -> pd.DataFrame:
+async def step2_patent_layering(drug_filter: Optional[set] = None) -> pd.DataFrame:
     """
     Step 2: Patent Layering Pattern with ChromaDB + LLM branching.
 
@@ -1087,6 +1183,9 @@ async def step2_patent_layering() -> pd.DataFrame:
       2. Sends full text + context to Gemini.
       3. LLM assigns: layer, category, description, parent patent.
       4. Builds the branching tree sorted by layer then filing date.
+
+    Args:
+        drug_filter: see step1_ip_landscape.
 
     Returns a SINGLE concatenated DataFrame (forecast_s3) with all drugs,
     with columns:
@@ -1099,7 +1198,14 @@ async def step2_patent_layering() -> pd.DataFrame:
         return pd.DataFrame()
 
     all_drugs = sorted(df["Drug Name"].dropna().unique().tolist())
-    print(f"[STEP 2] Drugs: {all_drugs}\n")
+
+    if drug_filter:
+        wanted = {d.strip().lower() for d in drug_filter if d and str(d).strip()}
+        before = len(all_drugs)
+        all_drugs = [d for d in all_drugs if d.lower() in wanted]
+        print(f"[STEP 2] Shard filter applied: {before} → {len(all_drugs)} drug(s)")
+
+    print(f"[STEP 2] Drugs to process: {all_drugs}\n")
 
     if not all_drugs:
         print("[STEP 2] No drugs found.")
@@ -2131,7 +2237,22 @@ if __name__ == "__main__":
         "--upload", action="store_true", default=False,
         help="Upload the final merged table to BigQuery after processing."
     )
+    parser.add_argument(
+        "--drugs", default=None,
+        help=(
+            "Comma-separated drug names. When provided, step3 only processes "
+            "these drugs (case-insensitive). When absent, processes all drugs "
+            "in loe_table. Used by the orchestrator to shard step3 across "
+            "Cloud Run tasks the same way step5 is sharded."
+        ),
+    )
     args = parser.parse_args()
+
+    # Parse --drugs into a set (None means 'all')
+    drug_filter: Optional[set] = None
+    if args.drugs:
+        drug_filter = {d.strip() for d in args.drugs.split(",") if d.strip()}
+        print(f"[CLI] --drugs filter: {sorted(drug_filter)}")
 
     def _run(coro):
         try:
@@ -2148,14 +2269,14 @@ if __name__ == "__main__":
     # STEP 1: IP Landscape
     # ══════════════════════════════════════════════════════════════════════
     print("\n── STEP 1 — IP Landscape of Marketed Drugs ──\n")
-    step1_result = _run(step1_ip_landscape())
+    step1_result = _run(step1_ip_landscape(drug_filter=drug_filter))
     print_step1(step1_result)
 
     # ══════════════════════════════════════════════════════════════════════
     # STEP 2: Patent Layering Pattern
     # ══════════════════════════════════════════════════════════════════════
     print("\n── STEP 2 — Patent Layering Pattern ──\n")
-    step2_result = _run(step2_patent_layering())
+    step2_result = _run(step2_patent_layering(drug_filter=drug_filter))
     print_forecast_s3(step2_result)
 
     # ══════════════════════════════════════════════════════════════════════
