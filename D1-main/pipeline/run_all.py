@@ -259,31 +259,49 @@ def _forecast_step_worker(drug, dry_run, step_script=None, step_label=None,
 
 
 def _run_forecast_step_global(step_label, step_script, extra_args=None,
-                              dry_run=False, resume=False):
-    """Run a forecast step that operates on the whole dataset (no --drug).
+                              dry_run=False, resume=False, drugs=None):
+    """Run a forecast step that operates on a batch of drugs in one invocation.
 
-    Used for step3.py, which processes all drugs in one invocation.
+    Used for step3.py. Historically step3 processed the entire dataset in
+    one go (no sharding), which meant every Cloud Run task redid the
+    full-dataset work. step3 now accepts `--drugs A,B,C` so the orchestrator
+    can pass only this task's drug slice; the checkpoint key is also
+    scoped to that slice so different tasks don't overwrite each other's
+    done-markers.
 
-    resume=True consults the global checkpoint marker (one per step) and
-    skips the subprocess if it's marked done. The marker is only written
-    on successful completion.
+    Args:
+        drugs: Optional list of drug names for this shard. When provided,
+            appended as `--drugs <comma-list>` to the subprocess command.
+            When None, step3 falls back to processing all drugs.
     """
     try:
         from cog import forecast_checkpoint as _ckpt
     except Exception:
         _ckpt = None
 
-    if resume and _ckpt is not None and not dry_run and _ckpt.is_done(step_script, None):
-        print(f"  [SKIP] {step_label} — already marked done in GCS")
+    # Build a stable per-shard checkpoint key so two tasks with different
+    # drug slices keep separate markers. When drugs is None it's the
+    # "all drugs" run and we use a single global marker.
+    if drugs:
+        # Sort + join so the key is deterministic regardless of input order.
+        shard_key = "drugs__" + ",".join(sorted(drugs))[:180]  # bound length
+    else:
+        shard_key = None  # global
+
+    if resume and _ckpt is not None and not dry_run and _ckpt.is_done(step_script, shard_key):
+        scope = f"shard ({len(drugs)} drug(s))" if drugs else "global"
+        print(f"  [SKIP] {step_label} [{scope}] — already marked done in GCS")
         return
 
     cmd = [PY, str(step_script)]
     if extra_args:
         cmd.extend(extra_args)
+    if drugs:
+        cmd.extend(["--drugs", ",".join(drugs)])
     run_step(step_label, cmd, dry_run=dry_run)
 
     if _ckpt is not None and not dry_run:
-        _ckpt.mark_done(step_script, None)
+        _ckpt.mark_done(step_script, shard_key)
 
 
 def _ipd_worker(drug, dry_run):
@@ -426,10 +444,12 @@ def run_forecast(drugs, workers, dry_run=False, resume=False):
         print(f"{BOLD}  {step_label}{RESET}")
 
         if drug_flag is None:
-            # Global step: run once, ignoring the per-drug list.
+            # Global-style step (step3): runs once per task but now accepts
+            # a --drugs shard, so each Cloud Run task only processes its
+            # own slice instead of the whole dataset every time.
             try:
                 _run_forecast_step_global(step_label, step_script, extra_args,
-                                          dry_run, resume=resume)
+                                          dry_run, resume=resume, drugs=drugs)
                 print(f"  {GREEN}✓ {step_label}{RESET}")
             except Exception as e:
                 print(f"  {RED}✗ {step_label}: {e}{RESET}")
