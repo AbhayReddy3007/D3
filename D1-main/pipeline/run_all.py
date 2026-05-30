@@ -25,7 +25,7 @@ Pipeline order (sequential between stages):
 Usage:
   python run_all.py                   # full pipeline
   python run_all.py --mode patents    # only patents stage
-  python run_all.py --mode forecast   # only forecast stage
+  python run_all.py --mode forecast   # forecast → merge → IPD → reports (skips patents)
   python run_all.py --mode ipd        # only IPD stage
   python run_all.py --mode reports    # only reports stage
   python run_all.py --workers 6       # limit parallelism (default: 10)
@@ -210,7 +210,7 @@ def _patent_worker(drug, dry_run):
 
 
 def _forecast_step_worker(drug, dry_run, step_script=None, step_label=None,
-                          extra_args=None, drug_flag="--drug"):
+                          extra_args=None, drug_flag="--drug", resume=False):
     """Run a single forecast step for one drug.
 
     Parameter order matches run_parallel's convention: (drug, dry_run, ...).
@@ -221,7 +221,27 @@ def _forecast_step_worker(drug, dry_run, step_script=None, step_label=None,
 
     drug_flag controls how the drug is passed to the script
     (e.g. "--drug" for step4/6, "--drugs" for step5).
+
+    resume=True checks the GCS checkpoint marker for (step, drug) and skips
+    the subprocess if it's already been completed in a prior run. The
+    marker is only written after a successful subprocess return — failures
+    don't get marked, so a re-run will retry them.
     """
+    # Import lazily so worker processes don't pay the cost when checkpoint
+    # support is unused, and so a missing GCS config doesn't break imports
+    # at module load time.
+    try:
+        from cog import forecast_checkpoint as _ckpt
+    except Exception as _e:
+        _ckpt = None
+        if resume:
+            print(f"[CHECKPOINT] unavailable ({_e}) — running {drug} without skip")
+
+    if resume and _ckpt is not None and not dry_run:
+        if _ckpt.is_done(step_script, drug):
+            print(f"  [SKIP] {step_label}: {drug} — already marked done in GCS")
+            return (drug, True, None)
+
     try:
         cmd = [PY, str(step_script), drug_flag, drug]
         if extra_args:
@@ -231,20 +251,39 @@ def _forecast_step_worker(drug, dry_run, step_script=None, step_label=None,
             cmd,
             dry_run=dry_run,
         )
+        if _ckpt is not None and not dry_run:
+            _ckpt.mark_done(step_script, drug)
         return (drug, True, None)
     except Exception as e:
         return (drug, False, str(e))
 
 
-def _run_forecast_step_global(step_label, step_script, extra_args=None, dry_run=False):
+def _run_forecast_step_global(step_label, step_script, extra_args=None,
+                              dry_run=False, resume=False):
     """Run a forecast step that operates on the whole dataset (no --drug).
 
     Used for step3.py, which processes all drugs in one invocation.
+
+    resume=True consults the global checkpoint marker (one per step) and
+    skips the subprocess if it's marked done. The marker is only written
+    on successful completion.
     """
+    try:
+        from cog import forecast_checkpoint as _ckpt
+    except Exception:
+        _ckpt = None
+
+    if resume and _ckpt is not None and not dry_run and _ckpt.is_done(step_script, None):
+        print(f"  [SKIP] {step_label} — already marked done in GCS")
+        return
+
     cmd = [PY, str(step_script)]
     if extra_args:
         cmd.extend(extra_args)
     run_step(step_label, cmd, dry_run=dry_run)
+
+    if _ckpt is not None and not dry_run:
+        _ckpt.mark_done(step_script, None)
 
 
 def _ipd_worker(drug, dry_run):
@@ -361,8 +400,8 @@ def run_patents(drugs, workers, dry_run=False):
     run_parallel("Patents", _patent_worker, drugs, workers, dry_run)
 
 
-def run_forecast(drugs, workers, dry_run=False):
-    banner("FORECASTING PIPELINE")
+def run_forecast(drugs, workers, dry_run=False, resume=False):
+    banner("FORECASTING PIPELINE" + (" [RESUME]" if resume else ""))
 
     # Each entry: (label, script, extra_args, drug_flag)
     #   drug_flag = None  -> run ONCE globally (script processes all drugs)
@@ -389,7 +428,8 @@ def run_forecast(drugs, workers, dry_run=False):
         if drug_flag is None:
             # Global step: run once, ignoring the per-drug list.
             try:
-                _run_forecast_step_global(step_label, step_script, extra_args, dry_run)
+                _run_forecast_step_global(step_label, step_script, extra_args,
+                                          dry_run, resume=resume)
                 print(f"  {GREEN}✓ {step_label}{RESET}")
             except Exception as e:
                 print(f"  {RED}✗ {step_label}: {e}{RESET}")
@@ -406,6 +446,7 @@ def run_forecast(drugs, workers, dry_run=False):
             step_label=step_label,
             extra_args=extra_args,
             drug_flag=drug_flag,
+            resume=resume,
         )
 
         run_parallel(step_label, step_worker, drugs, workers, dry_run)
@@ -454,7 +495,7 @@ def main():
         help=(
             "all      = full pipeline: patents → forecast → merge → ipd → reports (default)\n"
             "patents  = patent pipeline only\n"
-            "forecast = forecast steps only\n"
+            "forecast = forecast → merge → ipd → reports (skips patents; resume on by default)\n"
             "ipd      = IPD BQ upload only\n"
             "reports  = reports only"
         ),
@@ -463,6 +504,34 @@ def main():
                         help=f"Max parallel workers per stage (default: {DEFAULT_WORKERS})")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print commands without executing them")
+
+    # Resume / checkpoint controls (forecast stage only).
+    # Default policy: resume is ON when --mode is "forecast" (the user has
+    # explicitly asked to start from there and almost certainly wants to
+    # skip already-done drugs); OFF for other modes to keep their previous
+    # behaviour unchanged. Use --no-resume to force a fresh forecast run,
+    # or --resume to enable it for other modes.
+    parser.add_argument(
+        "--resume", dest="resume", action="store_true", default=None,
+        help=(
+            "Skip drugs that are already marked done in the GCS forecast "
+            "checkpoint store. Default ON for --mode forecast, OFF otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--no-resume", dest="resume", action="store_false",
+        help="Force a fresh forecast run, ignoring any existing checkpoints.",
+    )
+    parser.add_argument(
+        "--clear-checkpoints",
+        nargs="?", const="__ALL__", default=None, metavar="STEP",
+        help=(
+            "Delete forecast checkpoints before running. Pass a step key "
+            "(e.g. 'step4') to clear just that step, or no value to clear all. "
+            "Use this after fixing a bug to force the next run to redo work."
+        ),
+    )
+
     args = parser.parse_args()
 
     t0 = time.time()
@@ -482,9 +551,27 @@ def main():
         print(f"{YELLOW}This task has no drugs to process. Exiting cleanly.{RESET}")
         return
 
+    # Resolve resume default based on mode (see argparse help above).
+    if args.resume is None:
+        args.resume = (args.mode == "forecast")
+
+    # Clear checkpoints if requested (before any work starts).
+    if args.clear_checkpoints is not None:
+        try:
+            from cog import forecast_checkpoint as _ckpt
+            if args.clear_checkpoints == "__ALL__":
+                n = _ckpt.clear()
+                print(f"[CHECKPOINT] Cleared ALL forecast checkpoints ({n} blob(s) removed)")
+            else:
+                n = _ckpt.clear(args.clear_checkpoints)
+                print(f"[CHECKPOINT] Cleared checkpoints for '{args.clear_checkpoints}' "
+                      f"({n} blob(s) removed)")
+        except Exception as e:
+            print(f"{RED}[CHECKPOINT] Failed to clear: {e}{RESET}")
+
     if args.mode == "all":
         run_patents(drugs, args.workers, args.dry_run)
-        run_forecast(drugs, args.workers, args.dry_run)
+        run_forecast(drugs, args.workers, args.dry_run, resume=args.resume)
         run_merge(args.dry_run)
         run_ipd(drugs, args.workers, args.dry_run)
         run_reports(drugs, args.workers, args.dry_run)
@@ -493,7 +580,13 @@ def main():
         run_patents(drugs, args.workers, args.dry_run)
 
     elif args.mode == "forecast":
-        run_forecast(drugs, args.workers, args.dry_run)
+        # Forecast onward: skip the patents stage but run everything after
+        # forecast as well (merge → IPD → reports). Resume defaults to ON
+        # for this mode so a re-run picks up where it left off.
+        run_forecast(drugs, args.workers, args.dry_run, resume=args.resume)
+        run_merge(args.dry_run)
+        run_ipd(drugs, args.workers, args.dry_run)
+        run_reports(drugs, args.workers, args.dry_run)
 
     elif args.mode == "ipd":
         run_ipd(drugs, args.workers, args.dry_run)
