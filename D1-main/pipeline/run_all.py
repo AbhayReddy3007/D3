@@ -431,45 +431,102 @@ def _run_forecast_step_global(step_label, step_script, extra_args=None,
         _ckpt.mark_done(step_script, shard_key)
 
 
-def _ipd_worker(drug, dry_run):
-    """ipd2bq + ipd3bq for a single drug."""
+def _ipd_worker(drug, dry_run, resume=False):
+    """ipd2bq + ipd3bq for a single drug.
+
+    Checkpointed as two separate keys ('ipd2bq' and 'ipd3bq') because the
+    two scripts are independent — if ipd3bq fails after ipd2bq succeeded,
+    a re-run with resume should skip ipd2bq and retry only ipd3bq.
+    """
     try:
-        run_step(
-            f"IPD2 BQ upload: {drug}",
-            [PY, str(IPD2_SCRIPT), drug],
-            dry_run=dry_run,
-        )
-        run_step(
-            f"IPD3 BQ upload: {drug}",
-            [PY, str(IPD3_SCRIPT), drug],
-            dry_run=dry_run,
-        )
-        return (drug, True, None)
-    except Exception as e:
-        return (drug, False, str(e))
+        from cog import forecast_checkpoint as _ckpt
+    except Exception:
+        _ckpt = None
+
+    # ipd2bq
+    skip_2 = (
+        resume and _ckpt is not None and not dry_run
+        and _ckpt.is_done("ipd2bq", drug)
+    )
+    if skip_2:
+        print(f"  [SKIP] IPD2 BQ upload: {drug} — already marked done in GCS")
+    else:
+        try:
+            run_step(
+                f"IPD2 BQ upload: {drug}",
+                [PY, str(IPD2_SCRIPT), drug],
+                dry_run=dry_run,
+            )
+            if _ckpt is not None and not dry_run:
+                _ckpt.mark_done("ipd2bq", drug)
+        except Exception as e:
+            return (drug, False, f"ipd2bq: {e}")
+
+    # ipd3bq
+    skip_3 = (
+        resume and _ckpt is not None and not dry_run
+        and _ckpt.is_done("ipd3bq", drug)
+    )
+    if skip_3:
+        print(f"  [SKIP] IPD3 BQ upload: {drug} — already marked done in GCS")
+    else:
+        try:
+            run_step(
+                f"IPD3 BQ upload: {drug}",
+                [PY, str(IPD3_SCRIPT), drug],
+                dry_run=dry_run,
+            )
+            if _ckpt is not None and not dry_run:
+                _ckpt.mark_done("ipd3bq", drug)
+        except Exception as e:
+            return (drug, False, f"ipd3bq: {e}")
+
+    return (drug, True, None)
 
 
-def _ipd4_worker(drug, dry_run):
+def _ipd4_worker(drug, dry_run, resume=False):
     """ipd4bq for a single drug."""
+    try:
+        from cog import forecast_checkpoint as _ckpt
+    except Exception:
+        _ckpt = None
+
+    if resume and _ckpt is not None and not dry_run and _ckpt.is_done("ipd4bq", drug):
+        print(f"  [SKIP] IPD4 BQ upload: {drug} — already marked done in GCS")
+        return (drug, True, None)
+
     try:
         run_step(
             f"IPD4 BQ upload: {drug}",
             [PY, str(IPD4_SCRIPT), drug],
             dry_run=dry_run,
         )
+        if _ckpt is not None and not dry_run:
+            _ckpt.mark_done("ipd4bq", drug)
         return (drug, True, None)
     except Exception as e:
         return (drug, False, str(e))
 
 
-def _reports_worker(drug, dry_run):
+def _reports_worker(drug, dry_run, resume=False):
     """reports.py for a single drug."""
+    try:
+        from cog import forecast_checkpoint as _ckpt
+    except Exception:
+        _ckpt = None
+
+    if resume and _ckpt is not None and not dry_run and _ckpt.is_done("reports", drug):
+        print(f"  [SKIP] Reports: {drug} — already marked done in GCS")
+        return (drug, True, None)
+
     try:
         run_step(
             f"Reports: {drug}",
             [PY, str(REPORTS_SCRIPT), drug],
             dry_run=dry_run,
         )
+        if _ckpt is not None and not dry_run:
+            _ckpt.mark_done("reports", drug)
         return (drug, True, None)
     except Exception as e:
         return (drug, False, str(e))
@@ -640,10 +697,12 @@ def run_forecast(drugs, workers, dry_run=False, resume=False):
         run_parallel(step_label, step_worker, drugs, workers, dry_run)
 
 
-def run_merge(dry_run=False):
+def run_merge(dry_run=False, resume=False):
     """
     Merge runs once globally.  When sharded across Cloud Run tasks,
     only task 0 executes the merge; other tasks skip it.
+
+    resume=True checks a global 'merge' checkpoint and skips if marked done.
     """
     task_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0"))
     task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
@@ -653,23 +712,41 @@ def run_merge(dry_run=False):
               f"(only task 0 runs merge){RESET}\n")
         return
 
+    try:
+        from cog import forecast_checkpoint as _ckpt
+    except Exception:
+        _ckpt = None
+
+    if resume and _ckpt is not None and not dry_run and _ckpt.is_done("merge", None):
+        print(f"{YELLOW}[SKIP] MERGE → Master_LOE — already marked done in GCS{RESET}\n")
+        return
+
     banner("MERGE → Master_LOE")
     run_step("merge_to_master_loe.py", [PY, str(MERGE_SCRIPT)], dry_run=dry_run)
+    if _ckpt is not None and not dry_run:
+        _ckpt.mark_done("merge", None)
 
 
-def run_ipd(drugs, workers, dry_run=False):
-    banner("IPD → BIGQUERY")
+def run_ipd(drugs, workers, dry_run=False, resume=False):
+    banner("IPD → BIGQUERY" + (" [RESUME]" if resume else ""))
+
+    # Bind `resume` into the workers via functools.partial — same picklability
+    # rule as the forecast workers (top-level function + partial = OK,
+    # nested closure = not OK).
+    ipd_worker  = functools.partial(_ipd_worker,  resume=resume)
+    ipd4_worker = functools.partial(_ipd4_worker, resume=resume)
 
     # ipd2bq + ipd3bq — parallelised across drugs
-    run_parallel("IPD (ipd2bq + ipd3bq)", _ipd_worker, drugs, workers, dry_run)
+    run_parallel("IPD (ipd2bq + ipd3bq)", ipd_worker, drugs, workers, dry_run)
 
     # ipd4bq — parallelised across drugs
-    run_parallel("IPD4 BQ upload", _ipd4_worker, drugs, workers, dry_run)
+    run_parallel("IPD4 BQ upload", ipd4_worker, drugs, workers, dry_run)
 
 
-def run_reports(drugs, workers, dry_run=False):
-    banner("REPORTS GENERATION")
-    run_parallel("Reports", _reports_worker, drugs, workers, dry_run)
+def run_reports(drugs, workers, dry_run=False, resume=False):
+    banner("REPORTS GENERATION" + (" [RESUME]" if resume else ""))
+    reports_worker = functools.partial(_reports_worker, resume=resume)
+    run_parallel("Reports", reports_worker, drugs, workers, dry_run)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
@@ -693,30 +770,35 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Print commands without executing them")
 
-    # Resume / checkpoint controls (forecast stage only).
+    # Resume / checkpoint controls.
     # Default policy: resume is ON when --mode is "forecast" (the user has
     # explicitly asked to start from there and almost certainly wants to
     # skip already-done drugs); OFF for other modes to keep their previous
-    # behaviour unchanged. Use --no-resume to force a fresh forecast run,
-    # or --resume to enable it for other modes.
+    # behaviour unchanged. Use --no-resume to force a fresh run, or
+    # --resume to enable it for other modes.
+    # Checkpoint coverage spans the full forecast → merge → ipd → reports
+    # chain. Each per-drug stage marks (step, drug) after success; merge is
+    # a single global marker.
     parser.add_argument(
         "--resume", dest="resume", action="store_true", default=None,
         help=(
-            "Skip drugs that are already marked done in the GCS forecast "
-            "checkpoint store. Default ON for --mode forecast, OFF otherwise."
+            "Skip drugs/stages already marked done in the GCS checkpoint "
+            "store. Covers forecast (step3/4/5/6), merge, IPD (ipd2/3/4), "
+            "and reports. Default ON for --mode forecast, OFF otherwise."
         ),
     )
     parser.add_argument(
         "--no-resume", dest="resume", action="store_false",
-        help="Force a fresh forecast run, ignoring any existing checkpoints.",
+        help="Force a fresh run, ignoring any existing checkpoints.",
     )
     parser.add_argument(
         "--clear-checkpoints",
         nargs="?", const="__ALL__", default=None, metavar="STEP",
         help=(
-            "Delete forecast checkpoints before running. Pass a step key "
-            "(e.g. 'step4') to clear just that step, or no value to clear all. "
-            "Use this after fixing a bug to force the next run to redo work."
+            "Delete checkpoints before running. Pass a step key "
+            "(e.g. 'step4', 'ipd2bq', 'reports', 'merge') to clear just "
+            "that stage, or no value to clear all. Use this after fixing "
+            "a bug to force the next run to redo work."
         ),
     )
 
@@ -760,9 +842,9 @@ def main():
     if args.mode == "all":
         run_patents(drugs, args.workers, args.dry_run)
         run_forecast(drugs, args.workers, args.dry_run, resume=args.resume)
-        run_merge(args.dry_run)
-        run_ipd(drugs, args.workers, args.dry_run)
-        run_reports(drugs, args.workers, args.dry_run)
+        run_merge(args.dry_run, resume=args.resume)
+        run_ipd(drugs, args.workers, args.dry_run, resume=args.resume)
+        run_reports(drugs, args.workers, args.dry_run, resume=args.resume)
 
     elif args.mode == "patents":
         run_patents(drugs, args.workers, args.dry_run)
@@ -770,17 +852,18 @@ def main():
     elif args.mode == "forecast":
         # Forecast onward: skip the patents stage but run everything after
         # forecast as well (merge → IPD → reports). Resume defaults to ON
-        # for this mode so a re-run picks up where it left off.
+        # for this mode so a re-run picks up where it left off across
+        # every stage — step3/4/5/6, merge, ipd2/3/4, and reports.
         run_forecast(drugs, args.workers, args.dry_run, resume=args.resume)
-        run_merge(args.dry_run)
-        run_ipd(drugs, args.workers, args.dry_run)
-        run_reports(drugs, args.workers, args.dry_run)
+        run_merge(args.dry_run, resume=args.resume)
+        run_ipd(drugs, args.workers, args.dry_run, resume=args.resume)
+        run_reports(drugs, args.workers, args.dry_run, resume=args.resume)
 
     elif args.mode == "ipd":
-        run_ipd(drugs, args.workers, args.dry_run)
+        run_ipd(drugs, args.workers, args.dry_run, resume=args.resume)
 
     elif args.mode == "reports":
-        run_reports(drugs, args.workers, args.dry_run)
+        run_reports(drugs, args.workers, args.dry_run, resume=args.resume)
 
     banner(f"DONE — {time.time() - t0:.1f}s ({(time.time() - t0) / 60:.1f} min)")
 
