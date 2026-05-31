@@ -30,7 +30,8 @@ try:
     from dotenv import load_dotenv
 except ImportError:
     load_dotenv = lambda **kw: None  # Not needed on Cloud Run
-import google.generativeai as genai
+# google.generativeai is deprecated. Use google.genai (new SDK) only.
+from google import genai
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
@@ -237,15 +238,17 @@ def load_data_from_bigquery() -> tuple[pd.DataFrame, pd.DataFrame]:
 #  GEMINI SETUP
 # ═══════════════════════════════════════════════════════════════════════════
 load_dotenv(override=True)
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-gemini = genai.GenerativeModel("gemini-2.5-flash")
+GEMINI_MODEL = "gemini-2.5-flash"
+_genai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 
 def _call_gemini(prompt: str, retries: int = 3, backoff: float = 2.5) -> str:
     for attempt in range(retries):
         try:
-            resp = gemini.generate_content(prompt)
-            return resp.text.strip()
+            resp = _genai_client.models.generate_content(
+                model=GEMINI_MODEL, contents=prompt,
+            )
+            return (resp.text or "").strip()
         except Exception as e:
             if attempt < retries - 1:
                 wait = backoff * (2 ** attempt)
