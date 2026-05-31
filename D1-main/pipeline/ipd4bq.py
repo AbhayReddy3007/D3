@@ -1,5 +1,6 @@
 import pandas as pd
-import google.generativeai as genai
+# google.generativeai is deprecated. Use google.genai (new SDK) only.
+from google import genai
 try:
     from dotenv import load_dotenv
 except ImportError:
@@ -33,8 +34,8 @@ KEEP_COLUMNS = [
 # ────────────────────────────────────────────────────────────────────────────
 
 load_dotenv(override=True)
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel("gemini-2.5-flash")
+GEMINI_MODEL = "gemini-2.5-flash"
+_genai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 
 def _get_credentials():
@@ -69,8 +70,10 @@ def _normalize_year_only(val) -> str:
 def _call_gemini(prompt: str, retries: int = 3, backoff: float = 2.0) -> str | None:
     for attempt in range(retries):
         try:
-            resp = model.generate_content(prompt)
-            return resp.text.strip()
+            resp = _genai_client.models.generate_content(
+                model=GEMINI_MODEL, contents=prompt,
+            )
+            return (resp.text or "").strip()
         except Exception as e:
             if attempt < retries - 1:
                 wait = backoff * (2 ** attempt)
