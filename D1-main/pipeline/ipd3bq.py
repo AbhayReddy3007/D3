@@ -20,8 +20,8 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-import google.generativeai as genai
-from google import genai as genai_new
+# google.generativeai is deprecated. Use google.genai (new SDK) only.
+from google import genai
 from google.genai import types
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -31,13 +31,13 @@ try:
 except ImportError:
     pass  # Not needed on Cloud Run
 
-# ── Import AlloyDB client (same module used by C2-main) ──────────────────────
+# ── Import AlloyDB client (lives in cog/, not pipeline/) ─────────────────────
 import sys
-# Add C2-main's parent directory so we can import alloydb_client
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-C2_MAIN_DIR = os.path.join(SCRIPT_DIR, "C2-main")
-if C2_MAIN_DIR not in sys.path:
-    sys.path.insert(0, SCRIPT_DIR)
+COG_DIR = os.path.join(SCRIPT_DIR, "cog")
+for _p in (SCRIPT_DIR, COG_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from alloydb_client import AlloyDBClient
 
 # ── BigQuery Config (from .env) ───────────────────────────────────────────────
@@ -505,11 +505,22 @@ def fetch_relevant_chunks(client, drug: str, source_file: str,
 
 # ── Gemini Helpers ────────────────────────────────────────────────────────────
 
+_genai_client = None
+
+def _get_genai_client():
+    global _genai_client
+    if _genai_client is None:
+        _genai_client = genai.Client(api_key=API_KEY)
+    return _genai_client
+
+
 def call_gemini(prompt: str) -> dict:
-    genai.configure(api_key=API_KEY)
-    model = genai.GenerativeModel(GEMINI_MODEL)
-    response = model.generate_content(prompt)
-    text = response.text.strip()
+    client = _get_genai_client()
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+    )
+    text = (response.text or "").strip()
     text = re.sub(r"^```(?:json)?", "", text).strip()
     text = re.sub(r"```$", "", text).strip()
     return json.loads(text)
@@ -643,7 +654,7 @@ async def run_circumvention_analysis(
     t0 = time.time()
     print(f"\n[Circumvention] Analysing design-around strategies for {drug_name}...")
 
-    gemini_client = genai_new.Client(api_key=API_KEY)
+    gemini_client = genai.Client(api_key=API_KEY)
     search_tools = [types.Tool(google_search=types.GoogleSearch())]
     search_config = types.GenerateContentConfig(tools=search_tools, temperature=0.1)
 
