@@ -258,6 +258,133 @@ def _forecast_step_worker(drug, dry_run, step_script=None, step_label=None,
         return (drug, False, str(e))
 
 
+def _step5_company_worker(company_drugs, dry_run, step_script=None,
+                          step_label=None, resume=False):
+    """Run step5 for one (company, drugs) pair.
+
+    Why this exists separately from _forecast_step_worker:
+    step5 reviews a COMPANY's strategy, not a drug's. Calling it per-drug
+    fans out redundantly when one company owns multiple drugs in the set,
+    AND it fails outright when the orchestrator passes only `--drugs <x>`
+    without `--company`, because step5's batch fallback queries an
+    optional BQ_SOURCE_TABLE that often isn't populated. So we resolve
+    drugs → unique companies upstream and call step5 once per company,
+    passing all the company's drugs together via `--drugs A,B,C`.
+
+    company_drugs is a tuple/list: (company_name, [drug1, drug2, ...]).
+    The orchestrator's run_parallel calls worker_fn(item, dry_run), so
+    company_drugs arrives as the first positional arg.
+
+    Checkpoint key is the company name (not a drug), so re-runs skip
+    already-reviewed companies cleanly.
+    """
+    company, drugs_for_company = company_drugs
+
+    try:
+        from cog import forecast_checkpoint as _ckpt
+    except Exception:
+        _ckpt = None
+
+    if resume and _ckpt is not None and not dry_run:
+        if _ckpt.is_done(step_script, company):
+            print(f"  [SKIP] {step_label}: {company} — already marked done in GCS")
+            return (company, True, None)
+
+    try:
+        cmd = [PY, str(step_script), "--company", company]
+        if drugs_for_company:
+            cmd.extend(["--drugs", ",".join(drugs_for_company)])
+        run_step(
+            f"{step_label}: {company} ({len(drugs_for_company)} drug(s))",
+            cmd,
+            dry_run=dry_run,
+        )
+        if _ckpt is not None and not dry_run:
+            _ckpt.mark_done(step_script, company)
+        return (company, True, None)
+    except Exception as e:
+        return (company, False, str(e))
+
+
+def _resolve_drug_to_company(drugs):
+    """Map a list of drug names to their innovator companies.
+
+    Queries the merged forecast_s3 BQ table (which step3 writes with
+    --upload) for (drug_name, innovator). Returns a dict
+    {company_name: [drug1, drug2, ...]}. Returns {} if the table is
+    missing/empty/inaccessible — step5 will then be skipped with a
+    warning rather than failing the pipeline.
+
+    Drugs without a recognised innovator get bucketed under 'Unknown',
+    which we drop (step5 with company='Unknown' produces nothing useful).
+    """
+    try:
+        from google.cloud import bigquery
+        from google.oauth2 import service_account
+    except Exception as e:
+        print(f"[STEP5 PREP] BigQuery client unavailable ({e}); skipping company resolution")
+        return {}
+
+    project_id = (
+        os.getenv("BQ_PROJECT_ID")
+        or os.getenv("PROJECT_ID")
+        or os.getenv("BQ_UPLOAD_PROJECT")
+    )
+    dataset_id = os.getenv("BQ_DATASET_ID") or "cognito_prod_datamart"
+    table_name = os.getenv("BQ_FORECAST_S3_TABLE", "forecast_s3")
+    if not project_id:
+        print("[STEP5 PREP] BQ_PROJECT_ID not set — cannot resolve drugs→companies")
+        return {}
+
+    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if creds_path and os.path.exists(creds_path):
+        creds  = service_account.Credentials.from_service_account_file(creds_path)
+        client = bigquery.Client(credentials=creds, project=project_id)
+    else:
+        client = bigquery.Client(project=project_id)
+
+    fq_table = f"{project_id}.{dataset_id}.{table_name}"
+    drugs_param = [str(d) for d in drugs]
+
+    query = f"""
+      SELECT DISTINCT drug_name, innovator
+      FROM `{fq_table}`
+      WHERE drug_name IN UNNEST(@drugs)
+        AND innovator IS NOT NULL
+        AND TRIM(innovator) NOT IN ('', 'Unknown', 'unknown', 'N/A', 'nan')
+    """
+    try:
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("drugs", "STRING", drugs_param),
+            ]
+        )
+        df = client.query(query, job_config=job_config).to_dataframe()
+    except Exception as e:
+        print(f"[STEP5 PREP] forecast_s3 query failed ({e}); skipping company resolution")
+        return {}
+
+    if df.empty:
+        print(f"[STEP5 PREP] No (drug→innovator) rows found in {fq_table} for shard")
+        return {}
+
+    mapping = {}
+    for _, row in df.iterrows():
+        company = str(row["innovator"]).strip()
+        drug    = str(row["drug_name"]).strip()
+        if not company or not drug:
+            continue
+        mapping.setdefault(company, []).append(drug)
+
+    # Deduplicate the drug lists within each company
+    for c in mapping:
+        mapping[c] = sorted(set(mapping[c]))
+
+    found = sum(len(v) for v in mapping.values())
+    print(f"[STEP5 PREP] Resolved {found}/{len(drugs)} drug(s) → {len(mapping)} company(ies)")
+    return mapping
+
+
 def _run_forecast_step_global(step_label, step_script, extra_args=None,
                               dry_run=False, resume=False, drugs=None):
     """Run a forecast step that operates on a batch of drugs in one invocation.
@@ -371,11 +498,15 @@ def run_parallel(label, worker_fn, drugs, workers, dry_run=False):
             for drug in drugs
         }
         for future in as_completed(futures):
-            drug = futures[future]
+            item = futures[future]
+            # `item` may be a string (drug name) or a (name, payload) tuple
+            # depending on the worker. Use the first element for display
+            # when it's a tuple/list.
+            display_name = item[0] if isinstance(item, (tuple, list)) else item
             try:
                 drug_name, ok, err = future.result()
             except Exception as exc:
-                drug_name, ok, err = drug, False, str(exc)
+                drug_name, ok, err = display_name, False, str(exc)
 
             done += 1
             if ok:
@@ -421,32 +552,42 @@ def run_patents(drugs, workers, dry_run=False):
 def run_forecast(drugs, workers, dry_run=False, resume=False):
     banner("FORECASTING PIPELINE" + (" [RESUME]" if resume else ""))
 
-    # Each entry: (label, script, extra_args, drug_flag)
-    #   drug_flag = None  -> run ONCE globally (script processes all drugs)
-    #   drug_flag = "--drug"  -> run per drug, pass `--drug <name>`
-    #   drug_flag = "--drugs" -> run per drug, pass `--drugs <name>`
+    # Each entry: (label, script, extra_args, kind)
+    #   kind = "global"   -> one invocation per shard, uses --drugs A,B,C
+    #   kind = "per-drug" -> one invocation per drug, fans out in parallel
+    #   kind = "per-company" -> resolve drugs→companies, fan out per COMPANY
     #
-    # step3 does not accept --drug at all (it processes the whole dataset
-    # in one go via step1_ip_landscape/step2_patent_layering/step3_filing).
-    # step5 accepts --drugs (plural, comma-separated), not --drug.
+    # step3 used to be "global with no --drugs"; it now accepts --drugs so
+    #   the orchestrator can shard it across Cloud Run tasks.
+    # step5 was previously fanned out per-drug, which broke because step5
+    #   wants --company (not --drug). It also did redundant work when one
+    #   company owned multiple drugs. We now resolve drugs→companies first
+    #   and fan out per company.
     forecast_steps = [
         ("Step 3 — IP Landscape + Layering + Filing Analysis",
-         FORECAST_DIR / "step3.py", ["--upload"], None),
+         FORECAST_DIR / "step3.py", ["--upload"], "global"),
         ("Step 4 — Innovator Filing Patterns",
-         FORECAST_DIR / "step4.py", None, "--drug"),
+         FORECAST_DIR / "step4.py", None, "per-drug", "--drug"),
         ("Step 5 — Business Strategy Review",
-         FORECAST_DIR / "step5.py", None, "--drugs"),
+         FORECAST_DIR / "step5.py", None, "per-company", None),
         ("Step 6 — Patent Forecast Generator",
-         FORECAST_DIR / "step6.py", None, "--drug"),
+         FORECAST_DIR / "step6.py", None, "per-drug", "--drug"),
     ]
 
-    for step_label, step_script, extra_args, drug_flag in forecast_steps:
+    for entry in forecast_steps:
+        # Tolerate both 4-tuple (global) and 5-tuple (per-drug/per-company) shapes
+        if len(entry) == 4:
+            step_label, step_script, extra_args, kind = entry
+            drug_flag = None
+        else:
+            step_label, step_script, extra_args, kind, drug_flag = entry
+
         print(f"{BOLD}  {step_label}{RESET}")
 
-        if drug_flag is None:
-            # Global-style step (step3): runs once per task but now accepts
-            # a --drugs shard, so each Cloud Run task only processes its
-            # own slice instead of the whole dataset every time.
+        if kind == "global":
+            # Global-style step (step3): runs once per task with a --drugs
+            # shard, so each Cloud Run task only processes its own slice
+            # instead of the whole dataset every time.
             try:
                 _run_forecast_step_global(step_label, step_script, extra_args,
                                           dry_run, resume=resume, drugs=drugs)
@@ -456,10 +597,37 @@ def run_forecast(drugs, workers, dry_run=False, resume=False):
                 sys.exit(1)
             continue
 
-        # Per-drug step: parallelise across drugs.
-        # Use functools.partial over a top-level function so the worker is
-        # picklable for ProcessPoolExecutor. A nested closure here would
-        # raise "Can't pickle local object 'run_forecast.<locals>._step_worker'".
+        if kind == "per-company":
+            # Resolve drugs → unique companies (via forecast_s3 BQ table
+            # written by step3 --upload above). If the table is missing
+            # or no companies resolve, skip step5 with a warning rather
+            # than failing the pipeline; downstream steps don't depend
+            # on step5's output.
+            print(f"  [STEP5 PREP] Resolving drugs → companies for {len(drugs)} drug(s)...")
+            company_map = _resolve_drug_to_company(drugs)
+            if not company_map:
+                print(
+                    f"  {YELLOW}⚠ {step_label} — no companies resolved; "
+                    f"skipping. (Run step3 first, or check that forecast_s3 "
+                    f"has innovator data.){RESET}\n"
+                )
+                continue
+
+            # Build [(company, [drugs]), ...] in deterministic order
+            items = sorted(company_map.items(), key=lambda kv: kv[0])
+            print(f"  [STEP5 PREP] Will run {len(items)} company review(s)")
+
+            step_worker = functools.partial(
+                _step5_company_worker,
+                step_script=step_script,
+                step_label=step_label,
+                resume=resume,
+            )
+            # run_parallel expects "drugs" but accepts any iterable of items
+            run_parallel(step_label, step_worker, items, workers, dry_run)
+            continue
+
+        # Per-drug step (step4, step6): one invocation per drug
         step_worker = functools.partial(
             _forecast_step_worker,
             step_script=step_script,
