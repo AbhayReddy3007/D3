@@ -49,11 +49,12 @@ from docx.oxml.ns import nsdecls
 from docx.oxml import parse_xml
 
 try:
-    import google.generativeai as genai
+    # google.generativeai is deprecated. Use google.genai (new SDK) only.
+    from google import genai
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
-    print("[WARN] google-generativeai not installed.")
+    print("[WARN] google-genai not installed.")
 
 # ── Load .env ─────────────────────────────────────────────────────────────────
 try:
@@ -412,8 +413,7 @@ def call_gemini_for_narrative(drug_data: dict, api_key: str) -> dict:
     if not GEMINI_AVAILABLE:
         return _fallback_narrative(drug_data)
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(GEMINI_MODEL)
+    client = genai.Client(api_key=api_key)
 
     sd          = drug_data.get("score_data", {})
     final_score = sd.get("final_score", "N/A")
@@ -473,8 +473,10 @@ def call_gemini_for_narrative(drug_data: dict, api_key: str) -> dict:
     )
 
     try:
-        resp = model.generate_content(prompt)
-        text = resp.text.strip()
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL, contents=prompt,
+        )
+        text = (resp.text or "").strip()
         text = re.sub(r"^```(?:json)?", "", text).strip()
         text = re.sub(r"```$",          "", text).strip()
         return json.loads(text)
