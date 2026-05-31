@@ -31,13 +31,37 @@ try:
 except ImportError:
     pass  # Not needed on Cloud Run
 
-# ── Import AlloyDB client (lives in cog/, not pipeline/) ─────────────────────
+# ── Import AlloyDB client ─────────────────────────────────────────────────────
+# `alloydb_client.py` lives in `cog/` (a sibling package). Depending on how
+# this script is deployed it may sit at any of:
+#   <script_dir>/cog/alloydb_client.py            (running from pipeline/)
+#   <script_dir>/../cog/alloydb_client.py         (container layout: /app/Pipeline/ + /app/cog/)
+#   <script_dir>/alloydb_client.py                (rare — flat layout)
 import sys
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-COG_DIR = os.path.join(SCRIPT_DIR, "cog")
-for _p in (SCRIPT_DIR, COG_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+
+_alloydb_candidates = [
+    os.path.join(SCRIPT_DIR, "cog"),
+    os.path.join(SCRIPT_DIR, os.pardir, "cog"),
+    SCRIPT_DIR,
+]
+_alloydb_dir = next(
+    (d for d in _alloydb_candidates
+     if os.path.exists(os.path.join(d, "alloydb_client.py"))),
+    None,
+)
+if _alloydb_dir is None:
+    raise ModuleNotFoundError(
+        "alloydb_client.py not found. Looked in:\n  "
+        + "\n  ".join(os.path.abspath(d) for d in _alloydb_candidates)
+        + "\nMake sure cog/alloydb_client.py is included in your container "
+          "image and lives next to (or as a sibling of) this script."
+    )
+_alloydb_dir = os.path.abspath(_alloydb_dir)
+if _alloydb_dir not in sys.path:
+    sys.path.insert(0, _alloydb_dir)
+print(f"[IPD3BQ] alloydb_client located at: {_alloydb_dir}/alloydb_client.py")
+
 from alloydb_client import AlloyDBClient
 
 # ── BigQuery Config (from .env) ───────────────────────────────────────────────
