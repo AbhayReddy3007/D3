@@ -26,8 +26,8 @@ import time
 import argparse
 from datetime import datetime
 import pandas as pd
-import google.generativeai as genai
-from google import genai as genai_new
+# google.generativeai is deprecated. Use google.genai (new SDK) only.
+from google import genai
 from google.genai import types
 try:
     from dotenv import load_dotenv
@@ -38,12 +38,18 @@ from google.oauth2 import service_account
 
 load_dotenv(override=True)
 
-# ── Import AlloyDB client (same module used by C2-main) ──────────────────────
+# ── Import AlloyDB client (lives in cog/, not pipeline/) ─────────────────────
 import sys
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-C2_MAIN_DIR = os.path.join(SCRIPT_DIR, "C2-main")
-if C2_MAIN_DIR not in sys.path:
-    sys.path.insert(0, SCRIPT_DIR)
+# Put both `pipeline/` and `pipeline/cog/` on the path so `alloydb_client`
+# resolves whether it's used as `from alloydb_client import ...` (the form
+# below) or as `from cog import alloydb_client`. The previous code added
+# `pipeline/` and `pipeline/C2-main/` but the module actually lives in
+# `pipeline/cog/`, which neither covered — hence ModuleNotFoundError.
+COG_DIR = os.path.join(SCRIPT_DIR, "cog")
+for _p in (SCRIPT_DIR, COG_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from alloydb_client import AlloyDBClient
 
 # ── BigQuery Config (from .env) ───────────────────────────────────────────────
@@ -633,11 +639,25 @@ def fetch_relevant_chunks(client, drug, patent_number, source_file, sections, to
     return []
 
 
+# Lazy module-level client so we configure exactly once. The new SDK's
+# Client is cheap to keep around and is thread-safe for the synchronous
+# generate_content path we use here.
+_genai_client = None
+
+def _get_genai_client():
+    global _genai_client
+    if _genai_client is None:
+        _genai_client = genai.Client(api_key=API_KEY)
+    return _genai_client
+
+
 def call_gemini(prompt: str) -> dict:
-    genai.configure(api_key=API_KEY)
-    model = genai.GenerativeModel(GEMINI_MODEL)
-    response = model.generate_content(prompt)
-    text = response.text.strip()
+    client = _get_genai_client()
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+    )
+    text = (response.text or "").strip()
     text = re.sub(r"^```(?:json)?", "", text).strip()
     text = re.sub(r"```$", "", text).strip()
     return json.loads(text)
