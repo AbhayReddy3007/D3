@@ -178,7 +178,7 @@ def import_from_gbq(
 
         fq_table = f"{project_id}.{dataset_id}.{table_name}"
 
-        query = f"""
+        query = rf"""
         WITH filtered AS (
           SELECT
             molecule_name                                AS cleaned_generic_name,
