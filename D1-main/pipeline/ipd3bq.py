@@ -88,7 +88,7 @@ def load_data_from_bigquery() -> pd.DataFrame:
     credentials = _get_credentials()
     client = bigquery.Client(project=BQ_PROJECT_ID, credentials=credentials)
 
-    query = f"SELECT * FROM `{table_ref}`"
+    query = f"SELECT DISTINCT * FROM `{table_ref}`"
     print(f"[BigQuery] Running query: {query}")
     df = client.query(query, location=BQ_LOCATION).to_dataframe()
     print(f"[BigQuery] Loaded {len(df)} rows, columns: {list(df.columns)}")
@@ -573,10 +573,10 @@ def _repair_json(text: str):
 import concurrent.futures
 
 # Thread pool for running blocking Gemini calls concurrently
-_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 
 # Concurrency limit: how many categories/patents analysed at once
-CATEGORY_CONCURRENCY = 4
+CATEGORY_CONCURRENCY = 8
 
 
 async def _analyse_one_category(
