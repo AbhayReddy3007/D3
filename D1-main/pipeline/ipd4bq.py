@@ -511,6 +511,7 @@ def write_to_bigquery(df: pd.DataFrame, table_id: str) -> None:
     df = df.copy()
     df.columns = [_to_snake_case(c) for c in df.columns]
     df = df.astype(str).replace("nan", pd.NA).replace("<NA>", pd.NA)
+    df = df.drop_duplicates()
 
     credentials = _get_credentials()
     client = bigquery.Client(
@@ -521,7 +522,7 @@ def write_to_bigquery(df: pd.DataFrame, table_id: str) -> None:
 
     full_table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_id}"
     job_config = bigquery.LoadJobConfig(
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         autodetect=True,
     )
 
@@ -549,6 +550,7 @@ def main():
     # BQ has "PTE months"; code expects "PTE (months)"
     df.rename(columns={"PTE months": "PTE (months)"}, inplace=True)
     df = df.apply(lambda col: col.str.strip() if col.dtype == "object" else col)
+    df = df.drop_duplicates()
 
     total = len(df)
     print(f"\nTotal rows loaded           : {total}")
