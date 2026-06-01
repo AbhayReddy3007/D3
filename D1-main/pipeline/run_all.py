@@ -18,8 +18,8 @@ Cloud Run Jobs support:
 Pipeline order (sequential between stages):
   1. Patents   — patent pipeline + BQ upload, parallelised across drugs
   2. Forecast  — steps 3→4→5→6 (sequential), each step parallelised across drugs
-  3. Merge     — merge_to_master_loe.py (single step, runs once)
-  4. IPD       — ipd2bq + ipd3bq parallelised across drugs, then ipd4bq runs once (global)
+  3. Merge     — merge_to_master_loe.py (single step, runs once, only appends new rows)
+  4. IPD       — ipd2bq + ipd3bq + ipd4bq all parallelised across drugs
   5. Reports   — reports.py parallelised across drugs
 
 Usage:
@@ -432,10 +432,10 @@ def _run_forecast_step_global(step_label, step_script, extra_args=None,
 
 
 def _ipd_worker(drug, dry_run, resume=False):
-    """ipd2bq + ipd3bq for a single drug.
+    """ipd2bq + ipd3bq + ipd4bq for a single drug.
 
-    Checkpointed as two separate keys ('ipd2bq' and 'ipd3bq') because the
-    two scripts are independent — if ipd3bq fails after ipd2bq succeeded,
+    Checkpointed as three separate keys ('ipd2bq', 'ipd3bq', 'ipd4bq') because the
+    three scripts are independent — if ipd3bq fails after ipd2bq succeeded,
     a re-run with resume should skip ipd2bq and retry only ipd3bq.
     """
     try:
@@ -481,22 +481,33 @@ def _ipd_worker(drug, dry_run, resume=False):
         except Exception as e:
             return (drug, False, f"ipd3bq: {e}")
 
+    # ipd4bq — now per-drug (accepts a positional drug argument)
+    skip_4 = (
+        resume and _ckpt is not None and not dry_run
+        and _ckpt.is_done("ipd4bq", drug)
+    )
+    if skip_4:
+        print(f"  [SKIP] IPD4 BQ upload: {drug} — already marked done in GCS")
+    else:
+        try:
+            run_step(
+                f"IPD4 BQ upload: {drug}",
+                [PY, str(IPD4_SCRIPT), drug],
+                dry_run=dry_run,
+            )
+            if _ckpt is not None and not dry_run:
+                _ckpt.mark_done("ipd4bq", drug)
+        except Exception as e:
+            return (drug, False, f"ipd4bq: {e}")
+
     return (drug, True, None)
 
 
 def run_ipd4_global(dry_run=False, resume=False):
-    """Run ipd4bq exactly once (global step).
+    """DEPRECATED: ipd4bq now runs per-drug inside _ipd_worker.
 
-    ipd4bq loads the ENTIRE Master_LOE table, scores it, and writes the
-    derived table back with WRITE_TRUNCATE. It has no drug filter and
-    ignores any positional argument. Running it once per drug in parallel
-    would therefore make every worker reprocess the whole table and
-    concurrently truncate-overwrite the same output (a race + N× wasted
-    work), so it is run a single time after the per-drug ipd2/ipd3 stage —
-    the same way merge is handled.
-
-    When sharded across Cloud Run tasks, only task 0 runs it (matching
-    run_merge), with a single global checkpoint key.
+    Kept for backward compatibility if called directly. When called,
+    it runs ipd4bq without a drug filter (processes all drugs).
     """
     task_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0"))
     task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
@@ -773,13 +784,10 @@ def run_ipd(drugs, workers, dry_run=False, resume=False):
     # nested closure = not OK).
     ipd_worker  = functools.partial(_ipd_worker,  resume=resume)
 
-    # ipd2bq + ipd3bq — parallelised across drugs (both honour a --drug filter)
-    run_parallel("IPD (ipd2bq + ipd3bq)", ipd_worker, drugs, workers, dry_run)
-
-    # ipd4bq — GLOBAL step, runs exactly once (see run_ipd4_global). It has no
-    # drug filter and truncate-writes the whole derived table, so it must not
-    # be fanned out per-drug.
-    run_ipd4_global(dry_run=dry_run, resume=resume)
+    # ipd2bq + ipd3bq + ipd4bq — all parallelised across drugs
+    # ipd4bq now accepts a --drug filter and processes only that drug's
+    # rows from Master_LOE, so it can safely run per-drug in parallel.
+    run_parallel("IPD (ipd2bq + ipd3bq + ipd4bq)", ipd_worker, drugs, workers, dry_run)
 
 
 def run_reports(drugs, workers, dry_run=False, resume=False):
@@ -825,8 +833,9 @@ def main():
         "--resume", dest="resume", action="store_true", default=None,
         help=(
             "Skip drugs/stages already marked done in the GCS checkpoint "
-            "store. Covers forecast (step3/4/5/6), merge, IPD (ipd2/3/4), "
-            "and reports. Default ON for --mode forecast, OFF otherwise."
+            "store. Covers forecast (step3/4/5/6), merge, IPD (ipd2/3/4 "
+            "all per-drug), and reports. Default ON for --mode forecast, "
+            "OFF otherwise."
         ),
     )
     parser.add_argument(
