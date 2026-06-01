@@ -41,52 +41,38 @@ except ImportError:
 
 # ── Connection setup ─────────────────────────────────────────────────────────
 
-_user = os.getenv("ALLOYDB_USER", "postgres")
-_db   = os.getenv("ALLOYDB_DB", "postgres")
+_raw_password = os.getenv("ALLOYDB_PASSWORD")
+_ip           = os.getenv("ALLOYDB_HOST")
+_user         = os.getenv("ALLOYDB_USER", "postgres")
+_db           = os.getenv("ALLOYDB_DB", "postgres")
 
-# The connection string and schema check are built lazily (on the first
-# connection) rather than at import time, so that importing this module does
-# NOT require AlloyDB credentials to be present — only actually using the
-# database does. This keeps the module importable for tooling, tests, and
-# partial pipeline runs (e.g. report-only) that never touch AlloyDB, and
-# avoids opening a network connection just to import.
-DATABASE_URL = None
-_schema_ready = False
+if not _raw_password or not _ip:
+    raise EnvironmentError(
+        "Missing ALLOYDB_PASSWORD or ALLOYDB_HOST in environment. "
+        "Set them as environment variables."
+    )
 
-
-def _build_database_url() -> str:
-    raw_password = os.getenv("ALLOYDB_PASSWORD")
-    ip           = os.getenv("ALLOYDB_HOST")
-    if not raw_password or not ip:
-        raise EnvironmentError(
-            "Missing ALLOYDB_PASSWORD or ALLOYDB_HOST in environment. "
-            "Set them as environment variables."
-        )
-    encoded_password = urllib.parse.quote_plus(raw_password)
-    return f"postgresql://{_user}:{encoded_password}@{ip}:5432/{_db}"
+_encoded_password = urllib.parse.quote_plus(_raw_password)
+DATABASE_URL = f"postgresql://{_user}:{_encoded_password}@{_ip}:5432/{_db}"
 
 
-def _get_conn():
-    """Get a new psycopg2 connection (autocommit off by default).
-
-    The connection string is resolved on first use, and the schema is
-    ensured exactly once (the first time a connection is opened).
-    """
-    global DATABASE_URL, _schema_ready
-    if DATABASE_URL is None:
-        DATABASE_URL = _build_database_url()
-    conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
-    if not _schema_ready:
-        # Set the flag before calling _ensure_schema() (which itself opens a
-        # connection) to avoid re-entrant schema checks; reset on failure so
-        # the next connection retries.
-        _schema_ready = True
+def _get_conn(retries=3, backoff=2.0):
+    """Get a new psycopg2 connection with retry logic for transient failures."""
+    last_err = None
+    for attempt in range(retries):
         try:
-            _ensure_schema()
-        except Exception as e:
-            _schema_ready = False
-            print(f"[ALLOYDB] Schema ensure deferred (will retry): {e}")
-    return conn
+            return psycopg2.connect(DATABASE_URL, connect_timeout=30)
+        except psycopg2.OperationalError as e:
+            last_err = e
+            if attempt < retries - 1:
+                wait = backoff * (2 ** attempt)
+                print(f"[ALLOYDB] Connection attempt {attempt+1}/{retries} failed: {e}")
+                print(f"[ALLOYDB] Retrying in {wait}s...")
+                import time
+                time.sleep(wait)
+            else:
+                print(f"[ALLOYDB] All {retries} connection attempts failed.")
+    raise last_err
 
 
 # ── Ensure schema exists ─────────────────────────────────────────────────────
@@ -177,10 +163,16 @@ def _ensure_schema():
 
     print("[ALLOYDB] Schema verified / migrated")
 
+# Lazy initialization — don't connect at import time.
+# _ensure_schema() is called on first actual DB operation instead.
+_schema_ready = False
 
-# Schema is ensured lazily on the first connection (see _get_conn), so there
-# is no module-level _ensure_schema() call here — importing this module no
-# longer opens a database connection.
+def _lazy_ensure_schema():
+    """Call _ensure_schema() once, on first actual use. Never at import time."""
+    global _schema_ready
+    if not _schema_ready:
+        _ensure_schema()
+        _schema_ready = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -206,6 +198,7 @@ class AlloyDBCollection:
         metadatas:  List[dict],
     ):
         """Insert rows. Uses ON CONFLICT to upsert."""
+        _lazy_ensure_schema()
         conn = _get_conn()
         try:
             with conn.cursor() as cur:
@@ -248,6 +241,7 @@ class AlloyDBCollection:
         Retrieve rows by ids or by metadata filter.
         Returns ChromaDB-style dict: {ids, documents, metadatas, embeddings}.
         """
+        _lazy_ensure_schema()
         include = include or []
         conn = _get_conn()
         try:
@@ -307,6 +301,7 @@ class AlloyDBCollection:
         Vector similarity search using pgvector cosine distance (<=>).
         Returns ChromaDB-style nested lists: {ids: [[]], documents: [[]], ...}.
         """
+        _lazy_ensure_schema()
         include = include or ["documents"]
         emb = query_embeddings[0]
         emb_str = "[" + ",".join(str(v) for v in emb) + "]"
@@ -351,6 +346,7 @@ class AlloyDBCollection:
         metadatas: List[dict],
     ):
         """Update metadata for existing rows."""
+        _lazy_ensure_schema()
         conn = _get_conn()
         try:
             with conn.cursor() as cur:
@@ -375,6 +371,7 @@ class AlloyDBCollection:
         where: Optional[dict] = None,
     ):
         """Delete rows by ids or metadata filter."""
+        _lazy_ensure_schema()
         conn = _get_conn()
         try:
             with conn.cursor() as cur:
@@ -413,6 +410,7 @@ class AlloyDBClient:
         Get a collection by name.
         Raises ValueError if no rows exist for this collection name.
         """
+        _lazy_ensure_schema()
         conn = _get_conn()
         try:
             with conn.cursor() as cur:
@@ -441,6 +439,7 @@ class AlloyDBClient:
 
     def delete_collection(self, name: str):
         """Delete all rows belonging to a collection."""
+        _lazy_ensure_schema()
         conn = _get_conn()
         try:
             with conn.cursor() as cur:
@@ -458,6 +457,7 @@ class AlloyDBClient:
 
     def list_collections(self) -> List:
         """List all distinct collection names. Returns list of objects with .name attr."""
+        _lazy_ensure_schema()
         conn = _get_conn()
         try:
             with conn.cursor() as cur:
