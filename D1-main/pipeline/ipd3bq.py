@@ -853,8 +853,9 @@ def write_circumvention_to_bq(circumvention_by_drug: dict):
     table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_CIRC_TABLE}"
     client = _get_bq_client()
 
+    df_circ = df_circ.drop_duplicates()
     job_config = bigquery.LoadJobConfig(
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         autodetect=True,
     )
     job = client.load_table_from_dataframe(df_circ, table_ref, job_config=job_config,
@@ -925,8 +926,9 @@ def write_score_to_bq(drug_scores: list):
     table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_SCORE_TABLE}"
     client = _get_bq_client()
 
+    df_score = df_score.drop_duplicates()
     job_config = bigquery.LoadJobConfig(
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         autodetect=True,
     )
     job = client.load_table_from_dataframe(df_score, table_ref, job_config=job_config,
@@ -942,6 +944,7 @@ def process_patents(skip_circumvention=False, drug_filter=None):
     # ── Load from BigQuery ────────────────────────────────────────────────
     df = load_data_from_bigquery()
     df.columns = df.columns.str.strip()
+    df = df.drop_duplicates()
 
     # All values arrive as STR from BQ; coerce required text columns
     for col in ["Tag", "Step 1 Claim Category", "Phase", "Drug Name"]:
