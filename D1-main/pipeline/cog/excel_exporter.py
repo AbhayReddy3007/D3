@@ -26,6 +26,12 @@ from . import gcs_cache
 
 _EXCEL_SUBFOLDER = "patent_exports"
 
+# Informational path describing where Excel output lives. The actual files are
+# written to GCS (see export_to_excel / gcs_cache), not the local filesystem;
+# this Path exists so callers that report an output location have a value to
+# show (e.g. the agent's result summary).
+EXCEL_OUTPUT_DIR = Path(_EXCEL_SUBFOLDER)
+
 
 # ─────────────────────────────────────────────
 # Helpers
@@ -304,3 +310,106 @@ def export_combined_excel(analysis_date: str) -> Optional[str]:
         print(f"[COMBINED EXCEL] Failed: {e}")
         print(traceback.format_exc())
         return None
+
+
+# ─────────────────────────────────────────────
+# BigQuery export
+# ─────────────────────────────────────────────
+# BigQuery upload reuses the canonical uploader in 2bq.py (build_rows +
+# upload_to_bigquery) so the row schema and the row-level upsert logic stay
+# identical to the standalone `2bq.py` step the orchestrator runs. 2bq.py is a
+# top-level script whose filename starts with a digit, so it cannot be
+# imported with a normal `import` statement; it is loaded lazily via importlib
+# the first time a BigQuery export is requested (this also avoids paying the
+# import cost — and any circular-import risk — when only Excel export is used).
+
+import importlib.util
+
+_bq_module = None
+
+
+def _load_bq_module():
+    """Lazily load the sibling 2bq.py module (digit-leading filename)."""
+    global _bq_module
+    if _bq_module is None:
+        bq_path = Path(__file__).resolve().parent.parent / "2bq.py"
+        spec = importlib.util.spec_from_file_location("_bq_uploader", str(bq_path))
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load BigQuery uploader from {bq_path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _bq_module = mod
+    return _bq_module
+
+
+def export_to_bigquery(drug_name: str, patents: List[Dict]) -> bool:
+    """Upload a single drug's patent rows to BigQuery (loe_table).
+
+    Delegates to 2bq.py's build_rows + upload_to_bigquery so the schema and
+    upsert behaviour match the standalone `2bq.py --drug` step. Uses
+    replace_drugs=True so re-uploading a drug replaces its rows rather than
+    accumulating duplicates. Returns True on success, False otherwise.
+    """
+    try:
+        if not patents:
+            print(f"[BQ] '{drug_name}' — no patents to upload")
+            return False
+        bq = _load_bq_module()
+        rows = bq.build_rows(drug_name, patents)
+        if not rows:
+            print(f"[BQ] '{drug_name}' — no rows built")
+            return False
+        df = pd.DataFrame(rows)
+        return bq.upload_to_bigquery(
+            df=df,
+            project_id=bq.DEFAULT_PROJECT,
+            dataset_id=bq.DEFAULT_DATASET,
+            table_id=bq.DEFAULT_TABLE,
+            location=bq.DEFAULT_LOCATION,
+            replace_drugs=True,
+        )
+    except Exception as e:
+        import traceback
+        print(f"[BQ] Upload failed for '{drug_name}': {e}")
+        print(traceback.format_exc())
+        return False
+
+
+def export_combined_bigquery(analysis_date: str) -> bool:
+    """Upload every cached drug's patent rows to BigQuery in one batch.
+
+    Reads all drug payloads from the same results cache 2bq.py reads, builds
+    rows via 2bq.py's build_rows, and uploads the combined set. analysis_date
+    is accepted for interface consistency; the cache already reflects the
+    latest analysis. Returns True on success, False otherwise.
+    """
+    try:
+        bq = _load_bq_module()
+        payloads = bq.load_all_from_cache()
+        if not payloads:
+            print("[BQ COMBINED] No cached results to upload")
+            return False
+        all_rows = []
+        for payload in payloads:
+            d = payload.get("drug", "unknown")
+            pats = payload.get("patents", [])
+            if not pats:
+                continue
+            all_rows.extend(bq.build_rows(d, pats))
+        if not all_rows:
+            print("[BQ COMBINED] No rows to upload")
+            return False
+        df = pd.DataFrame(all_rows)
+        return bq.upload_to_bigquery(
+            df=df,
+            project_id=bq.DEFAULT_PROJECT,
+            dataset_id=bq.DEFAULT_DATASET,
+            table_id=bq.DEFAULT_TABLE,
+            location=bq.DEFAULT_LOCATION,
+            replace_drugs=True,
+        )
+    except Exception as e:
+        import traceback
+        print(f"[BQ COMBINED] Upload failed: {e}")
+        print(traceback.format_exc())
+        return False
