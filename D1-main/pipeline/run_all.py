@@ -19,7 +19,7 @@ Pipeline order (sequential between stages):
   1. Patents   — patent pipeline + BQ upload, parallelised across drugs
   2. Forecast  — steps 3→4→5→6 (sequential), each step parallelised across drugs
   3. Merge     — merge_to_master_loe.py (single step, runs once)
-  4. IPD       — ipd2bq + ipd3bq parallelised across drugs, then ipd4bq parallelised across drugs
+  4. IPD       — ipd2bq + ipd3bq parallelised across drugs, then ipd4bq runs once (global)
   5. Reports   — reports.py parallelised across drugs
 
 Usage:
@@ -484,52 +484,90 @@ def _ipd_worker(drug, dry_run, resume=False):
     return (drug, True, None)
 
 
-def _ipd4_worker(drug, dry_run, resume=False):
-    """ipd4bq for a single drug."""
+def run_ipd4_global(dry_run=False, resume=False):
+    """Run ipd4bq exactly once (global step).
+
+    ipd4bq loads the ENTIRE Master_LOE table, scores it, and writes the
+    derived table back with WRITE_TRUNCATE. It has no drug filter and
+    ignores any positional argument. Running it once per drug in parallel
+    would therefore make every worker reprocess the whole table and
+    concurrently truncate-overwrite the same output (a race + N× wasted
+    work), so it is run a single time after the per-drug ipd2/ipd3 stage —
+    the same way merge is handled.
+
+    When sharded across Cloud Run tasks, only task 0 runs it (matching
+    run_merge), with a single global checkpoint key.
+    """
+    task_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0"))
+    task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
+
+    if task_count > 1 and task_index != 0:
+        print(f"{YELLOW}[SHARD] IPD4 skipped on task {task_index} "
+              f"(only task 0 runs the global ipd4bq step){RESET}\n")
+        return
+
     try:
         from cog import forecast_checkpoint as _ckpt
     except Exception:
         _ckpt = None
 
-    if resume and _ckpt is not None and not dry_run and _ckpt.is_done("ipd4bq", drug):
-        print(f"  [SKIP] IPD4 BQ upload: {drug} — already marked done in GCS")
-        return (drug, True, None)
+    if resume and _ckpt is not None and not dry_run and _ckpt.is_done("ipd4bq", None):
+        print(f"{YELLOW}[SKIP] IPD4 BQ upload — already marked done in GCS{RESET}\n")
+        return
 
     try:
         run_step(
-            f"IPD4 BQ upload: {drug}",
-            [PY, str(IPD4_SCRIPT), drug],
+            "IPD4 BQ upload (global)",
+            [PY, str(IPD4_SCRIPT)],
             dry_run=dry_run,
         )
         if _ckpt is not None and not dry_run:
-            _ckpt.mark_done("ipd4bq", drug)
-        return (drug, True, None)
+            _ckpt.mark_done("ipd4bq", None)
     except Exception as e:
-        return (drug, False, str(e))
+        print(f"{RED}✗ IPD4 BQ upload failed: {e}{RESET}")
+        raise
 
 
-def _reports_worker(drug, dry_run, resume=False):
-    """reports.py for a single drug."""
+def run_reports_global(dry_run=False, resume=False):
+    """Run reports.py exactly once (global step).
+
+    reports.py is a wrapper that loads every drug from BigQuery itself and
+    generates all report types for all drugs in a single run (it does not
+    accept or honour a per-drug argument). Fanning it out per-drug in
+    parallel would make every worker regenerate the full report set and
+    race on the same GCS/BigQuery writes, so it is run a single time.
+
+    When sharded across Cloud Run tasks, only task 0 runs it (matching
+    run_merge / run_ipd4_global), with a single global checkpoint key.
+    """
+    task_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0"))
+    task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
+
+    if task_count > 1 and task_index != 0:
+        print(f"{YELLOW}[SHARD] Reports skipped on task {task_index} "
+              f"(only task 0 runs the global reports step){RESET}\n")
+        return
+
     try:
         from cog import forecast_checkpoint as _ckpt
     except Exception:
         _ckpt = None
 
-    if resume and _ckpt is not None and not dry_run and _ckpt.is_done("reports", drug):
-        print(f"  [SKIP] Reports: {drug} — already marked done in GCS")
-        return (drug, True, None)
+    if resume and _ckpt is not None and not dry_run and _ckpt.is_done("reports", None):
+        print(f"{YELLOW}[SKIP] Reports — already marked done in GCS{RESET}\n")
+        return
 
     try:
         run_step(
-            f"Reports: {drug}",
-            [PY, str(REPORTS_SCRIPT), drug],
+            "Reports (global)",
+            [PY, str(REPORTS_SCRIPT)],
             dry_run=dry_run,
         )
         if _ckpt is not None and not dry_run:
-            _ckpt.mark_done("reports", drug)
-        return (drug, True, None)
+            _ckpt.mark_done("reports", None)
     except Exception as e:
-        return (drug, False, str(e))
+        print(f"{RED}✗ Reports failed: {e}{RESET}")
+        raise
 
 
 # ── Parallel runner ──────────────────────────────────────────────────────────
@@ -734,19 +772,23 @@ def run_ipd(drugs, workers, dry_run=False, resume=False):
     # rule as the forecast workers (top-level function + partial = OK,
     # nested closure = not OK).
     ipd_worker  = functools.partial(_ipd_worker,  resume=resume)
-    ipd4_worker = functools.partial(_ipd4_worker, resume=resume)
 
-    # ipd2bq + ipd3bq — parallelised across drugs
+    # ipd2bq + ipd3bq — parallelised across drugs (both honour a --drug filter)
     run_parallel("IPD (ipd2bq + ipd3bq)", ipd_worker, drugs, workers, dry_run)
 
-    # ipd4bq — parallelised across drugs
-    run_parallel("IPD4 BQ upload", ipd4_worker, drugs, workers, dry_run)
+    # ipd4bq — GLOBAL step, runs exactly once (see run_ipd4_global). It has no
+    # drug filter and truncate-writes the whole derived table, so it must not
+    # be fanned out per-drug.
+    run_ipd4_global(dry_run=dry_run, resume=resume)
 
 
 def run_reports(drugs, workers, dry_run=False, resume=False):
     banner("REPORTS GENERATION" + (" [RESUME]" if resume else ""))
-    reports_worker = functools.partial(_reports_worker, resume=resume)
-    run_parallel("Reports", reports_worker, drugs, workers, dry_run)
+    # reports.py is a GLOBAL step (see run_reports_global): it loads all drugs
+    # itself and produces the full report set in one run, so it is not fanned
+    # out per-drug. `drugs`/`workers` are accepted for signature consistency
+    # with the other stages but are intentionally unused here.
+    run_reports_global(dry_run=dry_run, resume=resume)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
