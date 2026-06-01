@@ -66,25 +66,42 @@ def _blob_path(subfolder: str, *parts: str) -> str:
 # Core operations
 # ─────────────────────────────────────────────
 
-def write_json(subfolder: str, filename: str, data: dict, drug_name: str = None) -> str:
+def write_json(subfolder: str, filename: str, data: dict, drug_name: str = None,
+               retries: int = 4, backoff: float = 2.0) -> str:
     """
-    Write a JSON dict to GCS.
+    Write a JSON dict to GCS with retry for transient errors (429, 5xx).
 
     Args:
         subfolder:  Cache category (e.g. "results_cache", "analysis_cache")
         filename:   Filename within the subfolder
         data:       Dict to serialize as JSON
         drug_name:  Optional drug subdirectory
+        retries:    Max retry attempts
+        backoff:    Base backoff in seconds (doubles each attempt)
 
     Returns:
         GCS URI of the written blob.
     """
+    import time as _time
+
     parts = [drug_name, filename] if drug_name else [filename]
     blob_name = _blob_path(subfolder, *parts)
-    blob = _bucket().blob(blob_name)
     content = json.dumps(data, indent=2, default=str)
-    blob.upload_from_string(content, content_type="application/json")
     uri = f"gs://{GCS_BUCKET_NAME}/{blob_name}"
+
+    for attempt in range(retries):
+        try:
+            blob = _bucket().blob(blob_name)
+            blob.upload_from_string(content, content_type="application/json")
+            return uri
+        except Exception as e:
+            err_str = str(e)
+            is_retryable = "429" in err_str or "500" in err_str or "503" in err_str
+            if is_retryable and attempt < retries - 1:
+                wait = backoff * (2 ** attempt)
+                _time.sleep(wait)
+            else:
+                raise
     return uri
 
 
@@ -156,13 +173,28 @@ def delete_prefix(subfolder: str, drug_name: str = None) -> int:
 
 def write_bytes(subfolder: str, filename: str, data: bytes,
                 content_type: str = "application/octet-stream",
-                drug_name: str = None) -> str:
-    """Write raw bytes to GCS. Returns GCS URI."""
+                drug_name: str = None, retries: int = 4, backoff: float = 2.0) -> str:
+    """Write raw bytes to GCS with retry. Returns GCS URI."""
+    import time as _time
+
     parts = [drug_name, filename] if drug_name else [filename]
     blob_name = _blob_path(subfolder, *parts)
-    blob = _bucket().blob(blob_name)
-    blob.upload_from_string(data, content_type=content_type)
-    return f"gs://{GCS_BUCKET_NAME}/{blob_name}"
+    uri = f"gs://{GCS_BUCKET_NAME}/{blob_name}"
+
+    for attempt in range(retries):
+        try:
+            blob = _bucket().blob(blob_name)
+            blob.upload_from_string(data, content_type=content_type)
+            return uri
+        except Exception as e:
+            err_str = str(e)
+            is_retryable = "429" in err_str or "500" in err_str or "503" in err_str
+            if is_retryable and attempt < retries - 1:
+                wait = backoff * (2 ** attempt)
+                _time.sleep(wait)
+            else:
+                raise
+    return uri
 
 
 def read_bytes(subfolder: str, filename: str, drug_name: str = None) -> Optional[bytes]:
