@@ -48,12 +48,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 # Report manifest: (module_file, report_label, gcs_filename)
 REPORT_MANIFEST = [
-    ("1bqreport.py",   "LOE Primary Market",      "1.Primary Market Entry Horizon.pdf"),
-    ("2bqreport.py",   "Patent Strength",          "2.Patent Strength and Invalidity Opportunity.docx"),
-    ("3bqreport.py",   "Patent Thicket",           "3.Patent Thicket and Circumvention Feasibility.pdf"),
-    ("4bqreport.py",   "Secondary Market LOE",     "4.Global Launch Sequencing & Arbitrage.pdf"),
-    ("PTE_analysis",   "PTE Analysis",             "5.PTE Analysis.pdf"),
-    ("bq_block.py",    "Blocking Analysis",        "6.Blocking Analysis.pdf"),
+    ("1bqreport.py",      "LOE Primary Market",      "1.Primary Market Entry Horizon.pdf"),
+    ("2bqreport.py",      "Patent Strength",          "2.Patent Strength and Invalidity Opportunity.docx"),
+    ("3bqreport.py",      "Patent Thicket",           "3.Patent Thicket and Circumvention Feasibility.pdf"),
+    ("4bqreport.py",      "Secondary Market LOE",     "4.Global Launch Sequencing & Arbitrage.pdf"),
+    ("PTE_analysis",      "PTE Analysis",             "5.PTE Analysis.pdf"),
+    ("bq_block.py",       "Blocking Analysis",        "6.Blocking Analysis.pdf"),
+    ("forecast_report.py","Forecast Report",          "7.Forecast_Report.pdf"),
 ]
 
 
@@ -88,11 +89,49 @@ def _get_gcs_client():
     return storage.Client(project=os.getenv("BQ_PROJECT_ID", "cognito-prod-394707"), credentials=credentials)
 
 
+def _archive_existing_blob(bucket, blob_name: str, safe_name: str,
+                           gcs_filename: str) -> None:
+    """Copy any existing blob at `blob_name` to
+    `…/{drug}/IP/archive/<YYYYMMDD-HHMMSS>_<gcs_filename>` before overwrite.
+
+    Best-effort: a failure here logs a warning and returns; the caller
+    proceeds with the upload regardless. Run weekly, this gives you a
+    per-week archive of every report version.
+    """
+    try:
+        existing = bucket.blob(blob_name)
+        if not existing.exists():
+            return
+        existing.reload()
+        prior_ts = existing.updated or existing.time_created or datetime.now()
+        ts_str = prior_ts.strftime("%Y%m%d-%H%M%S")
+        archive_name = (
+            f"{GCS_BASE_PATH}/{safe_name}/{GCS_SUBFOLDER}"
+            f"/archive/{ts_str}_{gcs_filename}"
+        )
+        bucket.copy_blob(existing, bucket, new_name=archive_name)
+        print(f"    📦 archived prior version → gs://{GCS_BUCKET}/{archive_name}")
+    except Exception as arch_exc:
+        print(f"    [WARN] archive step failed for {gcs_filename}: {arch_exc}")
+
+
 def upload_to_gcs(local_path: str, drug_name: str, gcs_filename: str) -> str:
     """
     Upload a local file to:
         gs://cognito-gcs/Cognito_new/reports/{drug_name}/IP/{gcs_filename}
     Returns the GCS URI.
+
+    Archiving:
+      Before overwriting an existing blob at the destination path, the
+      current version is COPIED to:
+          gs://…/{drug_name}/IP/archive/<YYYYMMDD-HHMMSS>_<gcs_filename>
+      …using the existing blob's upload time as the timestamp (not now)
+      so the archive name reflects when the prior report was generated.
+      This gives you a per-week run history since the pipeline runs once
+      a week — every Monday's run preserves the prior Monday's file.
+
+      The archive step is best-effort: if it fails (e.g., permissions),
+      we log and continue with the upload rather than blocking the run.
     """
     from google.cloud import storage  # noqa: F811
 
@@ -104,7 +143,10 @@ def upload_to_gcs(local_path: str, drug_name: str, gcs_filename: str) -> str:
     bucket = client.bucket(GCS_BUCKET)
     blob   = bucket.blob(blob_name)
 
-    # Choose content type
+    # ── Archive existing version, if any ────────────────────────────────────
+    _archive_existing_blob(bucket, blob_name, safe_name, gcs_filename)
+
+    # ── Upload the new version (overwrites in place) ────────────────────────
     ct = "application/pdf"
     if gcs_filename.endswith(".docx"):
         ct = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -197,6 +239,7 @@ def _run_1bqreport(mod) -> list:
             client = storage.Client(project=os.getenv("BQ_PROJECT_ID", "cognito-prod-394707"), credentials=_get_credentials())
             bucket = client.bucket(GCS_BUCKET)
             blob   = bucket.blob(blob_name)
+            _archive_existing_blob(bucket, blob_name, safe_name, mod.GCS_FILE_NAME)
             blob.upload_from_filename(local_path, content_type="application/pdf")
             print(f"  Upload successful: {gcs_uri}")
         except Exception as e:
@@ -258,6 +301,7 @@ def _run_2bqreport(mod) -> list:
             print(f"  Uploading to GCS: {gcs_uri}")
             try:
                 blob = bucket.blob(blob_name)
+                _archive_existing_blob(bucket, blob_name, safe_name, mod.GCS_FILE_NAME)
                 blob.upload_from_filename(
                     local_path,
                     content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -421,6 +465,38 @@ def _run_pte_analysis(mod) -> list:
     return results
 
 
+def _run_forecast_report(mod) -> list:
+    """Forecast Report — one PDF per drug.
+
+    Delegates to forecast_report.py's `generate_report(drug, output_dir)`,
+    which loads its own data from BigQuery (patent_forecast_scored +
+    Master_LOE) and writes a `<drug>_Forecast_Report.pdf` into output_dir.
+    We then rename each output to the manifest-standard `Forecast_Report.pdf`
+    in a per-drug subfolder so the upload step can pick it up by drug.
+    """
+    output_dir = SCRIPT_DIR / "reports" / "7_forecast_report"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Discover drugs the same way forecast_report itself does, so we don't
+    # depend on any other table for the list.
+    drugs = mod._list_drugs() if hasattr(mod, "_list_drugs") else []
+    if not drugs:
+        print("    [SKIP] No drugs available from forecast_report._list_drugs()")
+        return []
+
+    results = []
+    for drug in drugs:
+        try:
+            pdf_path = mod.generate_report(drug, str(output_dir))
+            if pdf_path and Path(pdf_path).exists():
+                results.append((drug, pdf_path))
+            else:
+                print(f"    [WARN] Forecast report produced no file for '{drug}'")
+        except Exception as exc:
+            print(f"    [ERROR] Forecast report failed for '{drug}': {exc}")
+    return results
+
+
 def _run_bq_block(mod) -> list:
     """Blocking Patent Analysis — one PDF per drug."""
     import tempfile
@@ -550,12 +626,13 @@ def _run_bq_block(mod) -> list:
 
 # Map module filenames → runner functions
 RUNNERS = {
-    "1bqreport.py":  _run_1bqreport,
-    "2bqreport.py":  _run_2bqreport,
-    "3bqreport.py":  _run_3bqreport,
-    "4bqreport.py":  _run_4bqreport,
-    "PTE_analysis":  _run_pte_analysis,
-    "bq_block.py":   _run_bq_block,
+    "1bqreport.py":       _run_1bqreport,
+    "2bqreport.py":       _run_2bqreport,
+    "3bqreport.py":       _run_3bqreport,
+    "4bqreport.py":       _run_4bqreport,
+    "PTE_analysis":       _run_pte_analysis,
+    "bq_block.py":        _run_bq_block,
+    "forecast_report.py": _run_forecast_report,
 }
 
 
