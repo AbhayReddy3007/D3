@@ -37,8 +37,35 @@ from .alloydb_client import AlloyDBClient
 # ─────────────────────────────────────────────
 
 import os
-api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-gemini_client = genai.Client(api_key=api_key)
+
+
+class _LazyGenaiClient:
+    """Lazily instantiate the real genai.Client on first attribute access.
+
+    Importing this module no longer requires GOOGLE_API_KEY/GEMINI_API_KEY to
+    be present — the key is only required the first time the client is
+    actually used. All existing call sites (gemini_client.models...,
+    gemini_client.aio..., gemini_client.files...) work unchanged because
+    attribute access is transparently forwarded to the real client.
+    """
+    _client = None
+
+    def _resolve(self):
+        if _LazyGenaiClient._client is None:
+            key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+            if not key:
+                raise RuntimeError(
+                    "GOOGLE_API_KEY or GEMINI_API_KEY must be set to use the "
+                    "Gemini client."
+                )
+            _LazyGenaiClient._client = genai.Client(api_key=key)
+        return _LazyGenaiClient._client
+
+    def __getattr__(self, name):
+        return getattr(self._resolve(), name)
+
+
+gemini_client = _LazyGenaiClient()
 
 chroma_client = AlloyDBClient()
 print("[ALLOYDB] Client initialized")
