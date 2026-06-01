@@ -38,8 +38,27 @@ BQ_DATASET_ID      = os.getenv("BQ_DATASET_ID")
 BQ_SERVICE_ACCOUNT = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 BQ_BRANDS_TABLE    = os.getenv("BQ_BRANDS_TABLE")
 
-api_key       = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-gemini_client = genai.Client(api_key=api_key)
+class _LazyGenaiClient:
+    """Lazily instantiate the real genai.Client on first attribute access so
+    importing this module does not require GOOGLE_API_KEY/GEMINI_API_KEY."""
+    _client = None
+
+    def _resolve(self):
+        if _LazyGenaiClient._client is None:
+            key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+            if not key:
+                raise RuntimeError(
+                    "GOOGLE_API_KEY or GEMINI_API_KEY must be set to use the "
+                    "Gemini client."
+                )
+            _LazyGenaiClient._client = genai.Client(api_key=key)
+        return _LazyGenaiClient._client
+
+    def __getattr__(self, name):
+        return getattr(self._resolve(), name)
+
+
+gemini_client = _LazyGenaiClient()
 
 _HTTP_HEADERS = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"}
 _HTTP_DELAY   = 0.7
