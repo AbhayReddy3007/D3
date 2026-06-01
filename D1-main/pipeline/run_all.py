@@ -23,10 +23,11 @@ Pipeline order (sequential between stages):
   5. Reports   — reports.py parallelised across drugs
 
 Usage:
-  python run_all.py                   # full pipeline
+  python run_all.py                   # IPD stage only (default)
+  python run_all.py --mode all        # full pipeline
   python run_all.py --mode patents    # only patents stage
   python run_all.py --mode forecast   # forecast → merge → IPD → reports (skips patents)
-  python run_all.py --mode ipd        # only IPD stage
+  python run_all.py --mode ipd        # only IPD stage (default)
   python run_all.py --mode reports    # only reports stage
   python run_all.py --workers 6       # limit parallelism (default: 10)
   python run_all.py --dry-run         # print commands without executing
@@ -806,12 +807,12 @@ def main():
     parser.add_argument(
         "--mode",
         choices=["all", "patents", "forecast", "ipd", "reports"],
-        default="all",
+        default="ipd",
         help=(
-            "all      = full pipeline: patents → forecast → merge → ipd → reports (default)\n"
+            "all      = full pipeline: patents → forecast → merge → ipd → reports\n"
             "patents  = patent pipeline only\n"
             "forecast = forecast → merge → ipd → reports (skips patents; resume on by default)\n"
-            "ipd      = IPD BQ upload only\n"
+            "ipd      = IPD BQ upload only (default)\n"
             "reports  = reports only"
         ),
     )
