@@ -722,6 +722,12 @@ def call_gemini(prompt: str) -> dict:
 
 DEFAULT_CHECKPOINT_FILE = "scoring_checkpoint111111.json"
 _CHECKPOINT_SUBFOLDER = "ipd2_checkpoints"
+_CHECKPOINT_GCS_FILE = "scoring_checkpoint.json"
+
+# Throttle: don't write to GCS more often than this (seconds)
+_MIN_GCS_WRITE_INTERVAL = 10.0
+_last_gcs_write_time = 0.0
+_checkpoint_dirty = False  # True if in-memory cache has unsaved changes
 
 def checkpoint_key(drug, patent_number):
     return f"{drug.strip()}|{patent_number.strip()}"
@@ -731,7 +737,7 @@ def load_checkpoint(path):
     # Try GCS first
     try:
         from cog import gcs_cache
-        data = gcs_cache.read_json(_CHECKPOINT_SUBFOLDER, "scoring_checkpoint.json")
+        data = gcs_cache.read_json(_CHECKPOINT_SUBFOLDER, _CHECKPOINT_GCS_FILE)
         if data is not None:
             print(f"📂 Loaded GCS checkpoint: {len(data)} patents already scored")
             return data
@@ -746,19 +752,60 @@ def load_checkpoint(path):
         return data
     return {}
 
-def save_checkpoint(cache, path):
-    """Save checkpoint to GCS, with local fallback."""
-    # Write to GCS
-    try:
-        from cog import gcs_cache
-        gcs_cache.write_json(_CHECKPOINT_SUBFOLDER, "scoring_checkpoint.json", cache)
-        return
-    except Exception as e:
-        print(f"[CHECKPOINT] GCS write failed ({e}), saving locally...")
+def _gcs_write_with_retry(cache, max_retries=4, base_backoff=2.0):
+    """Write checkpoint to GCS with exponential backoff retry for 429s."""
+    from cog import gcs_cache
+    for attempt in range(max_retries):
+        try:
+            gcs_cache.write_json(_CHECKPOINT_SUBFOLDER, _CHECKPOINT_GCS_FILE, cache)
+            return True
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str and attempt < max_retries - 1:
+                wait = base_backoff * (2 ** attempt)
+                print(f"[CHECKPOINT] GCS 429 rate limit, retrying in {wait}s (attempt {attempt+1}/{max_retries})...")
+                time.sleep(wait)
+            elif attempt < max_retries - 1:
+                wait = base_backoff * (2 ** attempt)
+                print(f"[CHECKPOINT] GCS write failed ({e}), retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"[CHECKPOINT] GCS write failed after {max_retries} attempts: {e}")
+                return False
+    return False
 
-    # Fallback: local
-    with open(path, "w") as f:
-        json.dump(cache, f, indent=2)
+def save_checkpoint(cache, path):
+    """Save checkpoint — throttled to avoid GCS 429 rate limits.
+
+    Writes to GCS at most once every _MIN_GCS_WRITE_INTERVAL seconds.
+    Always saves locally as a fast fallback. The final flush at end of
+    scoring ensures GCS gets the complete state.
+    """
+    global _last_gcs_write_time, _checkpoint_dirty
+    _checkpoint_dirty = True
+
+    # Always save locally (fast, no rate limit)
+    try:
+        with open(path, "w") as f:
+            json.dump(cache, f, indent=2)
+    except Exception:
+        pass
+
+    # Throttle GCS writes
+    now = time.time()
+    if now - _last_gcs_write_time >= _MIN_GCS_WRITE_INTERVAL:
+        if _gcs_write_with_retry(cache):
+            _last_gcs_write_time = now
+            _checkpoint_dirty = False
+
+def flush_checkpoint_to_gcs(cache):
+    """Force-write the final checkpoint state to GCS. Call at end of scoring."""
+    global _checkpoint_dirty, _last_gcs_write_time
+    if _checkpoint_dirty:
+        if _gcs_write_with_retry(cache):
+            _checkpoint_dirty = False
+            _last_gcs_write_time = time.time()
+            print("[CHECKPOINT] Final state flushed to GCS ✓")
 
 
 # ── Core Scoring ──────────────────────────────────────────────────────────────
@@ -1408,6 +1455,9 @@ def main():
         return [results_indexed[i] for i in range(len(df_shortlist))]
 
     results = asyncio.run(_score_all())
+
+    # Flush any remaining checkpoint data to GCS
+    flush_checkpoint_to_gcs(cache)
 
     # ── 5. Compute country-wise scores ────────────────────────────────────────
     print(f"\n{'='*60}")
