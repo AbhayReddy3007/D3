@@ -35,7 +35,19 @@ KEEP_COLUMNS = [
 
 load_dotenv(override=True)
 GEMINI_MODEL = "gemini-2.5-flash"
-_genai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+_genai_client = None
+
+
+def _get_genai_client():
+    """Lazily create the Gemini client so importing this module doesn't
+    crash when GEMINI_API_KEY is unset."""
+    global _genai_client
+    if _genai_client is None:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is not set.")
+        _genai_client = genai.Client(api_key=api_key)
+    return _genai_client
 
 
 def _get_credentials():
@@ -70,7 +82,7 @@ def _normalize_year_only(val) -> str:
 def _call_gemini(prompt: str, retries: int = 3, backoff: float = 2.0) -> str | None:
     for attempt in range(retries):
         try:
-            resp = _genai_client.models.generate_content(
+            resp = _get_genai_client().models.generate_content(
                 model=GEMINI_MODEL, contents=prompt,
             )
             return (resp.text or "").strip()
