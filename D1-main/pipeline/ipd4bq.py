@@ -476,7 +476,7 @@ def compute_arbitrage(shortlisted: pd.DataFrame, full_filtered: pd.DataFrame) ->
 #  BIGQUERY HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 def load_from_bigquery() -> pd.DataFrame:
-    """Load Master_LOE table from BigQuery and return as DataFrame."""
+    """Load DISTINCT rows from Master_LOE table from BigQuery."""
     print(f"\nConnecting to BigQuery …")
     print(f"  Project : {BQ_PROJECT_ID}")
     print(f"  Dataset : {BQ_DATASET_ID}")
@@ -489,12 +489,12 @@ def load_from_bigquery() -> pd.DataFrame:
         location=BQ_LOCATION,
     )
 
-    query = f"SELECT * FROM `{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_ID}`"
+    query = f"SELECT DISTINCT * FROM `{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_ID}`"
     print(f"  Query   : {query}")
 
     df = client.query(query).to_dataframe()
     df = df.astype(str).replace("None", pd.NA).replace("<NA>", pd.NA)
-    print(f"  ✓ Loaded {len(df):,} rows from BigQuery")
+    print(f"  ✓ Loaded {len(df):,} distinct rows from BigQuery")
     return df
 
 
@@ -507,7 +507,7 @@ def _to_snake_case(col: str) -> str:
 
 
 def write_to_bigquery(df: pd.DataFrame, table_id: str) -> None:
-    """Write a DataFrame to a BigQuery table (WRITE_TRUNCATE)."""
+    """Write a DataFrame to a BigQuery table (WRITE_APPEND — no truncation)."""
     df = df.copy()
     df.columns = [_to_snake_case(c) for c in df.columns]
     df = df.astype(str).replace("nan", pd.NA).replace("<NA>", pd.NA)
@@ -535,6 +535,12 @@ def write_to_bigquery(df: pd.DataFrame, table_id: str) -> None:
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════════════
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="IPD4 Patent Analysis Tool")
+    parser.add_argument("drug", nargs="?", default=None,
+                        help="Optional: single drug name to process. Omit to process all drugs.")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("  IPD PATENT ANALYSIS TOOL")
     print("=" * 60)
@@ -551,6 +557,14 @@ def main():
     df.rename(columns={"PTE months": "PTE (months)"}, inplace=True)
     df = df.apply(lambda col: col.str.strip() if col.dtype == "object" else col)
     df = df.drop_duplicates()
+
+    # ── Filter to single drug if specified ────────────────────────────────
+    if args.drug:
+        df = df[df["Drug Name"].str.lower() == args.drug.lower()].reset_index(drop=True)
+        print(f"\n[Filter] Processing single drug: '{args.drug}' → {len(df)} rows")
+        if df.empty:
+            print("No rows match this drug name. Exiting.")
+            return
 
     total = len(df)
     print(f"\nTotal rows loaded           : {total}")
