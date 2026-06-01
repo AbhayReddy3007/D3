@@ -13,3 +13,10 @@ requests>=2.31.0
 beautifulsoup4>=4.12.0
 openpyxl>=3.1.0
 db-dtypes>=1.2.0
+python-dateutil
+python-docx
+reportlab
+matplotlib
+PyMuPDF
+mammoth
+xhtml2pdf
