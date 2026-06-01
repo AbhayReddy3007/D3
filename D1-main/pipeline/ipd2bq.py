@@ -544,98 +544,116 @@ def get_country_weight(jurisdiction: str) -> float:
     return COUNTRY_WEIGHTS.get(jurisdiction.strip().upper(), 0.0)
 
 
-# ── AlloyDB chunk fetcher (with all-collections fallback) ─────────────────────
+# ── AlloyDB chunk fetcher (IVFFlat-native, fetch-once architecture) ───────────
 
-def fetch_relevant_chunks(client, drug, patent_number, source_file, sections, top_k=12):
+TOP_K_CHUNKS = 12  # Hard cap — IVFFlat returns exactly this many per query
+
+
+def _ivfflat_query(collection, query_texts: list, filename: str, top_k: int) -> list:
     """
-    Fetch relevant chunks for a patent from AlloyDB.
+    Use IVFFlat ANN query (collection.query) to retrieve the top_k most
+    semantically relevant chunks for a given filename in one DB round-trip.
+
+    Falls back to a metadata-filtered .get() if the collection does not support
+    .query() (older schema / non-vector collections).
+    """
+    # Primary: ANN vector search scoped to this file
+    try:
+        results = collection.query(
+            query_texts=query_texts,
+            n_results=top_k,
+            where={"filename": {"$eq": filename}},
+            include=["documents"],
+        )
+        # collection.query returns list-of-lists (one per query_text); flatten + deduplicate
+        seen: set = set()
+        docs: list = []
+        for doc_list in results.get("documents", []):
+            for doc in (doc_list or []):
+                if doc and doc not in seen:
+                    seen.add(doc)
+                    docs.append(doc)
+                    if len(docs) >= top_k:
+                        return docs
+        if docs:
+            return docs
+    except Exception:
+        pass
+
+    # Fallback: metadata filter only (no vector ranking)
+    try:
+        results = collection.get(
+            where={"$and": [
+                {"filename": {"$eq": filename}},
+                {"chunk_index": {"$gte": 0}},
+            ]},
+            include=["documents", "metadatas"],
+        )
+        docs = results.get("documents", []) or []
+    except Exception:
+        try:
+            results = collection.get(
+                where={"filename": {"$eq": filename}},
+                include=["documents", "metadatas"],
+            )
+            docs = [
+                d for d, m in zip(
+                    results.get("documents", []),
+                    results.get("metadatas", []),
+                )
+                if m.get("chunk_index", -1) >= 0
+            ]
+        except Exception:
+            docs = []
+    return docs[:top_k]
+
+
+def fetch_all_chunks_for_patent(drug: str, patent_number: str, source_file: str) -> list:
+    """
+    Fetch up to TOP_K_CHUNKS chunks for a patent — ONCE per patent, not once per SF.
+
+    The IVFFlat index on AlloyDB does the ranking and limiting, so we never pull
+    the full document over the network.  Each of the 4 sub-factors then re-ranks
+    these chunks in-memory using keyword scoring (zero extra DB calls).
 
     Strategy:
-      1. Try the drug-specific collection (fast path): patents_{drug}
-      2. If not found, scan ALL collections.
-
-    Args:
-        client:       AlloyDBClient instance (kept for API compat)
-        drug:         Drug name string (used to build primary collection name)
-        patent_number: Patent number string (used for logging only)
-        source_file:  Exact filename to look up in metadata
-        sections:     List of section keyword strings for relevance ranking
-        top_k:        Maximum number of chunks to return
-
-    Returns:
-        List of document strings (chunks), ranked by section keyword relevance.
+      1. Drug-specific collection  (patents_{drug})
+      2. Fallback: scan all other collections
     """
     if not source_file.strip():
         print(f"\n    [WARN] No source file specified for '{patent_number}'")
         return []
 
     exact_filename = source_file.strip()
+    # Broad combined query so IVFFlat returns a representative mix across all sections
+    combined_query = (
+        "independent claim novelty prior art background "
+        "prosecution amendment experimental data"
+    )
 
-    def _query_collection(collection, filename):
-        """Return all chunks from a collection whose metadata filename matches."""
-        docs = []
-
-        # Primary attempt: filter by both filename and valid chunk_index
-        try:
-            results = collection.get(
-                where={"$and": [
-                    {"filename": {"$eq": filename}},
-                    {"chunk_index": {"$gte": 0}},
-                ]},
-                include=["documents", "metadatas"],
-            )
-            docs = results.get("documents", [])
-        except Exception:
-            pass
-
-        # Fallback: drop chunk_index filter (handles older ingestion schemas)
-        if not docs:
-            try:
-                results = collection.get(
-                    where={"filename": {"$eq": filename}},
-                    include=["documents", "metadatas"],
-                )
-                docs = [
-                    d for d, m in zip(
-                        results.get("documents", []),
-                        results.get("metadatas", []),
-                    )
-                    if m.get("chunk_index", -1) >= 0
-                ]
-            except Exception:
-                pass
-
-        return docs
-
-    def _rank_and_slice(docs):
-        """Sort by section keyword relevance and return top_k."""
-        def relevance_score(text):
-            t = text.lower()
-            return sum(1 for kw in sections if kw in t)
-        return sorted(docs, key=relevance_score, reverse=True)[:top_k]
+    primary_coll_name = collection_name(drug)
 
     # ── 1. Primary: drug-specific collection ─────────────────────────────────
-    primary_coll_name = collection_name(drug)
     try:
         primary_coll = _alloydb_client.get_collection(primary_coll_name)
-        docs = _query_collection(primary_coll, exact_filename)
+        docs = _ivfflat_query(primary_coll, [combined_query], exact_filename, TOP_K_CHUNKS)
         if docs:
             print(
-                f"\n    [INFO] Found {len(docs)} chunks in collection "
-                f"'{primary_coll_name}' for '{exact_filename}'",
+                f"\n    [INFO] IVFFlat → {len(docs)} chunks from '{primary_coll_name}' "
+                f"for '{exact_filename}'",
                 end=" ",
             )
-            return _rank_and_slice(docs)
+            return docs
     except Exception:
         pass
 
     print(
-        f"\n    [INFO] '{exact_filename}' not found in primary collection "
+        f"\n    [INFO] '{exact_filename}' not in primary collection "
         f"'{primary_coll_name}' — scanning all collections...",
         end=" ",
     )
 
-    # ── 2. Fallback: search every collection ─────────────────────────────────
+    # ── 2. Fallback: search every other collection ────────────────────────────
     try:
         all_collections = _alloydb_client.list_collections()
     except Exception as e:
@@ -648,20 +666,32 @@ def fetch_relevant_chunks(client, drug, patent_number, source_file, sections, to
             continue
         try:
             coll = _alloydb_client.get_collection(coll_name)
-            docs = _query_collection(coll, exact_filename)
+            docs = _ivfflat_query(coll, [combined_query], exact_filename, TOP_K_CHUNKS)
             if docs:
                 print(
-                    f"\n    [INFO] Found {len(docs)} chunks in fallback collection "
+                    f"\n    [INFO] IVFFlat → {len(docs)} chunks from fallback "
                     f"'{coll_name}' for '{exact_filename}'",
                     end=" ",
                 )
-                return _rank_and_slice(docs)
+                return docs
         except Exception as e:
             print(f"\n    [WARN] Could not search collection '{coll_name}': {e}")
             continue
 
     print(f"\n    [WARN] No chunks found for '{exact_filename}' in any collection")
     return []
+
+
+def _rank_chunks_for_sf(all_chunks: list, sections: list, top_k: int = TOP_K_CHUNKS) -> list:
+    """
+    Re-rank an already-fetched chunk list by SF-specific section keywords.
+    Pure in-memory — zero DB calls.
+    """
+    def relevance_score(text: str) -> int:
+        t = text.lower()
+        return sum(1 for kw in sections if kw in t)
+    return sorted(all_chunks, key=relevance_score, reverse=True)[:top_k]
+
 
 
 # Lazy module-level client so we configure exactly once. The new SDK's
@@ -736,9 +766,15 @@ def _run_gemini_score_sync(prompt, chunks, drug, patent_number, filing_date, gra
                 "key_findings": [], "chunks_used": len(chunks)}
 
 
-async def score_patent_async(client, row, cached, active_sfs):
+async def score_patent_async(client, row, cached, active_sfs, cache, checkpoint_path, cache_lock):
     """
-    Score a single patent — all 4 sub-factors run in PARALLEL via threads.
+    Score a single patent.
+
+    Changes vs old version:
+    - AlloyDB is queried ONCE (fetch_all_chunks_for_patent), not once per SF.
+    - Each SF re-ranks the shared chunk list in-memory (_rank_chunks_for_sf).
+    - Checkpoint is written after EACH sub-factor (with asyncio.Lock to avoid races).
+    - Semaphore is NOT held here; caller passes it only around Gemini calls.
     """
     drug          = str(row.get("Drug Name", "")).strip()
     patent_number = str(row.get("Patent Number", "")).strip()
@@ -761,79 +797,54 @@ async def score_patent_async(client, row, cached, active_sfs):
         "sf4": (SF4_PROMPT, SF4_SECTIONS),
     }
 
-    # Identify which sub-factors still need scoring
     sfs_to_score = [sf for sf in active_sfs if sf not in result]
     if not sfs_to_score:
         return result
 
     loop = asyncio.get_event_loop()
 
-    # Launch all sub-factor Gemini calls in parallel
-    async def _score_one_sf(sf_key):
+    # ── ONE AlloyDB round-trip for all 4 SFs ──────────────────────────────────
+    all_chunks = await loop.run_in_executor(
+        _executor,
+        fetch_all_chunks_for_patent,
+        drug, patent_number, source_file,
+    )
+
+    async def _score_one_sf(sf_key, gemini_semaphore):
         prompt_template, sections = SF_CONFIG[sf_key]
-        chunks = fetch_relevant_chunks(client, drug, patent_number, source_file, sections)
+        # Re-rank in-memory for this SF — no DB call
+        chunks = _rank_chunks_for_sf(all_chunks, sections)
         if not chunks:
-            return sf_key, empty
-        sf_result = await loop.run_in_executor(
-            _executor,
-            _run_gemini_score_sync,
-            prompt_template, chunks, drug, patent_number, filing_date, grant_date,
-        )
-        return sf_key, sf_result
-
-    sf_tasks = [_score_one_sf(sf) for sf in sfs_to_score]
-    sf_results = await asyncio.gather(*sf_tasks)
-
-    for sf_key, sf_result in sf_results:
-        result[sf_key] = sf_result
+            sf_result = empty
+        else:
+            async with gemini_semaphore:
+                sf_result = await loop.run_in_executor(
+                    _executor,
+                    _run_gemini_score_sync,
+                    prompt_template, chunks, drug, patent_number, filing_date, grant_date,
+                )
         score = sf_result.get("score", "ERR")
         print(f"    [{sf_key.upper()}] score={score}", end="  ")
 
-    # Also log cached ones
+        # Checkpoint after each individual SF (lock prevents concurrent writes)
+        async with cache_lock:
+            result[sf_key] = sf_result
+            ck = checkpoint_key(drug, patent_number)
+            cache[ck] = result
+            save_checkpoint(cache, checkpoint_path)
+
+        return sf_key, sf_result
+
+    # Gemini semaphore is shared across all patents; pass it down from _score_all
+    # (injected via closure — see _score_all below)
+    gemini_semaphore = client  # re-used parameter slot; see _score_all for context
+
+    sf_tasks = [_score_one_sf(sf, gemini_semaphore) for sf in sfs_to_score]
+    await asyncio.gather(*sf_tasks)
+
     for sf_key in active_sfs:
         if sf_key not in sfs_to_score:
             print(f"    [{sf_key.upper()}] cached ✓", end="  ")
-
-    return result
-
-
-# Keep sync wrapper for backward compat
-def score_patent(client, row, cached, active_sfs):
-    drug          = str(row.get("Drug Name", "")).strip()
-    patent_number = str(row.get("Patent Number", "")).strip()
-    filing_date   = str(row.get("Filing Date", "")).strip()
-    grant_date    = str(row.get("Grant Date", "")).strip()
-    source_file   = str(row.get("Source File", "")).strip()
-
-    result = dict(cached)
-    empty = {
-        "score": None,
-        "reasoning": "No patent chunks found in AlloyDB for this patent.",
-        "key_findings": [],
-        "chunks_used": 0,
-    }
-
-    SF_CONFIG = {
-        "sf1": (SF1_PROMPT, SF1_SECTIONS),
-        "sf2": (SF2_PROMPT, SF2_SECTIONS),
-        "sf3": (SF3_PROMPT, SF3_SECTIONS),
-        "sf4": (SF4_PROMPT, SF4_SECTIONS),
-    }
-
-    for sf_key in active_sfs:
-        if sf_key in result:
-            print(f"    [{sf_key.upper()}] cached ✓", end="  ")
-            continue
-        prompt_template, sections = SF_CONFIG[sf_key]
-        chunks = fetch_relevant_chunks(client, drug, patent_number, source_file, sections)
-        if chunks:
-            result[sf_key] = _run_gemini_score_sync(
-                prompt_template, chunks, drug, patent_number, filing_date, grant_date
-            )
-        else:
-            result[sf_key] = empty
-        score = result[sf_key].get("score", "ERR")
-        print(f"    [{sf_key.upper()}] score={score}", end="  ")
 
     return result
 
@@ -1301,7 +1312,7 @@ def main():
     mask_blocking = df["Tag"].astype(str).str.strip().str.lower() == "blocking"
     mask_granted = df["Grant Date"].notna() & (df["Grant Date"].astype(str).str.strip() != "")
     mask_not_forecasted = df["Type"].astype(str).str.strip().str.lower() != "forecasted"
-    df_shortlist = df[mask_blocking & mask_granted & mask_not_forecasted].drop_duplicates().reset_index(drop=True)
+    df_shortlist = df[mask_blocking & mask_granted & mask_not_forecasted].drop_duplicates(subset=["Patent Number"]).reset_index(drop=True)
     print(f"Shortlisted {len(df_shortlist)} patents from BigQuery (Tag=Blocking AND Grant Date present AND Type\u2260Forecasted).")
 
     if args.drug:
@@ -1337,7 +1348,10 @@ def main():
     checkpoint_path = args.checkpoint
 
     async def _score_all():
-        semaphore = asyncio.Semaphore(PATENT_CONCURRENCY)
+        # gemini_semaphore throttles concurrent Gemini API calls only.
+        # AlloyDB fetches are I/O-bound and not rate-limited here.
+        gemini_semaphore = asyncio.Semaphore(PATENT_CONCURRENCY)
+        cache_lock = asyncio.Lock()
         results_indexed = {}
 
         async def _process_one(idx, row_data):
@@ -1355,21 +1369,19 @@ def main():
                 results_indexed[idx] = cached_entry
                 return
 
-            async with semaphore:
-                result = await score_patent_async(client, row_data, cached_entry, active_sfs)
-                print()
-
-            cache[key] = result
-            save_checkpoint(cache, checkpoint_path)
+            # Pass gemini_semaphore via the `client` parameter slot so
+            # score_patent_async can pass it down to each _score_one_sf coroutine.
+            result = await score_patent_async(
+                gemini_semaphore,   # reused as `client` param — see score_patent_async
+                row_data, cached_entry, active_sfs,
+                cache, checkpoint_path, cache_lock,
+            )
+            print()
             results_indexed[idx] = result
 
-        tasks = []
-        for i, (_, row) in enumerate(df_shortlist.iterrows()):
-            tasks.append(_process_one(i, row))
-
+        tasks = [_process_one(i, row) for i, (_, row) in enumerate(df_shortlist.iterrows())]
         await asyncio.gather(*tasks)
 
-        # Return results in original order
         return [results_indexed[i] for i in range(len(df_shortlist))]
 
     results = asyncio.run(_score_all())
