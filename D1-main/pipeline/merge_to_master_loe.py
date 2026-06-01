@@ -171,7 +171,29 @@ def _compute_drug_aggregates(df):
     return df.drop(columns=["_score", "_yte"])
 
 
-def merge_and_upload(dry_run=False, replace=False):
+def _deduplicate_in_bq(client):
+    """Replace Master_LOE with a fully deduplicated copy, keeping the latest updated_at per unique row."""
+    dedup_sql = f"""
+        CREATE OR REPLACE TABLE `{MASTER_TABLE}` AS
+        SELECT * EXCEPT(rn)
+        FROM (
+            SELECT *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY {", ".join(
+                        f"`{c}`" for c in MASTER_COLUMNS
+                        if c not in ("created_at", "updated_at", "Report_Timestamp")
+                    )}
+                    ORDER BY updated_at DESC
+                ) AS rn
+            FROM `{MASTER_TABLE}`
+        )
+        WHERE rn = 1
+    """
+    print("  Deduplicating in BigQuery...")
+    client.query(dedup_sql).result()
+
+
+def merge_and_upload(dry_run=False):
     client = _get_bq_client()
     now = datetime.now(timezone.utc)
 
@@ -213,27 +235,32 @@ def merge_and_upload(dry_run=False, replace=False):
         print(master.head(3).to_string())
         return
 
-    print(f"\n[4/4] Uploading to {MASTER_TABLE}...")
-    disp = bigquery.WriteDisposition.WRITE_TRUNCATE if replace else bigquery.WriteDisposition.WRITE_APPEND
+    print(f"\n[4/5] Appending to {MASTER_TABLE}...")
     job = client.load_table_from_dataframe(
         master, MASTER_TABLE,
-        job_config=bigquery.LoadJobConfig(write_disposition=disp, autodetect=True),
+        job_config=bigquery.LoadJobConfig(
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            autodetect=True,
+        ),
     )
     job.result()
+    print(f"  Appended {len(master)} rows.")
+
+    print(f"\n[5/5] Deduplicating {MASTER_TABLE}...")
+    _deduplicate_in_bq(client)
     t = client.get_table(MASTER_TABLE)
-    print(f"  [{'REPLACED' if replace else 'APPENDED'}] {t.num_rows} rows in {MASTER_TABLE}")
+    print(f"  [DONE] {t.num_rows} rows remaining after dedup.")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Merge → Master_LOE")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--replace", action="store_true")
     args = parser.parse_args()
     t0 = time.time()
     print("=" * 60)
     print(f"  MERGE → Master_LOE  |  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print("=" * 60)
-    merge_and_upload(dry_run=args.dry_run, replace=args.replace)
+    merge_and_upload(dry_run=args.dry_run)
     print(f"\n[DONE] {time.time() - t0:.1f}s")
 
 
