@@ -144,20 +144,26 @@ def _ensure_schema():
                 ON embeddings ((metadata->>'filename'))
             """)
 
-            # Drop old HNSW index if it exists (HNSW has 2000-dim limit,
-            # gemini-embedding-001 outputs 3072 dims)
+            # Drop old broken indexes — both HNSW and IVFFlat have a 2000-dim
+            # limit on full-precision vectors, but gemini-embedding-001 outputs
+            # 3072 dims, so neither can index the `embedding` column directly.
             cur.execute("DROP INDEX IF EXISTS idx_embeddings_hnsw")
+            cur.execute("DROP INDEX IF EXISTS idx_embeddings_ivfflat")
 
-            # IVFFlat supports >2000 dims but requires rows to exist
-            # for cluster computation. Skip gracefully if table is empty.
+            # Use HNSW on halfvec (half-precision) which supports up to 4000
+            # dims — enough for our 3072-dim embeddings. The cast to halfvec
+            # happens at index time; queries must also cast to halfvec to use
+            # the index (see the query method).
             try:
                 cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_embeddings_ivfflat
-                    ON embeddings USING ivfflat (embedding vector_cosine_ops)
-                    WITH (lists = 100)
+                    CREATE INDEX IF NOT EXISTS idx_embeddings_hnsw_halfvec
+                    ON embeddings USING hnsw ((embedding::halfvec(3072)) halfvec_cosine_ops)
                 """)
+                print("[ALLOYDB] HNSW halfvec index created/verified")
             except Exception as e:
-                print(f"[ALLOYDB] IVFFlat index skipped (will retry when data exists): {e}")
+                print(f"[ALLOYDB] HNSW halfvec index skipped: {e}")
+                print("[ALLOYDB] Queries will use exact (sequential) scan — "
+                      "still correct, just slower on large tables.")
     finally:
         conn.close()
 
@@ -319,7 +325,7 @@ class AlloyDBCollection:
 
                 cur.execute(f"""
                     SELECT unique_id, text, embedding, metadata,
-                           embedding <=> %s::vector AS distance
+                           embedding::halfvec(3072) <=> %s::halfvec(3072) AS distance
                     FROM embeddings
                     WHERE {where_sql}
                     ORDER BY distance ASC
