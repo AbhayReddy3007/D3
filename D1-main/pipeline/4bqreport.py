@@ -239,13 +239,26 @@ def load_data_from_bigquery() -> tuple[pd.DataFrame, pd.DataFrame]:
 # ═══════════════════════════════════════════════════════════════════════════
 load_dotenv(override=True)
 GEMINI_MODEL = "gemini-2.5-flash"
-_genai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+_genai_client = None
+
+
+def _get_genai_client():
+    """Lazily create the Gemini client so importing this module doesn't
+    crash when GEMINI_API_KEY is unset (the friendly check in main() then
+    handles it gracefully)."""
+    global _genai_client
+    if _genai_client is None:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is not set.")
+        _genai_client = genai.Client(api_key=api_key)
+    return _genai_client
 
 
 def _call_gemini(prompt: str, retries: int = 3, backoff: float = 2.5) -> str:
     for attempt in range(retries):
         try:
-            resp = _genai_client.models.generate_content(
+            resp = _get_genai_client().models.generate_content(
                 model=GEMINI_MODEL, contents=prompt,
             )
             return (resp.text or "").strip()
@@ -708,28 +721,85 @@ def _patent_expiry_summary(doc, drug_sl: pd.DataFrame):
 #  PDF CONVERSION & GCS UPLOAD
 # ═══════════════════════════════════════════════════════════════════════════
 def convert_docx_to_pdf(docx_path: str) -> str:
-    """Convert a .docx file to PDF using docx2pdf.
+    """Convert a .docx file to PDF.
 
-    On Windows this uses Microsoft Word via COM automation (Word must be
-    installed).  On macOS it uses the Word AppleScript bridge.  No external
-    command-line tools are required.
+    Primary path (cross-platform, works on Windows/Linux/macOS and inside the
+    Docker/Cloud Run container):
+        mammoth   — converts .docx → HTML  (preserves structure)
+        xhtml2pdf — renders HTML → PDF     (pure pip, no system deps)
 
-    Install once with:
-        pip install docx2pdf
+    Fallback path (only used if mammoth/xhtml2pdf are unavailable AND a local
+    Word/LibreOffice bridge exists): docx2pdf. Note that docx2pdf requires
+    Microsoft Word (Windows COM / macOS AppleScript) and therefore does NOT
+    work on a headless Linux container, which is why it is no longer the
+    default.
+
+    Install:
+        pip install mammoth xhtml2pdf --break-system-packages
 
     Returns the path to the generated PDF.
     """
+    pdf_path = os.path.splitext(docx_path)[0] + ".pdf"
+
+    # ── Primary: mammoth + xhtml2pdf (cross-platform) ─────────────────────────
+    try:
+        import mammoth
+        from xhtml2pdf import pisa
+    except ImportError:
+        mammoth = None
+        pisa = None
+
+    if mammoth is not None and pisa is not None:
+        style_map = """
+            p[style-name='Heading 2'] => h2:fresh
+            r[style-name='Strong']    => strong
+        """
+        with open(docx_path, "rb") as f:
+            raw_html = mammoth.convert_to_html(f, style_map=style_map).value
+
+        full_html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  @page {{ margin: 1.8cm 2cm 2cm 2cm; }}
+  body  {{ font-family: Arial, sans-serif; font-size: 9pt; color: #222; margin:0; padding:0; }}
+  h1    {{ color: #1F3864; font-size: 14pt; border-bottom: 3px solid #2F5496; padding-bottom:4px; }}
+  h2    {{ color: #2F5496; font-size: 11pt; border-bottom: 1px solid #2F5496; padding-bottom:2px; margin:10px 0 3px 0; }}
+  p     {{ margin: 0 0 5px 0; line-height: 1.35; text-align: justify; }}
+  ul    {{ margin: 2px 0 6px 0; padding-left: 18px; }}
+  li    {{ margin-bottom: 2px; line-height: 1.3; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 5px 0 8px 0; font-size: 8.5pt; }}
+  th    {{ background: #2F5496; color: #ffffff; font-weight: bold; text-align: center; padding: 4px 6px; border: 1px solid #2F5496; }}
+  td    {{ border: 1px solid #CCCCCC; padding: 4px 6px; vertical-align: top; }}
+  hr    {{ border: none; border-bottom: 2px solid #2F5496; margin: 10px 0 6px 0; }}
+</style>
+</head>
+<body>
+{raw_html}
+</body>
+</html>"""
+
+        with open(pdf_path, "wb") as pdf_file:
+            result = pisa.CreatePDF(full_html.encode("utf-8"), dest=pdf_file,
+                                    encoding="utf-8")
+        if result.err:
+            raise RuntimeError(f"xhtml2pdf conversion error code: {result.err}")
+        if not os.path.exists(pdf_path):
+            raise RuntimeError(f"PDF not created at expected path: {pdf_path}")
+        return pdf_path
+
+    # ── Fallback: docx2pdf (Windows/macOS with Word only) ─────────────────────
     try:
         from docx2pdf import convert as _docx2pdf_convert
     except ImportError:
         raise RuntimeError(
-            "docx2pdf is not installed.\n"
-            "Run: pip install docx2pdf"
+            "No DOCX→PDF backend available.\n"
+            "Install the cross-platform backend with:\n"
+            "  pip install mammoth xhtml2pdf --break-system-packages"
         )
 
-    pdf_path = os.path.splitext(docx_path)[0] + ".pdf"
     _docx2pdf_convert(docx_path, pdf_path)
-
     if not os.path.exists(pdf_path):
         raise RuntimeError(f"PDF not created at expected path: {pdf_path}")
     return pdf_path
