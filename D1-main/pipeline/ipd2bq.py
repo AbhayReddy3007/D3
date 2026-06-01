@@ -718,22 +718,45 @@ def call_gemini(prompt: str) -> dict:
     return json.loads(text)
 
 
-# ── Checkpoint helpers ────────────────────────────────────────────────────────
+# ── Checkpoint helpers (GCS-backed) ──────────────────────────────────────────
 
 DEFAULT_CHECKPOINT_FILE = "scoring_checkpoint111111.json"
+_CHECKPOINT_SUBFOLDER = "ipd2_checkpoints"
 
 def checkpoint_key(drug, patent_number):
     return f"{drug.strip()}|{patent_number.strip()}"
 
 def load_checkpoint(path):
+    """Load checkpoint from GCS, falling back to local file for migration."""
+    # Try GCS first
+    try:
+        from cog import gcs_cache
+        data = gcs_cache.read_json(_CHECKPOINT_SUBFOLDER, "scoring_checkpoint.json")
+        if data is not None:
+            print(f"📂 Loaded GCS checkpoint: {len(data)} patents already scored")
+            return data
+    except Exception as e:
+        print(f"[CHECKPOINT] GCS read failed ({e}), trying local fallback...")
+
+    # Fallback: local file (for migration)
     if os.path.exists(path):
         with open(path, "r") as f:
             data = json.load(f)
-        print(f"📂 Loaded checkpoint: {len(data)} patents already scored ({path})")
+        print(f"📂 Loaded local checkpoint: {len(data)} patents already scored ({path})")
         return data
     return {}
 
 def save_checkpoint(cache, path):
+    """Save checkpoint to GCS, with local fallback."""
+    # Write to GCS
+    try:
+        from cog import gcs_cache
+        gcs_cache.write_json(_CHECKPOINT_SUBFOLDER, "scoring_checkpoint.json", cache)
+        return
+    except Exception as e:
+        print(f"[CHECKPOINT] GCS write failed ({e}), saving locally...")
+
+    # Fallback: local
     with open(path, "w") as f:
         json.dump(cache, f, indent=2)
 
@@ -744,10 +767,10 @@ import asyncio
 import concurrent.futures
 
 # Thread pool for running blocking Gemini calls concurrently
-_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 
 # Concurrency limit: how many patents scored at once
-PATENT_CONCURRENCY = 4
+PATENT_CONCURRENCY = 8
 
 
 def _run_gemini_score_sync(prompt, chunks, drug, patent_number, filing_date, grant_date):
@@ -1004,7 +1027,7 @@ def _bq_client():
 
 
 def _write_bq_table(rows: list[dict], table_id: str, schema: list) -> None:
-    """Truncate-and-load rows into a BigQuery table."""
+    """Append rows into a BigQuery table (no truncation)."""
     client = _bq_client()
     full_table = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_id}"
     job_config = bigquery.LoadJobConfig(
@@ -1175,7 +1198,7 @@ def load_from_bigquery() -> pd.DataFrame:
     )
 
     query = f"""
-        SELECT
+        SELECT DISTINCT
             Drug_Name,
             Patent_Number,
             Jurisdiction,
