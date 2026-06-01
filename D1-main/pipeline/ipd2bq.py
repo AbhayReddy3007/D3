@@ -998,9 +998,10 @@ def _write_bq_table(rows: list[dict], table_id: str, schema: list) -> None:
     full_table = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_id}"
     job_config = bigquery.LoadJobConfig(
         schema=schema,
-        write_disposition="WRITE_TRUNCATE",
+        write_disposition="WRITE_APPEND",
     )
     df_out = pd.DataFrame(rows)
+    df_out = df_out.drop_duplicates()
     job = client.load_table_from_dataframe(df_out, full_table, job_config=job_config)
     job.result()
     print(f"  ✅ {len(rows)} rows written to {full_table}")
@@ -1300,7 +1301,7 @@ def main():
     mask_blocking = df["Tag"].astype(str).str.strip().str.lower() == "blocking"
     mask_granted = df["Grant Date"].notna() & (df["Grant Date"].astype(str).str.strip() != "")
     mask_not_forecasted = df["Type"].astype(str).str.strip().str.lower() != "forecasted"
-    df_shortlist = df[mask_blocking & mask_granted & mask_not_forecasted].reset_index(drop=True)
+    df_shortlist = df[mask_blocking & mask_granted & mask_not_forecasted].drop_duplicates().reset_index(drop=True)
     print(f"Shortlisted {len(df_shortlist)} patents from BigQuery (Tag=Blocking AND Grant Date present AND Type\u2260Forecasted).")
 
     if args.drug:
