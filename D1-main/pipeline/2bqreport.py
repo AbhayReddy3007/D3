@@ -108,6 +108,13 @@ def _extract_json(text: str):
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
+def _get_credentials():
+    """Get credentials: use service account file if available, else default (Cloud Run)."""
+    if CREDENTIALS_PATH and os.path.exists(CREDENTIALS_PATH):
+        return service_account.Credentials.from_service_account_file(CREDENTIALS_PATH)
+    return None  # Use ADC (Application Default Credentials)
+
+
 def _bq_client():
     credentials = _get_credentials()
     return bigquery.Client(
