@@ -41,24 +41,52 @@ except ImportError:
 
 # ── Connection setup ─────────────────────────────────────────────────────────
 
-_raw_password = os.getenv("ALLOYDB_PASSWORD")
-_ip           = os.getenv("ALLOYDB_HOST")
-_user         = os.getenv("ALLOYDB_USER", "postgres")
-_db           = os.getenv("ALLOYDB_DB", "postgres")
+_user = os.getenv("ALLOYDB_USER", "postgres")
+_db   = os.getenv("ALLOYDB_DB", "postgres")
 
-if not _raw_password or not _ip:
-    raise EnvironmentError(
-        "Missing ALLOYDB_PASSWORD or ALLOYDB_HOST in environment. "
-        "Set them as environment variables."
-    )
+# The connection string and schema check are built lazily (on the first
+# connection) rather than at import time, so that importing this module does
+# NOT require AlloyDB credentials to be present — only actually using the
+# database does. This keeps the module importable for tooling, tests, and
+# partial pipeline runs (e.g. report-only) that never touch AlloyDB, and
+# avoids opening a network connection just to import.
+DATABASE_URL = None
+_schema_ready = False
 
-_encoded_password = urllib.parse.quote_plus(_raw_password)
-DATABASE_URL = f"postgresql://{_user}:{_encoded_password}@{_ip}:5432/{_db}"
+
+def _build_database_url() -> str:
+    raw_password = os.getenv("ALLOYDB_PASSWORD")
+    ip           = os.getenv("ALLOYDB_HOST")
+    if not raw_password or not ip:
+        raise EnvironmentError(
+            "Missing ALLOYDB_PASSWORD or ALLOYDB_HOST in environment. "
+            "Set them as environment variables."
+        )
+    encoded_password = urllib.parse.quote_plus(raw_password)
+    return f"postgresql://{_user}:{encoded_password}@{ip}:5432/{_db}"
 
 
 def _get_conn():
-    """Get a new psycopg2 connection (autocommit off by default)."""
-    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+    """Get a new psycopg2 connection (autocommit off by default).
+
+    The connection string is resolved on first use, and the schema is
+    ensured exactly once (the first time a connection is opened).
+    """
+    global DATABASE_URL, _schema_ready
+    if DATABASE_URL is None:
+        DATABASE_URL = _build_database_url()
+    conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+    if not _schema_ready:
+        # Set the flag before calling _ensure_schema() (which itself opens a
+        # connection) to avoid re-entrant schema checks; reset on failure so
+        # the next connection retries.
+        _schema_ready = True
+        try:
+            _ensure_schema()
+        except Exception as e:
+            _schema_ready = False
+            print(f"[ALLOYDB] Schema ensure deferred (will retry): {e}")
+    return conn
 
 
 # ── Ensure schema exists ─────────────────────────────────────────────────────
@@ -149,7 +177,10 @@ def _ensure_schema():
 
     print("[ALLOYDB] Schema verified / migrated")
 
-_ensure_schema()
+
+# Schema is ensured lazily on the first connection (see _get_conn), so there
+# is no module-level _ensure_schema() call here — importing this module no
+# longer opens a database connection.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
