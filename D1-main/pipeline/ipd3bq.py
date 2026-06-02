@@ -853,6 +853,10 @@ def write_circumvention_to_bq(circumvention_by_drug: dict):
     table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_CIRC_TABLE}"
     client = _get_bq_client()
 
+    # Cast all columns to string to avoid pyarrow type mismatches
+    for col in df_circ.columns:
+        df_circ[col] = df_circ[col].astype(str).replace({"None": None, "nan": None})
+
     df_circ = df_circ.drop_duplicates()
     job_config = bigquery.LoadJobConfig(
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
@@ -925,6 +929,11 @@ def write_score_to_bq(drug_scores: list):
     df_score = pd.DataFrame(rows)
     table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_SCORE_TABLE}"
     client = _get_bq_client()
+
+    # Cast all columns to string to avoid pyarrow type mismatches
+    # (e.g. Combined_Total being float64 when BQ schema expects STRING)
+    for col in df_score.columns:
+        df_score[col] = df_score[col].astype(str).replace({"None": None, "nan": None})
 
     df_score = df_score.drop_duplicates()
     job_config = bigquery.LoadJobConfig(
@@ -1015,9 +1024,33 @@ def process_patents(skip_circumvention=False, drug_filter=None):
 
     drugs = non_blocking["Drug Name"].unique()
 
+    # ── GCS Checkpoint: skip drugs already completed ──────────────────────
+    _ipd3_ckpt_subfolder = "ipd3_checkpoints"
+    _ipd3_ckpt_file = "completed_drugs.json"
+    completed_drugs = set()
+    try:
+        from cog import gcs_cache
+        ckpt_data = gcs_cache.read_json(_ipd3_ckpt_subfolder, _ipd3_ckpt_file)
+        if ckpt_data and isinstance(ckpt_data, list):
+            completed_drugs = set(ckpt_data)
+            print(f"[CHECKPOINT] {len(completed_drugs)} drug(s) already done in GCS: {completed_drugs}")
+    except Exception as e:
+        print(f"[CHECKPOINT] Could not load ipd3 checkpoint: {e}")
+
+    def _save_ipd3_checkpoint():
+        try:
+            from cog import gcs_cache
+            gcs_cache.write_json(_ipd3_ckpt_subfolder, _ipd3_ckpt_file, sorted(completed_drugs))
+        except Exception as e:
+            print(f"[CHECKPOINT] GCS write failed: {e}")
+
     drug_scores = []
 
     for drug in drugs:
+        if drug in completed_drugs:
+            print(f"\n  [SKIP] {drug} — already completed (checkpoint)")
+            continue
+
         drug_df = non_blocking[non_blocking["Drug Name"] == drug].copy()
 
         # ── Build forecasted source (BLOCKING rows with Type == "Forecasted") ──
@@ -1127,6 +1160,10 @@ def process_patents(skip_circumvention=False, drug_filter=None):
             "avg_final_score":    avg_final,
             "jurisdiction_scores": jurisdiction_scores,
         })
+
+        # Mark drug as completed in checkpoint
+        completed_drugs.add(drug)
+        _save_ipd3_checkpoint()
 
     # ── Circumvention Analysis → BigQuery ────────────────────────────────
     if not skip_circumvention:
