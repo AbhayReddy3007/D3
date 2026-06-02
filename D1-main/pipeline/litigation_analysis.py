@@ -553,19 +553,27 @@ def _extract_json_from_response(text: str) -> str:
     return text[start:]
 
 
+def _get_credentials():
+    """Get credentials: use service account file if available, else ADC (Cloud Run)."""
+    from google.oauth2 import service_account as _sa
+    cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if cred_path and Path(cred_path).exists():
+        return _sa.Credentials.from_service_account_file(cred_path)
+    return None  # ADC — Cloud Run uses the attached service account automatically
+
+
+def _get_bigquery_client():
+    """Return a BigQuery client using the same auth as other pipeline files."""
+    from google.cloud import bigquery as bq
+    credentials = _get_credentials()
+    return bq.Client(project=BQ_PROJECT_ID, credentials=credentials)
+
+
 def _get_patent_numbers_from_bigquery(molecule_name: str) -> list:
     """Query BigQuery for distinct patent numbers for a molecule."""
-    bq_sa = os.getenv("BQ_SERVICE_ACCOUNT")
-    if not bq_sa:
-        print("⚠️  BQ_SERVICE_ACCOUNT not set — skipping BigQuery.")
-        return []
-    bq_sa_path = Path(bq_sa)
-    if not bq_sa_path.exists():
-        print(f"⚠️  Key file not found: {bq_sa_path}")
-        return []
     try:
         from google.cloud import bigquery as bq
-        client = bq.Client.from_service_account_json(str(bq_sa_path))
+        client = _get_bigquery_client()
     except Exception as e:
         print(f"⚠️  BigQuery auth failed: {e}")
         return []
@@ -589,16 +597,6 @@ def _get_patent_numbers_from_bigquery(molecule_name: str) -> list:
     except Exception as e:
         print(f"⚠️  BigQuery query error: {e}")
         return []
-
-
-def _get_bigquery_client():
-    """Return a BigQuery client, preferring service-account credentials."""
-    from google.cloud import bigquery as bq
-    sa_path = os.getenv("BQ_SERVICE_ACCOUNT")
-    if sa_path and Path(sa_path).exists():
-        return bq.Client.from_service_account_json(sa_path)
-    print("Warning: BQ_SERVICE_ACCOUNT not set or file missing — using default credentials.")
-    return bq.Client()
 
 
 def _fetch_drugs_from_query(query: str) -> list:
