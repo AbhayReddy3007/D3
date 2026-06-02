@@ -853,6 +853,22 @@ def write_circumvention_to_bq(circumvention_by_drug: dict):
     table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_CIRC_TABLE}"
     client = _get_bq_client()
 
+    # Align dtypes to match BQ schema
+    try:
+        table = client.get_table(table_ref)
+        bq_type_map = {field.name: field.field_type for field in table.schema}
+        for col in df_circ.columns:
+            if col in bq_type_map:
+                bq_type = bq_type_map[col]
+                if bq_type in ("STRING",):
+                    df_circ[col] = df_circ[col].astype(str).replace({"None": None, "nan": None, "NaN": None})
+                elif bq_type in ("INTEGER", "INT64"):
+                    df_circ[col] = pd.to_numeric(df_circ[col], errors="coerce").astype("Int64")
+                elif bq_type in ("FLOAT", "FLOAT64", "NUMERIC"):
+                    df_circ[col] = pd.to_numeric(df_circ[col], errors="coerce")
+    except Exception as e:
+        print(f"[BQ] Could not read schema for type alignment ({e}) — using autodetect")
+
     df_circ = df_circ.drop_duplicates()
 
     # Skip rows where Drug_Name + Patent_Category already exist in BQ
