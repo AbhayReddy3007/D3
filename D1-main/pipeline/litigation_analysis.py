@@ -65,7 +65,7 @@ def _safe_parse_json(text: str):
         pass
 
     # Attempt 4: truncated JSON — try closing brackets
-    for suffix in ["]", "}", "]}", "]}']:
+    for suffix in ["]", "}", "]}", "]}"]:
         try:
             return json.loads(cleaned + suffix)
         except json.JSONDecodeError:
