@@ -815,7 +815,7 @@ def _load_from_bigquery() -> pd.DataFrame:
     client = _get_bq_client()
 
     table_ref = f"`{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_ID}`"
-    query     = f"SELECT * FROM {table_ref}"
+    query     = f"SELECT DISTINCT * FROM {table_ref}"
     print(f"  Running query: {query}")
 
     df = client.query(query).to_dataframe()
