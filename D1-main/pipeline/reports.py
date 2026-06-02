@@ -46,6 +46,15 @@ CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
+# Global drug filter — set by --drugs CLI arg; None means "all drugs"
+DRUG_FILTER = None
+
+def _filter_drugs(drug_list):
+    """Filter a list of drug names to only those in DRUG_FILTER (if set)."""
+    if DRUG_FILTER is None:
+        return list(drug_list)
+    return [d for d in drug_list if d.strip().lower() in DRUG_FILTER]
+
 # Report manifest: (module_file, report_label, gcs_filename)
 REPORT_MANIFEST = [
     ("1bqreport.py",      "LOE Primary Market",      "1.Primary Market Entry Horizon.pdf"),
@@ -262,7 +271,7 @@ def _run_1bqreport(mod) -> list:
         df["Type"] = df["Type"].astype(str).str.strip()
     df = mod._normalize_forecasted_col(df)
 
-    drugs   = df["Drug Name"].dropna().unique()
+    drugs   = _filter_drugs(df["Drug Name"].dropna().unique())
     results = []
     drug_rationales = {}
 
@@ -338,7 +347,7 @@ def _run_2bqreport(mod) -> list:
     mod.build_report(data, output_path)
 
     # This report is one file per drug set; map to each drug
-    drug_names = data["final"]["Drug Name"].dropna().unique().tolist()
+    drug_names = _filter_drugs(data["final"]["Drug Name"].dropna().unique().tolist())
     return [(dn, output_path) for dn in drug_names]
 
 
@@ -357,6 +366,8 @@ def _run_3bqreport(mod) -> list:
     results = []
 
     for drug_name, drug_data in sorted(drugs_data.items()):
+        if DRUG_FILTER is not None and drug_name.strip().lower() not in DRUG_FILTER:
+            continue
         print(f"    [{drug_name}] Generating narrative ...")
         if api_key and mod.GEMINI_AVAILABLE:
             narrative = mod.call_gemini_for_narrative(drug_data, api_key)
@@ -401,7 +412,7 @@ def _run_4bqreport(mod) -> list:
         print("    [SKIP] Shortlisted table is empty or missing Drug Name")
         return []
 
-    drugs   = sorted(shortlisted["Drug Name"].dropna().unique())
+    drugs   = _filter_drugs(sorted(shortlisted["Drug Name"].dropna().unique()))
     results = []
 
     output_dir = SCRIPT_DIR / "reports" / "4_secondary_market"
@@ -439,7 +450,7 @@ def _run_pte_analysis(mod) -> list:
         print("    [SKIP] Shortlisted table empty or missing Drug Name")
         return []
 
-    drugs   = sorted(shortlisted["Drug Name"].dropna().unique())
+    drugs   = _filter_drugs(sorted(shortlisted["Drug Name"].dropna().unique()))
     results = []
 
     output_dir = SCRIPT_DIR / "reports" / "5_pte_analysis"
@@ -483,6 +494,7 @@ def _run_forecast_report(mod) -> list:
     if not drugs:
         print("    [SKIP] No drugs available from forecast_report._list_drugs()")
         return []
+    drugs = _filter_drugs(drugs)
 
     results = []
     for drug in drugs:
@@ -517,6 +529,8 @@ def _run_bq_block(mod) -> list:
     results = []
 
     for dn, drug_patents in drug_groups.items():
+        if DRUG_FILTER is not None and dn.strip().lower() not in DRUG_FILTER:
+            continue
         safe = re.sub(r"[^a-zA-Z0-9_-]", "_", dn)
         pdf_path = str(output_dir / f"{safe}_Blocking_analysis.pdf")
 
@@ -640,6 +654,16 @@ RUNNERS = {
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Unified report generator")
+    parser.add_argument("--drugs", nargs="+", default=None,
+                        help="Filter to specific drugs. If omitted, all drugs are processed.")
+    args = parser.parse_args()
+
+    # Store drug filter globally so runners can access it
+    global DRUG_FILTER
+    DRUG_FILTER = set(d.strip().lower() for d in args.drugs) if args.drugs else None
+
     start = time.time()
 
     print("=" * 70)
