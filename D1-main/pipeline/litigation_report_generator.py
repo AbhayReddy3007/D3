@@ -64,10 +64,12 @@ LITIGATION_TABLE  = f"{BQ_PROJECT_ID}.{BQ_DATASET}.litigation_analysis_table"
 
 def _get_bq_client():
     from google.cloud import bigquery
-    sa = os.getenv("BQ_SERVICE_ACCOUNT") or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    if sa and Path(sa).exists():
-        return bigquery.Client.from_service_account_json(sa)
-    return bigquery.Client(project=BQ_PROJECT_ID)
+    from google.oauth2 import service_account as _sa
+    cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+    credentials = None
+    if cred_path and Path(cred_path).exists():
+        credentials = _sa.Credentials.from_service_account_file(cred_path)
+    return bigquery.Client(project=BQ_PROJECT_ID, credentials=credentials)
 
 
 def load_from_bigquery(drugs: list | None = None, latest_only: bool = False) -> pd.DataFrame:
