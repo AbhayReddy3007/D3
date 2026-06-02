@@ -853,11 +853,31 @@ def write_circumvention_to_bq(circumvention_by_drug: dict):
     table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_CIRC_TABLE}"
     client = _get_bq_client()
 
-    # Cast all columns to string to avoid pyarrow type mismatches
-    for col in df_circ.columns:
-        df_circ[col] = df_circ[col].astype(str).replace({"None": None, "nan": None})
-
     df_circ = df_circ.drop_duplicates()
+
+    # Skip rows where Drug_Name + Patent_Category already exist in BQ
+    try:
+        existing = client.query(
+            f"SELECT DISTINCT Drug_Name, Patent_Category FROM `{table_ref}`"
+        ).to_dataframe()
+        if not existing.empty:
+            existing["_key"] = (existing["Drug_Name"].astype(str).str.strip() + "|"
+                                + existing["Patent_Category"].astype(str).str.strip())
+            existing_keys = set(existing["_key"])
+            df_circ["_key"] = (df_circ["Drug_Name"].astype(str).str.strip() + "|"
+                               + df_circ["Patent_Category"].astype(str).str.strip())
+            before = len(df_circ)
+            df_circ = df_circ[~df_circ["_key"].isin(existing_keys)].drop(columns=["_key"])
+            skipped = before - len(df_circ)
+            if skipped > 0:
+                print(f"[BQ] Skipped {skipped} circumvention rows (already in table)")
+    except Exception as e:
+        print(f"[BQ] Could not check existing circumvention rows ({e}) — writing all")
+
+    if df_circ.empty:
+        print(f"[BQ] All circumvention rows already exist — nothing to write.")
+        return
+
     job_config = bigquery.LoadJobConfig(
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         autodetect=True,
@@ -865,7 +885,7 @@ def write_circumvention_to_bq(circumvention_by_drug: dict):
     job = client.load_table_from_dataframe(df_circ, table_ref, job_config=job_config,
                                            location=BQ_LOCATION)
     job.result()
-    print(f"[BQ] Circumvention_Table: {len(df_circ)} rows written → {table_ref}")
+    print(f"[BQ] Circumvention_Table: {len(df_circ)} new rows written → {table_ref}")
 
 
 def write_score_to_bq(drug_scores: list):
@@ -930,12 +950,47 @@ def write_score_to_bq(drug_scores: list):
     table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_SCORE_TABLE}"
     client = _get_bq_client()
 
-    # Cast all columns to string to avoid pyarrow type mismatches
-    # (e.g. Combined_Total being float64 when BQ schema expects STRING)
-    for col in df_score.columns:
-        df_score[col] = df_score[col].astype(str).replace({"None": None, "nan": None})
+    # Align dtypes to match BQ schema — read the table schema and cast accordingly
+    try:
+        table = client.get_table(table_ref)
+        bq_type_map = {field.name: field.field_type for field in table.schema}
+        for col in df_score.columns:
+            if col in bq_type_map:
+                bq_type = bq_type_map[col]
+                if bq_type in ("STRING",):
+                    df_score[col] = df_score[col].astype(str).replace({"None": None, "nan": None, "NaN": None})
+                elif bq_type in ("INTEGER", "INT64"):
+                    df_score[col] = pd.to_numeric(df_score[col], errors="coerce").astype("Int64")
+                elif bq_type in ("FLOAT", "FLOAT64", "NUMERIC"):
+                    df_score[col] = pd.to_numeric(df_score[col], errors="coerce")
+    except Exception as e:
+        print(f"[BQ] Could not read schema for type alignment ({e}) — using autodetect")
 
     df_score = df_score.drop_duplicates()
+
+    # Skip rows where Drug_Name + Jurisdiction already exist in BQ
+    try:
+        existing = client.query(
+            f"SELECT DISTINCT Drug_Name, Jurisdiction FROM `{table_ref}`"
+        ).to_dataframe()
+        if not existing.empty:
+            existing["_key"] = (existing["Drug_Name"].astype(str).str.strip() + "|"
+                                + existing["Jurisdiction"].astype(str).str.strip())
+            existing_keys = set(existing["_key"])
+            df_score["_key"] = (df_score["Drug_Name"].astype(str).str.strip() + "|"
+                                + df_score["Jurisdiction"].astype(str).str.strip())
+            before = len(df_score)
+            df_score = df_score[~df_score["_key"].isin(existing_keys)].drop(columns=["_key"])
+            skipped = before - len(df_score)
+            if skipped > 0:
+                print(f"[BQ] Skipped {skipped} score rows (already in table)")
+    except Exception as e:
+        print(f"[BQ] Could not check existing score rows ({e}) — writing all")
+
+    if df_score.empty:
+        print(f"[BQ] All score rows already exist — nothing to write.")
+        return
+
     job_config = bigquery.LoadJobConfig(
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         autodetect=True,
@@ -943,7 +998,7 @@ def write_score_to_bq(drug_scores: list):
     job = client.load_table_from_dataframe(df_score, table_ref, job_config=job_config,
                                            location=BQ_LOCATION)
     job.result()
-    print(f"[BQ] Patent_Thicket_Score_Table: {len(df_score)} rows written → {table_ref}")
+    print(f"[BQ] Patent_Thicket_Score_Table: {len(df_score)} new rows written → {table_ref}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
