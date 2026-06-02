@@ -10,7 +10,7 @@ then uploads each per-drug PDF to Google Cloud Storage under:
   gs://cognito-gcs/Cognito_new/reports/{drug_name}/PTE_Analysis.pdf
 
 API key read from .env  →  GEMINI_API_KEY
-Model: gemini-2.0-flash
+Model: gemini-2.5-flash
 """
 
 import os
@@ -155,7 +155,7 @@ def load_data_from_bigquery() -> tuple[pd.DataFrame, pd.DataFrame]:
 #  GEMINI SETUP
 # ═══════════════════════════════════════════════════════════════════════════
 load_dotenv(override=True)
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-2.5-flash"
 _genai_client = None
 
 
@@ -172,7 +172,7 @@ def _get_genai_client():
     return _genai_client
 
 
-def _call_gemini(prompt: str, retries: int = 3, backoff: float = 2.0) -> str | None:
+def _call_gemini(prompt: str, retries: int = 3, backoff: float = 2.5) -> str | None:
     for attempt in range(retries):
         try:
             resp = _get_genai_client().models.generate_content(
