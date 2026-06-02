@@ -103,7 +103,7 @@ def _get_bq_client() -> bigquery.Client:
 def _load_table(client: bigquery.Client, table_name: str) -> pd.DataFrame:
     """Load an entire BQ table into a DataFrame (all columns as strings)."""
     full_ref = f"`{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}`"
-    query    = f"SELECT * FROM {full_ref}"
+    query    = f"SELECT DISTINCT * FROM {full_ref}"
     print(f"  [BQ] Querying {full_ref} …")
     df = client.query(query).to_dataframe().astype(str)
     # Replace literal "None" / "nan" strings with proper NaN
