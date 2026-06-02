@@ -197,14 +197,14 @@ def merge_and_upload(dry_run=False):
     client = _get_bq_client()
     now = datetime.now(timezone.utc)
 
-    print("\n[1/4] Reading source tables...")
+    print("\n[1/5] Reading source tables...")
     loe_df      = _read_table(client, LOE_TABLE)
     forecast_df = _read_table(client, FORECASTED_TABLE)
     if loe_df.empty and forecast_df.empty:
         print("[ERROR] Both tables empty.")
         sys.exit(1)
 
-    print("\n[2/4] Mapping columns...")
+    print("\n[2/5] Mapping columns...")
     if not loe_df.empty:
         loe_df = _map_and_align(loe_df, _LOE_COL_MAP)
         loe_df["Type"] = "Existing"
@@ -213,43 +213,81 @@ def merge_and_upload(dry_run=False):
         if "Type" not in forecast_df.columns or forecast_df["Type"].isna().all():
             forecast_df["Type"] = "Forecasted"
 
-    print("\n[3/4] Merging...")
-    master = pd.concat([loe_df, forecast_df], ignore_index=True)
+    print("\n[3/5] Merging sources...")
+    incoming = pd.concat([loe_df, forecast_df], ignore_index=True)
 
     ts_cols = {"Report_Timestamp", "created_at", "updated_at"}
-    for col in master.columns:
+    for col in incoming.columns:
         if col not in ts_cols:
-            master[col] = master[col].astype(str).replace({"nan": None, "None": None, "": None})
+            incoming[col] = incoming[col].astype(str).replace({"nan": None, "None": None, "": None})
 
-    master["Report_Timestamp"] = pd.to_datetime(master["Report_Timestamp"], errors="coerce")
-    master["created_at"] = pd.to_datetime(master.get("created_at"), errors="coerce").fillna(now)
-    master["updated_at"] = now
-    master = _compute_drug_aggregates(master)
+    incoming["Report_Timestamp"] = pd.to_datetime(incoming["Report_Timestamp"], errors="coerce")
+    incoming["created_at"] = pd.to_datetime(incoming.get("created_at"), errors="coerce").fillna(now)
+    incoming["updated_at"] = now
+    incoming = _compute_drug_aggregates(incoming)
 
-    existing   = len(master[master["Type"] == "Existing"])
-    forecasted = len(master[master["Type"] == "Forecasted"])
-    print(f"  Total: {len(master)} | Existing: {existing} | Forecasted: {forecasted}")
+    # Deduplicate incoming data itself
+    dedup_cols = [c for c in MASTER_COLUMNS if c not in ("created_at", "updated_at", "Report_Timestamp")]
+    dedup_cols = [c for c in dedup_cols if c in incoming.columns]
+    incoming = incoming.drop_duplicates(subset=dedup_cols, keep="first").reset_index(drop=True)
+
+    existing   = len(incoming[incoming["Type"] == "Existing"])
+    forecasted = len(incoming[incoming["Type"] == "Forecasted"])
+    print(f"  Incoming: {len(incoming)} | Existing: {existing} | Forecasted: {forecasted}")
+
+    print("\n[4/5] Reading current Master_LOE to find only NEW rows...")
+    try:
+        master_existing = _read_table(client, MASTER_TABLE)
+    except Exception:
+        master_existing = pd.DataFrame()
+
+    if not master_existing.empty:
+        # Build a fingerprint of existing rows to compare
+        master_dedup_cols = [c for c in dedup_cols if c in master_existing.columns]
+        # Normalize master existing for comparison
+        for col in master_dedup_cols:
+            if col in master_existing.columns:
+                master_existing[col] = master_existing[col].astype(str).replace({"nan": None, "None": None, "": None})
+
+        # Create a set of existing row signatures
+        existing_keys = set()
+        for _, row in master_existing[master_dedup_cols].iterrows():
+            key = tuple(str(row[c]) for c in master_dedup_cols)
+            existing_keys.add(key)
+
+        # Filter incoming to only truly new rows
+        new_mask = []
+        for _, row in incoming[master_dedup_cols].iterrows():
+            key = tuple(str(row[c]) for c in master_dedup_cols)
+            new_mask.append(key not in existing_keys)
+
+        new_rows = incoming[new_mask].reset_index(drop=True)
+        print(f"  Already in Master_LOE: {len(incoming) - len(new_rows)}")
+        print(f"  New rows to append   : {len(new_rows)}")
+    else:
+        new_rows = incoming
+        print(f"  Master_LOE is empty — all {len(new_rows)} rows are new")
+
+    if new_rows.empty:
+        print("\n  ✓ No new rows to add — Master_LOE is up to date.")
+        return
 
     if dry_run:
         print("\n[DRY RUN]", MASTER_TABLE)
-        print(master.head(3).to_string())
+        print(new_rows.head(3).to_string())
         return
 
-    print(f"\n[4/5] Appending to {MASTER_TABLE}...")
+    print(f"\n[5/5] Appending {len(new_rows)} new rows to {MASTER_TABLE}...")
     job = client.load_table_from_dataframe(
-        master, MASTER_TABLE,
+        new_rows, MASTER_TABLE,
         job_config=bigquery.LoadJobConfig(
             write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
             autodetect=True,
         ),
     )
     job.result()
-    print(f"  Appended {len(master)} rows.")
-
-    print(f"\n[5/5] Deduplicating {MASTER_TABLE}...")
-    _deduplicate_in_bq(client)
     t = client.get_table(MASTER_TABLE)
-    print(f"  [DONE] {t.num_rows} rows remaining after dedup.")
+    print(f"  [DONE] Appended {len(new_rows)} new rows. Master_LOE now has {t.num_rows} rows.")
 
 
 def main():
