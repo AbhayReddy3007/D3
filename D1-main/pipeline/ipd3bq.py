@@ -1166,19 +1166,25 @@ def process_patents(skip_circumvention=False, drug_filter=None):
         _save_ipd3_checkpoint()
 
     # ── Circumvention Analysis → BigQuery ────────────────────────────────
-    if not skip_circumvention:
+    # Only run for drugs that were actually processed (not skipped by checkpoint)
+    processed_drugs = {ds["drug"] for ds in drug_scores}
+    if not skip_circumvention and processed_drugs:
         if not API_KEY:
             print("\n⚠️  GEMINI_API_KEY not set — skipping circumvention analysis.")
         else:
             print(f"\n{'='*60}")
             print(f"Running circumvention / 505(b)(2) design-around analysis...")
             print(f"{'='*60}")
+            # Filter non_blocking to only the drugs we actually scored
+            nb_to_analyse = non_blocking[non_blocking["Drug Name"].isin(processed_drugs)]
             chroma_client = get_chroma_clients()[0]
-            circumvention_by_drug = get_circumvention_for_drugs(non_blocking, chroma_client)
+            circumvention_by_drug = get_circumvention_for_drugs(nb_to_analyse, chroma_client)
             if circumvention_by_drug:
                 write_circumvention_to_bq(circumvention_by_drug)
-    else:
+    elif skip_circumvention:
         print("\n⏭️  Circumvention analysis skipped (--skip-circumvention flag).")
+    else:
+        print("\n⏭️  No new drugs to analyse — circumvention skipped.")
 
     # ── Score → BigQuery ──────────────────────────────────────────────────
     write_score_to_bq(drug_scores)
