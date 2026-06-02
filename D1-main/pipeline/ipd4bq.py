@@ -507,7 +507,7 @@ def _to_snake_case(col: str) -> str:
 
 
 def write_to_bigquery(df: pd.DataFrame, table_id: str) -> None:
-    """Write a DataFrame to a BigQuery table (WRITE_APPEND — no truncation)."""
+    """Write only NEW rows to a BigQuery table (skip existing patent numbers)."""
     df = df.copy()
     df.columns = [_to_snake_case(c) for c in df.columns]
     df = df.astype(str).replace("nan", pd.NA).replace("<NA>", pd.NA)
@@ -521,6 +521,46 @@ def write_to_bigquery(df: pd.DataFrame, table_id: str) -> None:
     )
 
     full_table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_id}"
+
+    # Skip rows where patent_number already exists in BQ
+    if "patent_number" in df.columns:
+        try:
+            existing = client.query(
+                f"SELECT DISTINCT patent_number FROM `{full_table_id}`"
+            ).to_dataframe()
+            if not existing.empty:
+                existing_patents = set(existing["patent_number"].astype(str).str.strip())
+                before = len(df)
+                df = df[~df["patent_number"].astype(str).str.strip().isin(existing_patents)]
+                skipped = before - len(df)
+                if skipped > 0:
+                    print(f"  [DEDUP] Skipped {skipped} rows (patent_number already in {table_id})")
+        except Exception as e:
+            print(f"  [DEDUP] Could not check existing rows ({e}) — writing all")
+    elif "drug_name" in df.columns:
+        # For arbitrage_summary_table — dedup on drug_name + jurisdiction
+        try:
+            existing = client.query(
+                f"SELECT DISTINCT drug_name, jurisdiction FROM `{full_table_id}`"
+            ).to_dataframe()
+            if not existing.empty:
+                existing["_key"] = (existing["drug_name"].astype(str).str.strip() + "|"
+                                    + existing["jurisdiction"].astype(str).str.strip())
+                existing_keys = set(existing["_key"])
+                df["_key"] = (df["drug_name"].astype(str).str.strip() + "|"
+                              + df.get("jurisdiction", pd.Series("")).astype(str).str.strip())
+                before = len(df)
+                df = df[~df["_key"].isin(existing_keys)].drop(columns=["_key"])
+                skipped = before - len(df)
+                if skipped > 0:
+                    print(f"  [DEDUP] Skipped {skipped} rows (already in {table_id})")
+        except Exception as e:
+            print(f"  [DEDUP] Could not check existing rows ({e}) — writing all")
+
+    if df.empty:
+        print(f"  ✓ All rows already exist in `{full_table_id}` — nothing to write.")
+        return
+
     job_config = bigquery.LoadJobConfig(
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         autodetect=True,
@@ -528,7 +568,7 @@ def write_to_bigquery(df: pd.DataFrame, table_id: str) -> None:
 
     job = client.load_table_from_dataframe(df, full_table_id, job_config=job_config)
     job.result()
-    print(f"  ✓ Written {len(df):,} rows → `{full_table_id}`")
+    print(f"  ✓ Written {len(df):,} new rows → `{full_table_id}`")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -821,3 +861,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
