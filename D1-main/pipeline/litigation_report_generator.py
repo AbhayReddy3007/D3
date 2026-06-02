@@ -108,7 +108,7 @@ def load_from_bigquery(drugs: list | None = None, latest_only: bool = False) -> 
         """
         sql = f"SELECT * EXCEPT(_rn) FROM ({inner}) WHERE _rn = 1"
     else:
-        sql = f"SELECT * FROM `{LITIGATION_TABLE}` WHERE 1=1 {drug_filter} ORDER BY drug_name, loaded_at DESC"
+        sql = f"SELECT DISTINCT * FROM `{LITIGATION_TABLE}` WHERE 1=1 {drug_filter} ORDER BY drug_name, loaded_at DESC"
 
     job_config = bigquery.QueryJobConfig(query_parameters=params) if params else None
     print(f"  [BQ] Querying {LITIGATION_TABLE}...")
