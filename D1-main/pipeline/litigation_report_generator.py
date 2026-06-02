@@ -47,8 +47,10 @@ load_dotenv(SCRIPT_DIR / ".env")
 # ── Gemini ─────────────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 if not GEMINI_API_KEY:
-    sys.exit("ERROR: GEMINI_API_KEY not found in environment / .env")
-client   = genai.Client(api_key=GEMINI_API_KEY)
+    print("WARNING: GEMINI_API_KEY not found in environment / .env — Gemini calls will fail")
+    client = None
+else:
+    client   = genai.Client(api_key=GEMINI_API_KEY)
 MODEL_ID = "gemini-2.0-flash"
 google_search_tool = types.Tool(google_search=types.GoogleSearch())
 
@@ -113,10 +115,11 @@ def load_from_bigquery(drugs: list | None = None, latest_only: bool = False) -> 
     try:
         df = bq.query(sql, job_config=job_config).to_dataframe()
     except Exception as e:
-        sys.exit(f"ERROR: BigQuery query failed: {e}")
+        raise RuntimeError(f"BigQuery query failed: {e}")
 
     if df.empty:
-        sys.exit("ERROR: No rows returned from litigation_analysis_table. Run litigation_analysis.py first.")
+        raise RuntimeError(f"No rows returned from {LITIGATION_TABLE} for the requested drugs. "
+                           "Run litigation_analysis.py first.")
 
     print(f"  [BQ] {len(df)} row(s) fetched for {df['drug_name'].nunique()} drug(s)")
 
