@@ -709,16 +709,30 @@ def _push_to_bigquery(litigation_data: dict) -> int:
         client.create_table(table)
         print(f"  [BQ] Created table {LITIGATION_TABLE}")
 
-    job = client.load_table_from_dataframe(
-        df,
-        LITIGATION_TABLE,
-        job_config=bq.LoadJobConfig(
-            schema=LITIGATION_TABLE_SCHEMA,
-            write_disposition=bq.WriteDisposition.WRITE_APPEND,
-        ),
-    )
-    job.result()
-    print(f"  [BQ] ✅ {len(rows)} row(s) appended to {LITIGATION_TABLE} for '{drug}'")
+    # Retry with backoff — multiple drugs finishing at once can exceed
+    # BQ's per-table update rate limit (429 TooManyRequests)
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            job = client.load_table_from_dataframe(
+                df,
+                LITIGATION_TABLE,
+                job_config=bq.LoadJobConfig(
+                    schema=LITIGATION_TABLE_SCHEMA,
+                    write_disposition=bq.WriteDisposition.WRITE_APPEND,
+                ),
+            )
+            job.result()
+            print(f"  [BQ] ✅ {len(rows)} row(s) appended to {LITIGATION_TABLE} for '{drug}'")
+            return len(rows)
+        except Exception as e:
+            err_str = str(e)
+            if ("429" in err_str or "rateLimitExceeded" in err_str) and attempt < max_retries - 1:
+                wait = (2 ** attempt) + random.uniform(0, 2)
+                print(f"  [BQ] Rate limited for '{drug}', retrying in {wait:.1f}s (attempt {attempt+1}/{max_retries})...")
+                time.sleep(wait)
+            else:
+                raise
     return len(rows)
 
 
