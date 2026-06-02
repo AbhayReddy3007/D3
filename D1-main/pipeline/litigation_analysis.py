@@ -35,7 +35,44 @@ from dotenv import load_dotenv
 from google import genai
 from google.api_core.exceptions import ResourceExhausted, InternalServerError, ServiceUnavailable
 from google.genai import types
-from json_repair import repair_json
+def _safe_parse_json(text: str):
+    """Parse JSON string, handling common Gemini output quirks without json_repair.
+
+    Handles: trailing commas, single quotes, unquoted keys, truncated output.
+    Returns parsed object (dict/list) or None on failure.
+    """
+    if not text or not text.strip():
+        return None
+
+    # Attempt 1: straight parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 2: fix trailing commas before } or ]
+    import re as _re
+    cleaned = _re.sub(r",\s*([}\]])", r"\1", text)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 3: single quotes → double quotes (careful with apostrophes)
+    try:
+        return json.loads(cleaned.replace("'", '"'))
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 4: truncated JSON — try closing brackets
+    for suffix in ["]", "}", "]}", "]}']:
+        try:
+            return json.loads(cleaned + suffix)
+        except json.JSONDecodeError:
+            continue
+
+    print(f"[WARN] Could not parse JSON (first 200 chars): {text[:200]}")
+    return None
 
 from constants import (
     BQ_PROJECT_ID,
@@ -289,7 +326,9 @@ async def _get_brand_and_innovator(
         )
         brand_json = _extract_json_from_response(brand_resp.text.strip())
         if brand_json:
-            brand_data = repair_json(brand_json)
+            brand_data = _safe_parse_json(brand_json)
+            if brand_data is None:
+                brand_data = {}
             if isinstance(brand_data, str):
                 brand_data = json.loads(brand_data)
             brand_names = brand_data.get("brand_names", []) or []
@@ -392,7 +431,9 @@ def _search_litigation_for_patent_group_sync(
             return []
         json_str = _extract_json_from_response(resp.text.strip())
         if json_str:
-            data = repair_json(json_str)
+            data = _safe_parse_json(json_str)
+            if data is None:
+                data = []
             if isinstance(data, str):
                 data = json.loads(data)
             if isinstance(data, list):
