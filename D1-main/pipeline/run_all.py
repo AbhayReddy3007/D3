@@ -794,83 +794,84 @@ def run_ipd(drugs, workers, dry_run=False, resume=False):
 
 
 def run_litigation_analysis(drugs, dry_run=False, resume=False):
-    """Run litigation_analysis.py with the discovered drug list."""
-    task_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0"))
-    task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
+    """Run litigation_analysis.py with the sharded drug list.
 
-    if task_count > 1 and task_index != 0:
-        print(f"{YELLOW}[SHARD] Litigation analysis skipped on task {task_index} "
-              f"(only task 0 runs global steps){RESET}\n")
-        return
-
+    Unlike the report generators, this runs on ALL Cloud Run tasks —
+    each task processes only its shard of drugs (already filtered by
+    shard_drugs() in main()).
+    """
     try:
         from cog import forecast_checkpoint as _ckpt
     except Exception:
         _ckpt = None
 
-    if resume and _ckpt is not None and not dry_run and _ckpt.is_done("litigation_analysis", None):
-        print(f"{YELLOW}[SKIP] Litigation analysis — already marked done in GCS{RESET}\n")
-        return
+    # Filter out drugs already completed in checkpoint
+    drugs_to_run = list(drugs)
+    if resume and _ckpt is not None and not dry_run:
+        drugs_to_run = [d for d in drugs_to_run if not _ckpt.is_done("litigation_analysis", d)]
+        skipped = len(drugs) - len(drugs_to_run)
+        if skipped:
+            print(f"{YELLOW}[SKIP] Litigation analysis: {skipped} drug(s) already done{RESET}")
 
-    drug_args = []
-    if drugs:
-        drug_args = ["--drugs"] + list(drugs)
+    if not drugs_to_run:
+        print(f"{YELLOW}All drugs already have litigation analysis — skipping.{RESET}\n")
+        return
 
     try:
         run_step(
-            "Litigation Analysis",
-            [PY, str(LITIGATION_ANALYSIS_SCRIPT)] + drug_args,
+            f"Litigation Analysis ({len(drugs_to_run)} drug(s))",
+            [PY, str(LITIGATION_ANALYSIS_SCRIPT), "--drugs"] + drugs_to_run,
             dry_run=dry_run,
         )
+        # Mark each drug as done
         if _ckpt is not None and not dry_run:
-            _ckpt.mark_done("litigation_analysis", None)
+            for d in drugs_to_run:
+                _ckpt.mark_done("litigation_analysis", d)
     except Exception as e:
         print(f"{RED}✗ Litigation analysis failed: {e}{RESET}")
         raise
 
 
-def run_litigation_report(dry_run=False, resume=False):
-    """Run litigation_report_generator.py (reads from BQ, generates PDF)."""
-    task_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0"))
-    task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
-
-    if task_count > 1 and task_index != 0:
-        print(f"{YELLOW}[SHARD] Litigation report skipped on task {task_index} "
-              f"(only task 0 runs global steps){RESET}\n")
-        return
-
+def _litigation_report_worker(drug, dry_run, resume=False):
+    """Generate litigation report for a single drug."""
     try:
         from cog import forecast_checkpoint as _ckpt
     except Exception:
         _ckpt = None
 
-    if resume and _ckpt is not None and not dry_run and _ckpt.is_done("litigation_report", None):
-        print(f"{YELLOW}[SKIP] Litigation report — already marked done in GCS{RESET}\n")
-        return
+    if resume and _ckpt is not None and not dry_run and _ckpt.is_done("litigation_report", drug):
+        print(f"  [SKIP] Litigation report: {drug} — already done")
+        return (drug, True, None)
 
     try:
         run_step(
-            "Litigation Report Generator",
-            [PY, str(LITIGATION_REPORT_SCRIPT), "--latest-only"],
+            f"Litigation Report: {drug}",
+            [PY, str(LITIGATION_REPORT_SCRIPT), "--drugs", drug, "--latest-only"],
             dry_run=dry_run,
         )
         if _ckpt is not None and not dry_run:
-            _ckpt.mark_done("litigation_report", None)
+            _ckpt.mark_done("litigation_report", drug)
+        return (drug, True, None)
     except Exception as e:
-        print(f"{RED}✗ Litigation report failed: {e}{RESET}")
-        raise
+        return (drug, False, f"litigation_report: {e}")
+
+
+def run_litigation_report(drugs, workers, dry_run=False, resume=False):
+    """Run litigation_report_generator.py per drug, parallelised across tasks."""
+    lit_report_worker = functools.partial(_litigation_report_worker, resume=resume)
+    run_parallel("Litigation Reports", lit_report_worker, drugs, workers, dry_run)
 
 
 def run_reports(drugs, workers, dry_run=False, resume=False):
     banner("REPORTS GENERATION" + (" [RESUME]" if resume else ""))
 
-    # Step 1: Litigation analysis (per-drug, writes to BQ)
+    # Step 1: Litigation analysis — runs on ALL tasks (sharded per drug)
     run_litigation_analysis(drugs, dry_run=dry_run, resume=resume)
 
-    # Step 2: Litigation report (reads from BQ, generates PDF)
-    run_litigation_report(dry_run=dry_run, resume=resume)
+    # Step 2: Litigation report — per drug, parallelised across tasks
+    run_litigation_report(drugs, workers, dry_run=dry_run, resume=resume)
 
-    # Step 3: Standard reports (global step)
+    # Step 3: Standard reports — global (task 0 only)
     run_reports_global(dry_run=dry_run, resume=resume)
 
 
