@@ -145,7 +145,7 @@ def _bq_client():
 def _query_table(client, table_name: str):
     """Return a pandas DataFrame for an entire BQ table."""
     ref   = f"`{PROJECT_ID}.{DATASET_ID}.{table_name}`"
-    query = f"SELECT * FROM {ref}"
+    query = f"SELECT DISTINCT * FROM {ref}"
     print(f"  Querying {ref} ...")
     try:
         df = client.query(query, location=BQ_LOCATION).to_dataframe()
