@@ -1074,18 +1074,41 @@ def _bq_client():
 
 
 def _write_bq_table(rows: list[dict], table_id: str, schema: list) -> None:
-    """Append rows into a BigQuery table (no truncation)."""
+    """Append only NEW rows into a BigQuery table (skip existing patent numbers)."""
+    if not rows:
+        print("  ⏭️  No rows to write.")
+        return
+
     client = _bq_client()
     full_table = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_id}"
+
+    df_out = pd.DataFrame(rows)
+    df_out = df_out.drop_duplicates()
+
+    # Fetch existing patent numbers from BQ to avoid duplicates
+    try:
+        existing_query = f"SELECT DISTINCT patent_number FROM `{full_table}`"
+        existing_df = client.query(existing_query).to_dataframe()
+        existing_patents = set(existing_df["patent_number"].astype(str).str.strip())
+        before = len(df_out)
+        df_out = df_out[~df_out["patent_number"].astype(str).str.strip().isin(existing_patents)]
+        skipped = before - len(df_out)
+        if skipped > 0:
+            print(f"  [DEDUP] Skipped {skipped} rows (patent_number already in {table_id})")
+    except Exception as e:
+        print(f"  [DEDUP] Could not check existing rows ({e}) — writing all")
+
+    if df_out.empty:
+        print(f"  ✓ All rows already exist in {full_table} — nothing to write.")
+        return
+
     job_config = bigquery.LoadJobConfig(
         schema=schema,
         write_disposition="WRITE_APPEND",
     )
-    df_out = pd.DataFrame(rows)
-    df_out = df_out.drop_duplicates()
     job = client.load_table_from_dataframe(df_out, full_table, job_config=job_config)
     job.result()
-    print(f"  ✅ {len(rows)} rows written to {full_table}")
+    print(f"  ✅ {len(df_out)} new rows written to {full_table}")
 
 
 # ── BQ schema definitions ─────────────────────────────────────────────────────
@@ -1180,9 +1203,12 @@ def build_output_bigquery(df_shortlist, results, country_scores=None):
         cw            = get_country_weight(jurisdiction)
         weighted      = compute_weighted_score(r)
 
-        print(f"  [{i+1}/{len(df_shortlist)}] {patent_number} — generating summary...", end=" ")
-        summary = generate_final_summary(row_data, r)
-        print("done")
+        # Summary generation skipped — populate with empty strings
+        summary = {
+            "core_inventive_step": "",
+            "key_vulnerabilities": "",
+            "key_strengths": "",
+        }
 
         row_out = {
             "drug_name":          drug,
