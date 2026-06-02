@@ -542,43 +542,38 @@ def run_ipd4_global(dry_run=False, resume=False):
         raise
 
 
-def run_reports_global(dry_run=False, resume=False):
-    """Run reports.py exactly once (global step).
+def run_reports_global(drugs, dry_run=False, resume=False):
+    """Run reports.py with the sharded drug list.
 
-    reports.py is a wrapper that loads every drug from BigQuery itself and
-    generates all report types for all drugs in a single run (it does not
-    accept or honour a per-drug argument). Fanning it out per-drug in
-    parallel would make every worker regenerate the full report set and
-    race on the same GCS/BigQuery writes, so it is run a single time.
-
-    When sharded across Cloud Run tasks, only task 0 runs it (matching
-    run_merge / run_ipd4_global), with a single global checkpoint key.
+    Now runs on ALL tasks — each task generates reports only for its
+    shard of drugs via the --drugs filter.
     """
-    task_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0"))
-    task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
-
-    if task_count > 1 and task_index != 0:
-        print(f"{YELLOW}[SHARD] Reports skipped on task {task_index} "
-              f"(only task 0 runs the global reports step){RESET}\n")
-        return
-
     try:
         from cog import forecast_checkpoint as _ckpt
     except Exception:
         _ckpt = None
 
-    if resume and _ckpt is not None and not dry_run and _ckpt.is_done("reports", None):
-        print(f"{YELLOW}[SKIP] Reports — already marked done in GCS{RESET}\n")
+    # Filter out drugs already completed
+    drugs_to_run = list(drugs)
+    if resume and _ckpt is not None and not dry_run:
+        drugs_to_run = [d for d in drugs_to_run if not _ckpt.is_done("reports", d)]
+        skipped = len(drugs) - len(drugs_to_run)
+        if skipped:
+            print(f"{YELLOW}[SKIP] Reports: {skipped} drug(s) already done{RESET}")
+
+    if not drugs_to_run:
+        print(f"{YELLOW}All drugs already have reports — skipping.{RESET}\n")
         return
 
     try:
         run_step(
-            "Reports (global)",
-            [PY, str(REPORTS_SCRIPT)],
+            f"Reports ({len(drugs_to_run)} drug(s))",
+            [PY, str(REPORTS_SCRIPT), "--drugs"] + drugs_to_run,
             dry_run=dry_run,
         )
         if _ckpt is not None and not dry_run:
-            _ckpt.mark_done("reports", None)
+            for d in drugs_to_run:
+                _ckpt.mark_done("reports", d)
     except Exception as e:
         print(f"{RED}✗ Reports failed: {e}{RESET}")
         raise
@@ -865,14 +860,14 @@ def run_litigation_report(drugs, workers, dry_run=False, resume=False):
 def run_reports(drugs, workers, dry_run=False, resume=False):
     banner("REPORTS GENERATION" + (" [RESUME]" if resume else ""))
 
-    # Step 1: Litigation analysis — runs on ALL tasks (sharded per drug)
+    # Step 1: Standard reports — all tasks, sharded per drug
+    run_reports_global(drugs, dry_run=dry_run, resume=resume)
+
+    # Step 2: Litigation analysis — runs on ALL tasks (sharded per drug)
     run_litigation_analysis(drugs, dry_run=dry_run, resume=resume)
 
-    # Step 2: Litigation report — per drug, parallelised across tasks
+    # Step 3: Litigation report — per drug, parallelised across tasks
     run_litigation_report(drugs, workers, dry_run=dry_run, resume=resume)
-
-    # Step 3: Standard reports — global (task 0 only)
-    run_reports_global(dry_run=dry_run, resume=resume)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
