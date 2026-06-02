@@ -20,15 +20,15 @@ Pipeline order (sequential between stages):
   2. Forecast  — steps 3→4→5→6 (sequential), each step parallelised across drugs
   3. Merge     — merge_to_master_loe.py (single step, runs once, only appends new rows)
   4. IPD       — ipd2bq + ipd3bq + ipd4bq all parallelised across drugs
-  5. Reports   — reports.py parallelised across drugs
+  5. Reports   — litigation_analysis → litigation_report_generator → reports.py
 
 Usage:
-  python run_all.py                   # IPD stage only (default)
+  python run_all.py                   # Reports stage (default): litigation → report → reports
   python run_all.py --mode all        # full pipeline
   python run_all.py --mode patents    # only patents stage
   python run_all.py --mode forecast   # forecast → merge → IPD → reports (skips patents)
-  python run_all.py --mode ipd        # only IPD stage (default)
-  python run_all.py --mode reports    # only reports stage
+  python run_all.py --mode ipd        # only IPD stage
+  python run_all.py --mode reports    # litigation analysis → litigation report → reports (default)
   python run_all.py --workers 6       # limit parallelism (default: 10)
   python run_all.py --dry-run         # print commands without executing
 """
@@ -49,7 +49,9 @@ MERGE_SCRIPT   = BASE_DIR / "merge_to_master_loe.py"
 IPD2_SCRIPT    = BASE_DIR / "ipd2bq.py"
 IPD3_SCRIPT    = BASE_DIR / "ipd3bq.py"
 IPD4_SCRIPT    = BASE_DIR / "ipd4bq.py"
-REPORTS_SCRIPT = BASE_DIR / "reports.py"
+REPORTS_SCRIPT              = BASE_DIR / "reports.py"
+LITIGATION_ANALYSIS_SCRIPT  = BASE_DIR / "litigation_analysis.py"
+LITIGATION_REPORT_SCRIPT    = BASE_DIR / "litigation_report_generator.py"
 
 DEFAULT_WORKERS = 10
 
@@ -791,12 +793,84 @@ def run_ipd(drugs, workers, dry_run=False, resume=False):
     run_parallel("IPD (ipd2bq + ipd3bq + ipd4bq)", ipd_worker, drugs, workers, dry_run)
 
 
+def run_litigation_analysis(drugs, dry_run=False, resume=False):
+    """Run litigation_analysis.py with the discovered drug list."""
+    task_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0"))
+    task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
+
+    if task_count > 1 and task_index != 0:
+        print(f"{YELLOW}[SHARD] Litigation analysis skipped on task {task_index} "
+              f"(only task 0 runs global steps){RESET}\n")
+        return
+
+    try:
+        from cog import forecast_checkpoint as _ckpt
+    except Exception:
+        _ckpt = None
+
+    if resume and _ckpt is not None and not dry_run and _ckpt.is_done("litigation_analysis", None):
+        print(f"{YELLOW}[SKIP] Litigation analysis — already marked done in GCS{RESET}\n")
+        return
+
+    drug_args = []
+    if drugs:
+        drug_args = ["--drugs"] + list(drugs)
+
+    try:
+        run_step(
+            "Litigation Analysis",
+            [PY, str(LITIGATION_ANALYSIS_SCRIPT)] + drug_args,
+            dry_run=dry_run,
+        )
+        if _ckpt is not None and not dry_run:
+            _ckpt.mark_done("litigation_analysis", None)
+    except Exception as e:
+        print(f"{RED}✗ Litigation analysis failed: {e}{RESET}")
+        raise
+
+
+def run_litigation_report(dry_run=False, resume=False):
+    """Run litigation_report_generator.py (reads from BQ, generates PDF)."""
+    task_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0"))
+    task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
+
+    if task_count > 1 and task_index != 0:
+        print(f"{YELLOW}[SHARD] Litigation report skipped on task {task_index} "
+              f"(only task 0 runs global steps){RESET}\n")
+        return
+
+    try:
+        from cog import forecast_checkpoint as _ckpt
+    except Exception:
+        _ckpt = None
+
+    if resume and _ckpt is not None and not dry_run and _ckpt.is_done("litigation_report", None):
+        print(f"{YELLOW}[SKIP] Litigation report — already marked done in GCS{RESET}\n")
+        return
+
+    try:
+        run_step(
+            "Litigation Report Generator",
+            [PY, str(LITIGATION_REPORT_SCRIPT), "--latest-only"],
+            dry_run=dry_run,
+        )
+        if _ckpt is not None and not dry_run:
+            _ckpt.mark_done("litigation_report", None)
+    except Exception as e:
+        print(f"{RED}✗ Litigation report failed: {e}{RESET}")
+        raise
+
+
 def run_reports(drugs, workers, dry_run=False, resume=False):
     banner("REPORTS GENERATION" + (" [RESUME]" if resume else ""))
-    # reports.py is a GLOBAL step (see run_reports_global): it loads all drugs
-    # itself and produces the full report set in one run, so it is not fanned
-    # out per-drug. `drugs`/`workers` are accepted for signature consistency
-    # with the other stages but are intentionally unused here.
+
+    # Step 1: Litigation analysis (per-drug, writes to BQ)
+    run_litigation_analysis(drugs, dry_run=dry_run, resume=resume)
+
+    # Step 2: Litigation report (reads from BQ, generates PDF)
+    run_litigation_report(dry_run=dry_run, resume=resume)
+
+    # Step 3: Standard reports (global step)
     run_reports_global(dry_run=dry_run, resume=resume)
 
 
@@ -807,13 +881,13 @@ def main():
     parser.add_argument(
         "--mode",
         choices=["all", "patents", "forecast", "ipd", "reports"],
-        default="ipd",
+        default="reports",
         help=(
             "all      = full pipeline: patents → forecast → merge → ipd → reports\n"
             "patents  = patent pipeline only\n"
             "forecast = forecast → merge → ipd → reports (skips patents; resume on by default)\n"
-            "ipd      = IPD BQ upload only (default)\n"
-            "reports  = reports only"
+            "ipd      = IPD BQ upload only\n"
+            "reports  = litigation analysis → litigation report → reports (default)"
         ),
     )
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
