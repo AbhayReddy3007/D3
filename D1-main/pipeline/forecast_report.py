@@ -88,7 +88,7 @@ def _load_forecast_scored(drug_name: str = None) -> pd.DataFrame:
     client = _get_bq_client()
     if drug_name:
         query = f"""
-        SELECT * FROM `{FORECAST_SCORED_TABLE}`
+        SELECT DISTINCT * FROM `{FORECAST_SCORED_TABLE}`
         WHERE LOWER(drug_name) = LOWER(@drug)
         """
         from google.cloud import bigquery
@@ -99,7 +99,7 @@ def _load_forecast_scored(drug_name: str = None) -> pd.DataFrame:
         )
         df = client.query(query, job_config=job_config).to_dataframe()
     else:
-        query = f"SELECT * FROM `{FORECAST_SCORED_TABLE}`"
+        query = f"SELECT DISTINCT * FROM `{FORECAST_SCORED_TABLE}`"
         df = client.query(query).to_dataframe()
     return df
 
@@ -109,7 +109,7 @@ def _load_master_loe(drug_name: str = None) -> pd.DataFrame:
     client = _get_bq_client()
     if drug_name:
         query = f"""
-        SELECT * FROM `{MASTER_LOE_TABLE}`
+        SELECT DISTINCT * FROM `{MASTER_LOE_TABLE}`
         WHERE LOWER(Drug_Name) = LOWER(@drug)
         """
         from google.cloud import bigquery
@@ -120,7 +120,7 @@ def _load_master_loe(drug_name: str = None) -> pd.DataFrame:
         )
         df = client.query(query, job_config=job_config).to_dataframe()
     else:
-        query = f"SELECT * FROM `{MASTER_LOE_TABLE}`"
+        query = f"SELECT DISTINCT * FROM `{MASTER_LOE_TABLE}`"
         df = client.query(query).to_dataframe()
     return df
 
