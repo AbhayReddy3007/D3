@@ -132,7 +132,7 @@ def load_from_bigquery() -> dict:
     # ── patent_strength_table ─────────────────────────────────────────────────
     print(f"Loading {BQ_STRENGTH_TABLE} from BigQuery...")
     try:
-        q = f"SELECT * FROM `{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_STRENGTH_TABLE}`"
+        q = f"SELECT DISTINCT * FROM `{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_STRENGTH_TABLE}`"
         df_final = client.query(q).to_dataframe()
         df_final = df_final.rename(columns={
             "drug_name":           "Drug Name",
@@ -190,7 +190,7 @@ def load_from_bigquery() -> dict:
     # ── patent_strength_country_score_table ───────────────────────────────────
     print(f"Loading {BQ_COUNTRY_SCORE_TABLE} from BigQuery...")
     try:
-        q = f"SELECT * FROM `{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_COUNTRY_SCORE_TABLE}`"
+        q = f"SELECT DISTINCT * FROM `{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_COUNTRY_SCORE_TABLE}`"
         df_country = client.query(q).to_dataframe()
         df_country = df_country.rename(columns={
             "drug_name":              "Drug Name",
