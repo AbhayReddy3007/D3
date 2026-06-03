@@ -23,12 +23,13 @@ Pipeline order (sequential between stages):
   5. Reports   — litigation_analysis → litigation_report_generator → reports.py
 
 Usage:
-  python run_all.py                   # Reports stage (default): litigation → report → reports
+  python run_all.py                   # Refresh scores + all reports (default)
   python run_all.py --mode all        # full pipeline
   python run_all.py --mode patents    # only patents stage
   python run_all.py --mode forecast   # forecast → merge → IPD → reports (skips patents)
   python run_all.py --mode ipd        # only IPD stage
-  python run_all.py --mode reports    # litigation analysis → litigation report → reports (default)
+  python run_all.py --mode reports    # litigation analysis → litigation report → reports
+  python run_all.py --mode refresh-scores  # ipd3 score refresh + all reports (default)
   python run_all.py --workers 6       # limit parallelism (default: 10)
   python run_all.py --dry-run         # print commands without executing
 """
@@ -876,14 +877,15 @@ def main():
     parser = argparse.ArgumentParser(description="LOE Pipeline orchestrator")
     parser.add_argument(
         "--mode",
-        choices=["all", "patents", "forecast", "ipd", "reports"],
-        default="reports",
+        choices=["all", "patents", "forecast", "ipd", "reports", "refresh-scores"],
+        default="refresh-scores",
         help=(
-            "all      = full pipeline: patents → forecast → merge → ipd → reports\n"
-            "patents  = patent pipeline only\n"
-            "forecast = forecast → merge → ipd → reports (skips patents; resume on by default)\n"
-            "ipd      = IPD BQ upload only\n"
-            "reports  = litigation analysis → litigation report → reports (default)"
+            "all             = full pipeline: patents → forecast → merge → ipd → reports\n"
+            "patents         = patent pipeline only\n"
+            "forecast        = forecast → merge → ipd → reports (skips patents)\n"
+            "ipd             = IPD BQ upload only\n"
+            "reports         = litigation analysis → litigation report → reports\n"
+            "refresh-scores  = rerun ipd3 score table + all reports (default)"
         ),
     )
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
@@ -985,6 +987,22 @@ def main():
         run_ipd(drugs, args.workers, args.dry_run, resume=args.resume)
 
     elif args.mode == "reports":
+        run_reports(drugs, args.workers, args.dry_run, resume=args.resume)
+
+    elif args.mode == "refresh-scores":
+        # Step 1: Rerun ipd3 with --refresh-scores (deletes old score rows, recomputes)
+        banner("IPD3 REFRESH SCORES")
+        for drug in drugs:
+            try:
+                run_step(
+                    f"IPD3 refresh scores: {drug}",
+                    [PY, str(IPD3_SCRIPT), drug, "--refresh-scores"],
+                    dry_run=args.dry_run,
+                )
+            except Exception as e:
+                print(f"{RED}✗ IPD3 refresh failed for {drug}: {e}{RESET}")
+
+        # Step 2: Run all reports
         run_reports(drugs, args.workers, args.dry_run, resume=args.resume)
 
     banner(f"DONE — {time.time() - t0:.1f}s ({(time.time() - t0) / 60:.1f} min)")
