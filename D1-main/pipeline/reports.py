@@ -293,17 +293,17 @@ def _run_1bqreport(mod) -> list:
 
 
 def _run_2bqreport(mod) -> list:
-    """Patent Strength Scoring — single DOCX with all drugs."""
+    """Patent Strength Scoring — one DOCX per drug."""
     import pandas as pd
     import json as _json
 
-    # Patch the module's upload_to_gcs to write to …/{drug}/IP/
+    # Patch the module's upload_to_gcs for per-drug upload
     def _patched_upload(local_path, drug_names):
         from google.cloud import storage
         client = storage.Client(project=os.getenv("BQ_PROJECT_ID", "cognito-prod-394707"), credentials=_get_credentials())
         bucket = client.bucket(GCS_BUCKET)
         gcs_uris = []
-        for drug_name in drug_names:
+        for drug_name in (drug_names if isinstance(drug_names, list) else [drug_names]):
             safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", str(drug_name))
             blob_name = f"{GCS_BASE_PATH}/{safe_name}/{GCS_SUBFOLDER}/{mod.GCS_FILE_NAME}"
             gcs_uri   = f"gs://{GCS_BUCKET}/{blob_name}"
@@ -323,8 +323,7 @@ def _run_2bqreport(mod) -> list:
         return gcs_uris
     mod.upload_to_gcs = _patched_upload
 
-    # Fix NAType serialization: patch json.dumps via the module's generate function
-    # by cleaning NA values from the dataframes before they reach json.dumps
+    # Load all data
     data = mod.load_from_bigquery()
     df_final = data.get("final", pd.DataFrame())
     if df_final.empty:
@@ -332,23 +331,47 @@ def _run_2bqreport(mod) -> list:
         return []
 
     # Replace all pandas NA/NaT/NaN with "N/A" so json.dumps works.
-    # BigQuery returns nullable extension dtypes (Int64, Float64, etc.)
-    # which reject string fillna. Convert everything to object first.
-    data["final"] = df_final.astype(object).fillna("N/A")
-
+    df_final = df_final.astype(object).fillna("N/A")
     df_country = data.get("country_scores", pd.DataFrame())
     if not df_country.empty:
-        data["country_scores"] = df_country.astype(object).fillna("N/A")
+        df_country = df_country.astype(object).fillna("N/A")
 
     output_dir = SCRIPT_DIR / "reports" / "2_patent_strength"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = str(output_dir / "2.Patent Strength and Invalidity Opportunity.docx")
 
-    mod.build_report(data, output_path)
+    # Generate one report per drug
+    drug_names = _filter_drugs(df_final["Drug Name"].dropna().unique().tolist())
+    results = []
 
-    # This report is one file per drug set; map to each drug
-    drug_names = _filter_drugs(data["final"]["Drug Name"].dropna().unique().tolist())
-    return [(dn, output_path) for dn in drug_names]
+    for drug in drug_names:
+        print(f"    [{drug}] Building Patent Strength report...")
+        drug_final = df_final[df_final["Drug Name"] == drug].copy()
+
+        drug_country = pd.DataFrame()
+        if not df_country.empty and "Drug Name" in df_country.columns:
+            drug_country = df_country[df_country["Drug Name"] == drug].copy()
+        elif not df_country.empty and "drug_name" in df_country.columns:
+            drug_country = df_country[df_country["drug_name"] == drug].copy()
+
+        drug_data = {
+            "final": drug_final,
+            "country_scores": drug_country,
+        }
+        # Preserve any other keys from the original data dict
+        for k, v in data.items():
+            if k not in ("final", "country_scores"):
+                drug_data[k] = v
+
+        safe = re.sub(r"[^a-zA-Z0-9_-]", "_", drug)
+        output_path = str(output_dir / f"{safe}_Patent_Strength.docx")
+
+        try:
+            mod.build_report(drug_data, output_path)
+            results.append((drug, output_path))
+        except Exception as exc:
+            print(f"    [ERROR] Patent Strength report failed for '{drug}': {exc}")
+
+    return results
 
 
 def _run_3bqreport(mod) -> list:
