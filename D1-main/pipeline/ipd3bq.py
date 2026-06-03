@@ -904,7 +904,7 @@ def write_circumvention_to_bq(circumvention_by_drug: dict):
     print(f"[BQ] Circumvention_Table: {len(df_circ)} new rows written → {table_ref}")
 
 
-def write_score_to_bq(drug_scores: list):
+def write_score_to_bq(drug_scores: list, refresh=False):
     """
     Flattens patent thicket score data into rows and writes them to
     BigQuery table: Patent_Thicket_Score_Table
@@ -984,24 +984,39 @@ def write_score_to_bq(drug_scores: list):
 
     df_score = df_score.drop_duplicates()
 
-    # Skip rows where Drug_Name + Jurisdiction already exist in BQ
-    try:
-        existing = client.query(
-            f"SELECT DISTINCT Drug_Name, Jurisdiction FROM `{table_ref}`"
-        ).to_dataframe()
-        if not existing.empty:
-            existing["_key"] = (existing["Drug_Name"].astype(str).str.strip() + "|"
-                                + existing["Jurisdiction"].astype(str).str.strip())
-            existing_keys = set(existing["_key"])
-            df_score["_key"] = (df_score["Drug_Name"].astype(str).str.strip() + "|"
-                                + df_score["Jurisdiction"].astype(str).str.strip())
-            before = len(df_score)
-            df_score = df_score[~df_score["_key"].isin(existing_keys)].drop(columns=["_key"])
-            skipped = before - len(df_score)
-            if skipped > 0:
-                print(f"[BQ] Skipped {skipped} score rows (already in table)")
-    except Exception as e:
-        print(f"[BQ] Could not check existing score rows ({e}) — writing all")
+    if refresh:
+        # Delete existing score rows for the drugs we're about to write
+        drug_names = df_score["Drug_Name"].dropna().unique().tolist()
+        for dn in drug_names:
+            try:
+                delete_sql = f"DELETE FROM `{table_ref}` WHERE Drug_Name = @drug"
+                from google.cloud import bigquery
+                job_config = bigquery.QueryJobConfig(
+                    query_parameters=[bigquery.ScalarQueryParameter("drug", "STRING", dn)]
+                )
+                client.query(delete_sql, job_config=job_config).result()
+                print(f"[REFRESH] Deleted existing score rows for '{dn}'")
+            except Exception as e:
+                print(f"[REFRESH] Could not delete rows for '{dn}': {e}")
+    else:
+        # Skip rows where Drug_Name + Jurisdiction already exist in BQ
+        try:
+            existing = client.query(
+                f"SELECT DISTINCT Drug_Name, Jurisdiction FROM `{table_ref}`"
+            ).to_dataframe()
+            if not existing.empty:
+                existing["_key"] = (existing["Drug_Name"].astype(str).str.strip() + "|"
+                                    + existing["Jurisdiction"].astype(str).str.strip())
+                existing_keys = set(existing["_key"])
+                df_score["_key"] = (df_score["Drug_Name"].astype(str).str.strip() + "|"
+                                    + df_score["Jurisdiction"].astype(str).str.strip())
+                before = len(df_score)
+                df_score = df_score[~df_score["_key"].isin(existing_keys)].drop(columns=["_key"])
+                skipped = before - len(df_score)
+                if skipped > 0:
+                    print(f"[BQ] Skipped {skipped} score rows (already in table)")
+        except Exception as e:
+            print(f"[BQ] Could not check existing score rows ({e}) — writing all")
 
     if df_score.empty:
         print(f"[BQ] All score rows already exist — nothing to write.")
@@ -1020,7 +1035,7 @@ def write_score_to_bq(drug_scores: list):
 # ── Main ──────────────────────────────────────────────────────────────────────
 EXCLUDED_CATEGORIES = {"Composition Of Matter"}
 
-def process_patents(skip_circumvention=False, drug_filter=None):
+def process_patents(skip_circumvention=False, drug_filter=None, refresh_scores=False):
     # ── Load from BigQuery ────────────────────────────────────────────────
     df = load_data_from_bigquery()
     df.columns = df.columns.str.strip()
@@ -1099,14 +1114,17 @@ def process_patents(skip_circumvention=False, drug_filter=None):
     _ipd3_ckpt_subfolder = "ipd3_checkpoints"
     _ipd3_ckpt_file = "completed_drugs.json"
     completed_drugs = set()
-    try:
-        from cog import gcs_cache
-        ckpt_data = gcs_cache.read_json(_ipd3_ckpt_subfolder, _ipd3_ckpt_file)
-        if ckpt_data and isinstance(ckpt_data, list):
-            completed_drugs = set(ckpt_data)
-            print(f"[CHECKPOINT] {len(completed_drugs)} drug(s) already done in GCS: {completed_drugs}")
-    except Exception as e:
-        print(f"[CHECKPOINT] Could not load ipd3 checkpoint: {e}")
+    if refresh_scores:
+        print("[REFRESH] --refresh-scores: bypassing checkpoint, will recompute all scores")
+    else:
+        try:
+            from cog import gcs_cache
+            ckpt_data = gcs_cache.read_json(_ipd3_ckpt_subfolder, _ipd3_ckpt_file)
+            if ckpt_data and isinstance(ckpt_data, list):
+                completed_drugs = set(ckpt_data)
+                print(f"[CHECKPOINT] {len(completed_drugs)} drug(s) already done in GCS: {completed_drugs}")
+        except Exception as e:
+            print(f"[CHECKPOINT] Could not load ipd3 checkpoint: {e}")
 
     def _save_ipd3_checkpoint():
         try:
@@ -1258,7 +1276,7 @@ def process_patents(skip_circumvention=False, drug_filter=None):
         print("\n⏭️  No new drugs to analyse — circumvention skipped.")
 
     # ── Score → BigQuery ──────────────────────────────────────────────────
-    write_score_to_bq(drug_scores)
+    write_score_to_bq(drug_scores, refresh=refresh_scores)
 
     print(f"\nDone! Results written to BigQuery dataset: {BQ_DATASET_ID}")
     print(f"  Tables: {BQ_CIRC_TABLE}, {BQ_SCORE_TABLE}")
@@ -1278,6 +1296,14 @@ if __name__ == "__main__":
         "--skip-circumvention", action="store_true",
         help="Skip circumvention / 505(b)(2) design-around analysis",
     )
+    parser.add_argument(
+        "--refresh-scores", action="store_true",
+        help="Delete existing score rows for the drug(s) and recompute. Bypasses checkpoint.",
+    )
     args = parser.parse_args()
 
-    process_patents(args.skip_circumvention, drug_filter=args.drug)
+    process_patents(
+        args.skip_circumvention or args.refresh_scores,  # refresh implies skip circumvention
+        drug_filter=args.drug,
+        refresh_scores=args.refresh_scores,
+    )
