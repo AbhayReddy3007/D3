@@ -53,6 +53,7 @@ IPD4_SCRIPT    = BASE_DIR / "ipd4bq.py"
 REPORTS_SCRIPT              = BASE_DIR / "reports.py"
 LITIGATION_ANALYSIS_SCRIPT  = BASE_DIR / "litigation_analysis.py"
 LITIGATION_REPORT_SCRIPT    = BASE_DIR / "litigation_report_generator.py"
+BLOCKING_REPORT_SCRIPT      = BASE_DIR / "blocking_report_ai.py"
 
 DEFAULT_WORKERS = 10
 
@@ -877,15 +878,16 @@ def main():
     parser = argparse.ArgumentParser(description="LOE Pipeline orchestrator")
     parser.add_argument(
         "--mode",
-        choices=["all", "patents", "forecast", "ipd", "reports", "refresh-scores"],
-        default="refresh-scores",
+        choices=["all", "patents", "forecast", "ipd", "reports", "refresh-scores", "blocking"],
+        default="blocking",
         help=(
             "all             = full pipeline: patents → forecast → merge → ipd → reports\n"
             "patents         = patent pipeline only\n"
             "forecast        = forecast → merge → ipd → reports (skips patents)\n"
             "ipd             = IPD BQ upload only\n"
             "reports         = litigation analysis → litigation report → reports\n"
-            "refresh-scores  = rerun ipd3 score table + all reports (default)"
+            "refresh-scores  = rerun ipd3 score table + all reports\n"
+            "blocking        = blocking report per drug (default)"
         ),
     )
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
@@ -1004,6 +1006,18 @@ def main():
 
         # Step 2: Run all reports
         run_reports(drugs, args.workers, args.dry_run, resume=args.resume)
+
+    elif args.mode == "blocking":
+        banner("BLOCKING REPORT (per drug)")
+        for drug in drugs:
+            try:
+                run_step(
+                    f"Blocking Report: {drug}",
+                    [PY, str(BLOCKING_REPORT_SCRIPT), drug],
+                    dry_run=args.dry_run,
+                )
+            except Exception as e:
+                print(f"{RED}✗ Blocking report failed for {drug}: {e}{RESET}")
 
     banner(f"DONE — {time.time() - t0:.1f}s ({(time.time() - t0) / 60:.1f} min)")
 
