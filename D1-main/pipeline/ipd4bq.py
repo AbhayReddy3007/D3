@@ -476,7 +476,7 @@ def compute_arbitrage(shortlisted: pd.DataFrame, full_filtered: pd.DataFrame) ->
 #  BIGQUERY HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 def load_from_bigquery() -> pd.DataFrame:
-    """Load DISTINCT rows from Master_LOE table from BigQuery."""
+    """Load latest rows from Master_LOE (deduplicated by Patent_Number, latest created_at)."""
     print(f"\nConnecting to BigQuery …")
     print(f"  Project : {BQ_PROJECT_ID}")
     print(f"  Dataset : {BQ_DATASET_ID}")
@@ -489,12 +489,21 @@ def load_from_bigquery() -> pd.DataFrame:
         location=BQ_LOCATION,
     )
 
-    query = f"SELECT DISTINCT * FROM `{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_ID}`"
-    print(f"  Query   : {query}")
+    table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_ID}"
+    query = f"""
+    SELECT * EXCEPT(rn) FROM (
+        SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY Patent_Number
+            ORDER BY created_at DESC
+        ) AS rn
+        FROM `{table_ref}`
+    ) WHERE rn = 1
+    """
+    print(f"  Query   : ROW_NUMBER dedup on Patent_Number")
 
     df = client.query(query).to_dataframe()
     df = df.astype(str).replace("None", pd.NA).replace("<NA>", pd.NA)
-    print(f"  ✓ Loaded {len(df):,} distinct rows from BigQuery")
+    print(f"  ✓ Loaded {len(df):,} latest rows from BigQuery")
     return df
 
 
@@ -861,4 +870,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
