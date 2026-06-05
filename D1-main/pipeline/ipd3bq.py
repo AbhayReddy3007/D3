@@ -712,7 +712,9 @@ async def run_circumvention_analysis(
     }
 
 
-def get_circumvention_for_drugs(non_blocking_df: pd.DataFrame, chroma_client) -> dict[str, dict]:
+def get_circumvention_for_drugs(non_blocking_df: pd.DataFrame, chroma_client,
+                                max_patents_per_category: int = 10) -> dict[str, dict]:
+    """Run circumvention analysis, limiting to max_patents_per_category patents per category."""
     cat_col = None
     for col_name in ["Step 1 Claim Category", "Patent Type"]:
         if col_name in non_blocking_df.columns:
@@ -743,8 +745,16 @@ def get_circumvention_for_drugs(non_blocking_df: pd.DataFrame, chroma_client) ->
         drugs_categories[drug][cat].append({
             "patent_number": pn,
             "drug_name": drug,
-            "source_file": source_file,  # ← passed directly to fetch_relevant_chunks
+            "source_file": source_file,
         })
+
+    # Limit patents per category
+    for drug in drugs_categories:
+        for cat in drugs_categories[drug]:
+            patents = drugs_categories[drug][cat]
+            if len(patents) > max_patents_per_category:
+                print(f"    [{drug}/{cat}] Limiting from {len(patents)} to {max_patents_per_category} patents")
+                drugs_categories[drug][cat] = patents[:max_patents_per_category]
 
     async def _run_all():
         # Run ALL drugs concurrently — each drug's categories are bounded
@@ -1035,7 +1045,8 @@ def write_score_to_bq(drug_scores: list, refresh=False):
 # ── Main ──────────────────────────────────────────────────────────────────────
 EXCLUDED_CATEGORIES = {"Composition Of Matter"}
 
-def process_patents(skip_circumvention=False, drug_filter=None, refresh_scores=False):
+def process_patents(skip_circumvention=False, drug_filter=None, refresh_scores=False,
+                    rerun=False, max_patents_per_category=10):
     # ── Load from BigQuery ────────────────────────────────────────────────
     df = load_data_from_bigquery()
     df.columns = df.columns.str.strip()
@@ -1114,8 +1125,8 @@ def process_patents(skip_circumvention=False, drug_filter=None, refresh_scores=F
     _ipd3_ckpt_subfolder = "ipd3_checkpoints"
     _ipd3_ckpt_file = "completed_drugs.json"
     completed_drugs = set()
-    if refresh_scores:
-        print("[REFRESH] --refresh-scores: bypassing checkpoint, will recompute all scores")
+    if refresh_scores or rerun:
+        print("[RERUN] Bypassing checkpoint, will reprocess all drugs")
     else:
         try:
             from cog import gcs_cache
@@ -1267,7 +1278,10 @@ def process_patents(skip_circumvention=False, drug_filter=None, refresh_scores=F
             # Filter non_blocking to only the drugs we actually scored
             nb_to_analyse = non_blocking[non_blocking["Drug Name"].isin(processed_drugs)]
             chroma_client = get_chroma_clients()[0]
-            circumvention_by_drug = get_circumvention_for_drugs(nb_to_analyse, chroma_client)
+            circumvention_by_drug = get_circumvention_for_drugs(
+                nb_to_analyse, chroma_client,
+                max_patents_per_category=max_patents_per_category,
+            )
             if circumvention_by_drug:
                 write_circumvention_to_bq(circumvention_by_drug)
     elif skip_circumvention:
@@ -1300,10 +1314,20 @@ if __name__ == "__main__":
         "--refresh-scores", action="store_true",
         help="Delete existing score rows for the drug(s) and recompute. Bypasses checkpoint.",
     )
+    parser.add_argument(
+        "--rerun", action="store_true",
+        help="Bypass checkpoint and rerun everything (scoring + circumvention).",
+    )
+    parser.add_argument(
+        "--max-patents-per-category", type=int, default=10,
+        help="Max patents per category for circumvention analysis (default: 10).",
+    )
     args = parser.parse_args()
 
     process_patents(
-        args.skip_circumvention or args.refresh_scores,  # refresh implies skip circumvention
+        args.skip_circumvention,
         drug_filter=args.drug,
-        refresh_scores=args.refresh_scores,
+        refresh_scores=args.refresh_scores or args.rerun,
+        rerun=args.rerun,
+        max_patents_per_category=args.max_patents_per_category,
     )
