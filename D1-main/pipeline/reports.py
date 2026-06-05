@@ -39,7 +39,7 @@ except ImportError:
 #  CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 GCS_BUCKET    = os.getenv("GCS_BUCKET",      "cognito-prod")
-GCS_BASE_PATH = "Cognito_new/Reports"
+GCS_BASE_PATH = "Cognito_new/reports"
 GCS_SUBFOLDER = "IP"                          # ← new sub-folder
 
 CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
@@ -193,7 +193,7 @@ def _patch_module_env(mod, filename: str):
     """
     Patch hardcoded credentials and GCS paths so every module:
       - uses the CREDENTIALS_PATH env var (not hardcoded Windows paths)
-      - uploads to gs://cognito-prod/Cognito_new/Reports/{drug_name}/IP/
+      - uploads to gs://cognito-prod/Cognito_new/reports/{drug_name}/IP/
     """
     creds = CREDENTIALS_PATH
 
@@ -210,7 +210,7 @@ def _patch_module_env(mod, filename: str):
         mod.SERVICE_KEY_PATH = creds
 
     # ── Override GCS bucket & base path so internal uploads also go to the
-    #    correct bucket (cognito-prod) and path (Cognito_new/Reports) ──
+    #    correct bucket (cognito-prod) and path (Cognito_new/reports) ──
     if hasattr(mod, "GCS_BUCKET"):
         mod.GCS_BUCKET = GCS_BUCKET
 
