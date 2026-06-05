@@ -681,11 +681,16 @@ def main():
     parser = argparse.ArgumentParser(description="Unified report generator")
     parser.add_argument("--drugs", nargs="+", default=None,
                         help="Filter to specific drugs. If omitted, all drugs are processed.")
+    parser.add_argument("--only", nargs="+", default=None,
+                        help="Run only these report scripts (e.g. --only 2bqreport.py forecast_report.py)")
     args = parser.parse_args()
 
     # Store drug filter globally so runners can access it
     global DRUG_FILTER
     DRUG_FILTER = set(d.strip().lower() for d in args.drugs) if args.drugs else None
+
+    # Report filter
+    only_reports = set(args.only) if args.only else None
 
     start = time.time()
 
@@ -703,6 +708,10 @@ def main():
     total_failed   = []
 
     for filename, label, gcs_filename in REPORT_MANIFEST:
+        # Skip reports not in --only filter
+        if only_reports and filename not in only_reports:
+            continue
+
         print(f"\n{'─'*70}")
         print(f"  [{REPORT_MANIFEST.index((filename, label, gcs_filename)) + 1}/{len(REPORT_MANIFEST)}]  {label}")
         print(f"  Script: {filename}  →  GCS: …/IP/{gcs_filename}")
