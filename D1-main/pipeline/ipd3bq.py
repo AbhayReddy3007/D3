@@ -88,8 +88,16 @@ def load_data_from_bigquery() -> pd.DataFrame:
     credentials = _get_credentials()
     client = bigquery.Client(project=BQ_PROJECT_ID, credentials=credentials)
 
-    query = f"SELECT DISTINCT * FROM `{table_ref}`"
-    print(f"[BigQuery] Running query: {query}")
+    query = f"""
+    SELECT * EXCEPT(rn) FROM (
+        SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY Patent_Number
+            ORDER BY created_at DESC
+        ) AS rn
+        FROM `{table_ref}`
+    ) WHERE rn = 1
+    """
+    print(f"[BigQuery] Running ROW_NUMBER dedup query on: {table_ref}")
     df = client.query(query, location=BQ_LOCATION).to_dataframe()
     print(f"[BigQuery] Loaded {len(df)} rows, columns: {list(df.columns)}")
 
