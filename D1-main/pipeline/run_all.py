@@ -878,17 +878,18 @@ def main():
     parser = argparse.ArgumentParser(description="LOE Pipeline orchestrator")
     parser.add_argument(
         "--mode",
-        choices=["all", "patents", "forecast", "ipd", "reports", "refresh-scores", "blocking", "step6-reports"],
-        default="step6-reports",
+        choices=["all", "patents", "forecast", "ipd", "reports", "refresh-scores", "blocking", "step6-reports", "forecast-reports"],
+        default="forecast-reports",
         help=(
-            "all             = full pipeline: patents → forecast → merge → ipd → reports\n"
-            "patents         = patent pipeline only\n"
-            "forecast        = forecast → merge → ipd → reports (skips patents)\n"
-            "ipd             = IPD BQ upload only\n"
-            "reports         = litigation analysis → litigation report → reports\n"
-            "refresh-scores  = rerun ipd3 score table + all reports\n"
-            "blocking        = blocking report per drug\n"
-            "step6-reports   = run forecast step6 + 2bqreport + forecast_report (default)"
+            "all              = full pipeline: patents → forecast → merge → ipd → reports\n"
+            "patents          = patent pipeline only\n"
+            "forecast         = forecast → merge → ipd → reports (skips patents)\n"
+            "ipd              = IPD BQ upload only\n"
+            "reports          = all reports (standard + litigation)\n"
+            "refresh-scores   = rerun ipd3 score table + all reports\n"
+            "blocking         = blocking report per drug\n"
+            "step6-reports    = run forecast step6 + 2bqreport + forecast_report\n"
+            "forecast-reports = 2bqreport + forecast_report only (default)"
         ),
     )
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
@@ -1045,6 +1046,29 @@ def main():
             )
         except Exception as e:
             print(f"{RED}✗ Reports failed: {e}{RESET}")
+
+    elif args.mode == "forecast-reports":
+        banner("REPORTS (2bqreport + forecast_report + blocking)")
+        try:
+            run_step(
+                f"Reports — 2bqreport + forecast_report ({len(drugs)} drug(s))",
+                [PY, str(REPORTS_SCRIPT), "--drugs"] + list(drugs)
+                + ["--only", "2bqreport.py", "forecast_report.py"],
+                dry_run=args.dry_run,
+            )
+        except Exception as e:
+            print(f"{RED}✗ Reports failed: {e}{RESET}")
+
+        # Blocking report per drug
+        for drug in drugs:
+            try:
+                run_step(
+                    f"Blocking Report: {drug}",
+                    [PY, str(BLOCKING_REPORT_SCRIPT), drug],
+                    dry_run=args.dry_run,
+                )
+            except Exception as e:
+                print(f"{RED}✗ Blocking report failed for {drug}: {e}{RESET}")
 
     banner(f"DONE — {time.time() - t0:.1f}s ({(time.time() - t0) / 60:.1f} min)")
 
