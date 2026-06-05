@@ -878,18 +878,19 @@ def main():
     parser = argparse.ArgumentParser(description="LOE Pipeline orchestrator")
     parser.add_argument(
         "--mode",
-        choices=["all", "patents", "forecast", "ipd", "reports", "refresh-scores", "blocking", "step6-reports", "forecast-reports"],
-        default="forecast-reports",
+        choices=["all", "patents", "forecast", "ipd", "reports", "refresh-scores", "blocking", "step6-reports", "forecast-reports", "ipd3-rerun"],
+        default="ipd3-rerun",
         help=(
-            "all              = full pipeline: patents → forecast → merge → ipd → reports\n"
+            "all              = full pipeline\n"
             "patents          = patent pipeline only\n"
-            "forecast         = forecast → merge → ipd → reports (skips patents)\n"
+            "forecast         = forecast → merge → ipd → reports\n"
             "ipd              = IPD BQ upload only\n"
             "reports          = all reports (standard + litigation)\n"
             "refresh-scores   = rerun ipd3 score table + all reports\n"
             "blocking         = blocking report per drug\n"
-            "step6-reports    = run forecast step6 + 2bqreport + forecast_report\n"
-            "forecast-reports = 2bqreport + forecast_report only (default)"
+            "step6-reports    = step6 + 2bqreport + forecast_report\n"
+            "forecast-reports = 2bqreport + forecast_report + blocking\n"
+            "ipd3-rerun       = rerun ipd3 (score + circumvention, 10 patents/cat) + reports (default)"
         ),
     )
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
@@ -1069,6 +1070,23 @@ def main():
                 )
             except Exception as e:
                 print(f"{RED}✗ Blocking report failed for {drug}: {e}{RESET}")
+
+    elif args.mode == "ipd3-rerun":
+        # Step 1: Rerun ipd3 with --rerun (bypass checkpoint, scoring + circumvention)
+        banner("IPD3 RERUN (scoring + circumvention, 10 patents/category)")
+        for drug in drugs:
+            try:
+                run_step(
+                    f"IPD3 rerun: {drug}",
+                    [PY, str(IPD3_SCRIPT), drug, "--rerun",
+                     "--max-patents-per-category", "10"],
+                    dry_run=args.dry_run,
+                )
+            except Exception as e:
+                print(f"{RED}✗ IPD3 rerun failed for {drug}: {e}{RESET}")
+
+        # Step 2: Run all reports
+        run_reports(drugs, args.workers, args.dry_run, resume=args.resume)
 
     banner(f"DONE — {time.time() - t0:.1f}s ({(time.time() - t0) / 60:.1f} min)")
 
