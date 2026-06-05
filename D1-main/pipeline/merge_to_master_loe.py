@@ -137,8 +137,8 @@ def _get_bq_client():
 
 def _read_table(client, table_id):
     try:
-        df = client.query(f"SELECT * FROM `{table_id}`").to_dataframe()
-        print(f"  [{table_id.split('.')[-1]}] {len(df)} rows, {len(df.columns)} cols")
+        df = client.query(f"SELECT DISTINCT * FROM `{table_id}`").to_dataframe()
+        print(f"  [{table_id.split('.')[-1]}] {len(df)} distinct rows, {len(df.columns)} cols")
         return df
     except Exception as e:
         print(f"  [{table_id.split('.')[-1]}] Failed: {e}")
@@ -235,9 +235,19 @@ def merge_and_upload(dry_run=False):
     forecasted = len(incoming[incoming["Type"] == "Forecasted"])
     print(f"  Incoming: {len(incoming)} | Existing: {existing} | Forecasted: {forecasted}")
 
-    print("\n[4/5] Reading current Master_LOE to find only NEW rows...")
+    print("\n[4/5] Reading current Master_LOE (latest rows only)...")
     try:
-        master_existing = _read_table(client, MASTER_TABLE)
+        master_query = f"""
+        SELECT * EXCEPT(rn) FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY Patent_Number
+                ORDER BY created_at DESC
+            ) AS rn
+            FROM `{MASTER_TABLE}`
+        ) WHERE rn = 1
+        """
+        master_existing = client.query(master_query).to_dataframe()
+        print(f"  [Master_LOE] {len(master_existing)} latest rows")
     except Exception:
         master_existing = pd.DataFrame()
 
