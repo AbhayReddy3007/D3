@@ -61,7 +61,7 @@ BQ_TABLE_ID   = "Master_LOE"
 BQ_LOCATION   = os.getenv("BQ_LOCATION", "asia-south1")
 
 GCS_BUCKET    = os.getenv("GCS_BUCKET", "cognito-prod")
-GCS_BASE_PATH = "Cognito_new/Reports"
+GCS_BASE_PATH = "Cognito_new/reports"
 GCS_SUBFOLDER = "IP"
 GCS_FILENAME  = "Blocking_Analysis.pdf"
 
@@ -411,7 +411,7 @@ def _parse_sections(text: str) -> Dict[str, str]:
 # ─────────────────────────────────────────────
 
 def _upload_to_gcs(local_pdf: str, drug_name: str) -> str:
-    """Upload PDF to gs://{GCS_BUCKET}/Cognito_new/Reports/{drug}/IP/Blocking_Analysis.pdf"""
+    """Upload PDF to gs://{GCS_BUCKET}/Cognito_new/reports/{drug}/IP/Blocking_Analysis.pdf"""
     from google.cloud import storage
 
     safe_drug = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name)
