@@ -195,7 +195,7 @@ def _load_step23_from_bq() -> Dict[str, pd.DataFrame]:
     """
     try:
         client = _get_bq_client()
-        query = f"SELECT * FROM `{BQ_FORECAST_S3_TABLE}`"
+        query = f"SELECT DISTINCT * FROM `{BQ_FORECAST_S3_TABLE}`"
         print(f"[STEP 2/3] Loading from {BQ_FORECAST_S3_TABLE}...")
         df = client.query(query).to_dataframe()
 
@@ -242,7 +242,7 @@ def _load_step4_from_bq(drug_name: str) -> str:
     try:
         client = _get_bq_client()
         query = f"""
-        SELECT *
+        SELECT DISTINCT *
         FROM `{BQ_FILING_PATTERN_TABLE}`
         WHERE LOWER(drug_name) = LOWER(@drug)
            OR LOWER(drug_name) LIKE CONCAT('%%', LOWER(@drug), '%%')
@@ -275,7 +275,7 @@ def _load_all_step4_from_bq() -> Dict[str, str]:
     """Load ALL Step 4 data from BQ in one query, return {drug_name_lower: text}."""
     try:
         client = _get_bq_client()
-        query = f"SELECT * FROM `{BQ_FILING_PATTERN_TABLE}`"
+        query = f"SELECT DISTINCT * FROM `{BQ_FILING_PATTERN_TABLE}`"
         print(f"[STEP 4] Loading all filing patterns from {BQ_FILING_PATTERN_TABLE}...")
         df = client.query(query).to_dataframe()
 
@@ -332,7 +332,7 @@ def _load_step5_from_bq(company_name: str) -> str:
     try:
         client = _get_bq_client()
         query = f"""
-        SELECT *
+        SELECT DISTINCT *
         FROM `{BQ_COMPANY_ANALYSIS_TABLE}`
         WHERE LOWER(company_name) = LOWER(@company)
            OR LOWER(company_name) LIKE CONCAT('%%', LOWER(@company), '%%')
@@ -366,7 +366,7 @@ def _load_all_step5_from_bq() -> Dict[str, str]:
     """Load ALL Step 5 data from BQ in one query, return {company_name_lower: text}."""
     try:
         client = _get_bq_client()
-        query = f"SELECT * FROM `{BQ_COMPANY_ANALYSIS_TABLE}`"
+        query = f"SELECT DISTINCT * FROM `{BQ_COMPANY_ANALYSIS_TABLE}`"
         print(f"[STEP 5] Loading all company analyses from {BQ_COMPANY_ANALYSIS_TABLE}...")
         df = client.query(query).to_dataframe()
 
