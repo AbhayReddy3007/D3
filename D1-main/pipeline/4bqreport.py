@@ -1,242 +1,38 @@
-"""
-IPD Patent Analysis — Per-Drug Word Report Generator (Gemini-powered)
-=====================================================================
-Reads data from Google BigQuery tables:
-  - shortlisted_secondary_patents_table  →  replaces "Shortlisted" sheet
-  - arbitrage_summary_table              →  replaces "Arbitrage Summary" sheet
-
-All BQ columns are snake_case and are mapped back to the original
-Title Case names used throughout the report generation logic.
-
-API key read from .env  →  GEMINI_API_KEY
-Model: gemini-2.5-flash
-"""
-
-import os
-import sys
-import io
-import re
-import time
-import tempfile
-from datetime import date
-
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-
+# google.generativeai is deprecated. Use google.genai (new SDK) only.
+from google import genai
 try:
     from dotenv import load_dotenv
 except ImportError:
     load_dotenv = lambda **kw: None  # Not needed on Cloud Run
-# google.generativeai is deprecated. Use google.genai (new SDK) only.
-from google import genai
+import os
+import time
+import json
+import re
+from datetime import date
+from dateutil.relativedelta import relativedelta
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
-from docx import Document
-from docx.shared import Pt, RGBColor, Inches
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  BIGQUERY CONFIG
-# ═══════════════════════════════════════════════════════════════════════════
+# ── BIGQUERY CONFIG ──────────────────────────────────────────────────────────
 BQ_PROJECT_ID  = "cognito-prod-394707"
 BQ_DATASET_ID  = "cognito_prod_datamart"
-BQ_TABLE_ID    = "Master_LOE"          # not used directly; kept for reference
+BQ_TABLE_ID    = "Master_LOE"
 CREDENTIALS_PATH = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
 BQ_LOCATION    = "asia-south1"
 
-# Table names
-SHORTLISTED_TABLE = "shortlisted_secondary_patents_table"
-ARBITRAGE_TABLE   = "arbitrage_summary_table"
+# ── CONFIG ──────────────────────────────────────────────────────────────────
+TARGET_JURISDICTIONS  = {"CN", "IN", "BR", "AU", "RU", "US", "CA", "JP", "MX", "TW", "KR", "TW"}
+KEEP_CLAIM_CATEGORIES = {"Composition Of Matter", "Device", "Formulation"}
+ALL_CRITICAL_CATEGORIES = sorted(KEEP_CLAIM_CATEGORIES)
 
-# ── snake_case  →  Title Case column mappings ─────────────────────────────
-SHORTLISTED_COL_MAP = {
-    "drug_name":                    "Drug Name",
-    "jurisdiction":                 "Jurisdiction",
-    "patent_number":                "Patent Number",
-    "step_1_claim_category":        "Step 1 Claim Category",
-    "adjusted_expiry_with_pte":     "Adjusted Expiry (with PTE)",
-    "expiry_gap_years":             "Expiry Gap (Years)",
-    "pte_status":                   "PTE Status",
-    "pte_months_granted":           "PTE Months (Granted)",
-}
+KEEP_COLUMNS = [
+    "Drug Name", "Patent Number", "Jurisdiction", "Tag",
+    "Grant Date", "Filing Date", "Approval Date",
+    "PTE (months)", "Step 1 Claim Category", "Years to Entry", "Type",
+]
+# ────────────────────────────────────────────────────────────────────────────
 
-ARBITRAGE_COL_MAP = {
-    "drug_name":                    "Drug Name",
-    "jurisdiction":                 "Jurisdiction",
-    "dimension_iv_score":           "Dimension IV Score",
-    "dimension_iv_rating":          "Dimension IV Rating",
-    "product_loe_year":             "Product LOE (Year)",
-    "gap_vs_us_years":              "Gap vs US (Years)",
-    "gap_vs_longest_loe_years":     "Gap vs Longest LOE (Years)",
-    "key_protection_gap":           "Key Protection Gap",
-    "arbitrage_score":              "Arbitrage Score",
-    "arbitrage_signal":             "Arbitrage Signal",
-    "rationale":                    "Rationale",
-    "created_at":                   "Created At",
-    "updated_at":                   "Updated At",
-}
-
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  BIGQUERY SCHEMA MIGRATION  —  create columns if absent
-# ═══════════════════════════════════════════════════════════════════════════
-def _ensure_arbitrage_columns(client: bigquery.Client) -> None:
-    """
-    Add 'rationale' (STRING), 'created_at' (TIMESTAMP), and 'updated_at'
-    (TIMESTAMP) columns to arbitrage_summary_table if they do not already
-    exist, then populate them appropriately.
-
-    - created_at  : set once (first run) and never overwritten.
-    - updated_at  : set to CURRENT_TIMESTAMP() on every run.
-    """
-    full_table = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{ARBITRAGE_TABLE}"
-
-    # Fetch current schema
-    table = client.get_table(full_table)
-    existing = {f.name for f in table.schema}
-
-    ddl_statements = []
-
-    if "rationale" not in existing:
-        ddl_statements.append(
-            f"ALTER TABLE `{full_table}` ADD COLUMN IF NOT EXISTS rationale STRING"
-        )
-
-    if "created_at" not in existing:
-        ddl_statements.append(
-            f"ALTER TABLE `{full_table}` ADD COLUMN IF NOT EXISTS created_at TIMESTAMP"
-        )
-
-    if "updated_at" not in existing:
-        ddl_statements.append(
-            f"ALTER TABLE `{full_table}` ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP"
-        )
-
-    for stmt in ddl_statements:
-        print(f"  [BQ DDL] {stmt}")
-        client.query(stmt).result()
-        print(f"           ✓ Done")
-
-    # Populate rationale where NULL
-    update_rationale = f"""
-        UPDATE `{full_table}`
-        SET rationale = CONCAT(
-            'Arbitrage Score is ', CAST(arbitrage_score AS STRING),
-            ' because of ', CAST(arbitrage_signal AS STRING)
-        )
-        WHERE rationale IS NULL
-    """
-    print("  [BQ] Populating rationale column …")
-    client.query(update_rationale).result()
-    print("       ✓ rationale populated")
-
-    # Populate created_at only where NULL (i.e. first time this row is seen)
-    update_created_at = f"""
-        UPDATE `{full_table}`
-        SET created_at = CURRENT_TIMESTAMP()
-        WHERE created_at IS NULL
-    """
-    print("  [BQ] Populating created_at column (first-run rows only) …")
-    client.query(update_created_at).result()
-    print("       ✓ created_at populated")
-
-    # Always refresh updated_at to reflect the current run
-    update_updated_at = f"""
-        UPDATE `{full_table}`
-        SET updated_at = CURRENT_TIMESTAMP()
-        WHERE TRUE
-    """
-    print("  [BQ] Refreshing updated_at column (all rows) …")
-    client.query(update_updated_at).result()
-    print("       ✓ updated_at refreshed")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  BIGQUERY LOADER
-# ═══════════════════════════════════════════════════════════════════════════
-def _get_credentials():
-    """Get credentials: use service account file if available, else default (Cloud Run)."""
-    if CREDENTIALS_PATH and os.path.exists(CREDENTIALS_PATH):
-        return service_account.Credentials.from_service_account_file(CREDENTIALS_PATH)
-    return None  # Use ADC (Application Default Credentials)
-
-def _get_bq_client() -> bigquery.Client:
-    """Return an authenticated BigQuery client."""
-    credentials = _get_credentials()
-    return bigquery.Client(
-        project=BQ_PROJECT_ID,
-        credentials=credentials,
-        location=BQ_LOCATION,
-    )
-
-
-def _load_table(client: bigquery.Client, table_name: str) -> pd.DataFrame:
-    """Load an entire BQ table into a DataFrame (all columns as strings)."""
-    full_ref = f"`{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}`"
-    query    = f"SELECT DISTINCT * FROM {full_ref}"
-    print(f"  [BQ] Querying {full_ref} …")
-    df = client.query(query).to_dataframe().astype(str)
-    # Replace literal "None" / "nan" strings with proper NaN
-    df.replace({"None": pd.NA, "nan": pd.NA, "<NA>": pd.NA}, inplace=True)
-    print(f"       → {len(df)} rows, columns: {list(df.columns)}")
-    return df
-
-
-def _rename_columns(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
-    """
-    Rename snake_case BQ columns to Title Case display names.
-    Only renames columns that exist; unknown columns are left as-is.
-    """
-    existing_map = {k: v for k, v in col_map.items() if k in df.columns}
-    df = df.rename(columns=existing_map)
-
-    # Warn about expected columns that were missing in the table
-    missing = [v for k, v in col_map.items() if k not in existing_map]
-    if missing:
-        print(f"  ⚠  The following expected columns were NOT found in BQ: {missing}")
-    return df
-
-
-def load_data_from_bigquery() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Returns (shortlisted_df, arbitrage_df) with Title Case columns,
-    ready for the report generation functions.
-    """
-    client = _get_bq_client()
-
-    # Ensure rationale + created_at + updated_at columns exist in BQ
-    print("  Ensuring arbitrage table schema …")
-    _ensure_arbitrage_columns(client)
-
-    # Shortlisted
-    sl_raw = _load_table(client, SHORTLISTED_TABLE)
-    sl_df  = _rename_columns(sl_raw, SHORTLISTED_COL_MAP)
-    sl_df.columns = sl_df.columns.str.strip()
-
-    # Arbitrage Summary
-    arb_raw = _load_table(client, ARBITRAGE_TABLE)
-    arb_df  = _rename_columns(arb_raw, ARBITRAGE_COL_MAP)
-    arb_df.columns = arb_df.columns.str.strip()
-
-    print(f"\n  ✓ Shortlisted  : {len(sl_df)} rows | "
-          f"{sl_df['Drug Name'].nunique() if 'Drug Name' in sl_df.columns else '?'} drug(s)")
-    print(f"  ✓ Arbitrage    : {len(arb_df)} rows")
-
-    return sl_df, arb_df
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  GEMINI SETUP
-# ═══════════════════════════════════════════════════════════════════════════
 load_dotenv(override=True)
 GEMINI_MODEL = "gemini-2.5-flash"
 _genai_client = None
@@ -244,8 +40,7 @@ _genai_client = None
 
 def _get_genai_client():
     """Lazily create the Gemini client so importing this module doesn't
-    crash when GEMINI_API_KEY is unset (the friendly check in main() then
-    handles it gracefully)."""
+    crash when GEMINI_API_KEY is unset."""
     global _genai_client
     if _genai_client is None:
         api_key = os.getenv("GEMINI_API_KEY")
@@ -255,7 +50,36 @@ def _get_genai_client():
     return _genai_client
 
 
-def _call_gemini(prompt: str, retries: int = 3, backoff: float = 2.5) -> str:
+def _get_credentials():
+    """Get credentials: use service account file if available, else default (Cloud Run)."""
+    if CREDENTIALS_PATH and os.path.exists(CREDENTIALS_PATH):
+        return service_account.Credentials.from_service_account_file(CREDENTIALS_PATH)
+    return None  # Use ADC (Application Default Credentials)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SHARED DATE NORMALIZER
+#  Converts bare years like "2025" or "2025.0" → "2025-01-01"
+#  Used for both Grant Date and Filing Date columns.
+# ═══════════════════════════════════════════════════════════════════════════
+def _normalize_year_only(val) -> str:
+    """Return a parseable date string; bare years become YYYY-01-01."""
+    if pd.isna(val):
+        return val
+    s = str(val).strip()
+    try:
+        n = float(s)
+        if n == int(n):          # bare year like 2025 or 2025.0
+            return f"{int(n)}-01-01"
+    except (ValueError, TypeError):
+        pass
+    return s
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  HELPER — safe Gemini call with retry
+# ═══════════════════════════════════════════════════════════════════════════
+def _call_gemini(prompt: str, retries: int = 3, backoff: float = 2.0) -> str | None:
     for attempt in range(retries):
         try:
             resp = _get_genai_client().models.generate_content(
@@ -269,760 +93,779 @@ def _call_gemini(prompt: str, retries: int = 3, backoff: float = 2.5) -> str:
                 time.sleep(wait)
             else:
                 print(f"    ✗ Gemini failed after {retries} attempts: {e}")
-                return "Narrative unavailable."
+                return None
+
+
+def _clean_json(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?", "", text)
+    text = re.sub(r"```$", "", text)
+    return text.strip()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  COLOUR PALETTE
+#  1. APPROVAL DATE LOOKUP
 # ═══════════════════════════════════════════════════════════════════════════
-BRAND_BLUE     = RGBColor(0x2F, 0x55, 0x97)
-ACCENT_BLUE    = RGBColor(0x44, 0x72, 0xC4)
-LIGHT_BLUE_HEX = "DCE6F1"
-HEADER_HEX     = "2F5597"
-WHITE_HEX      = "FFFFFF"
-
-SCORE_HEX = {5: "2ECC71", 4: "27AE60", 3: "F39C12", 2: "E67E22", 1: "E74C3C"}
-SIGNAL_HEX = {
-    "Immediate opportunity": "2ECC71",
-    "Strong arbitrage":      "27AE60",
-    "Meaningful arbitrage":  "F39C12",
-    "Limited arbitrage":     "E67E22",
-    "No arbitrage":          "E74C3C",
-    "Reference market":      "3498DB",
-}
-RATING_HEX = {
-    "Very Strong Geographic Arbitrage Opportunity": "2ECC71",
-    "Strong Geographic Arbitrage Opportunity":      "27AE60",
-    "Moderate Geographic Arbitrage Opportunity":    "F39C12",
-    "Limited Geographic Arbitrage Opportunity":     "E67E22",
-    "FAIL — No viable geographic arbitrage":        "E74C3C",
-}
-JUR_FULL = {
-    "CN": "China", "IN": "India", "BR": "Brazil",
-    "AU": "Australia", "RU": "Russia", "US": "United States",
-    "JP": "Japan", "KR": "South Korea", "TW": "Taiwan",
-    "CA": "Canada", "MX": "Mexico",
+JURISDICTION_FULL = {
+    "CN": "China (NMPA / formerly CFDA)",
+    "IN": "India (CDSCO / DCGI)",
+    "BR": "Brazil (ANVISA)",
+    "AU": "Australia (TGA)",
+    "RU": "Russia (Ministry of Health / Roszdravnadzor)",
+    "US": "United States (FDA)",
+    "JP": "Japan (PMDA / MHLW)",
+    "KR": "South Korea (MFDS)",
+    "TW": "Taiwan (TFDA)",
+    "CA": "Canada (Health Canada)",
+    "MX": "Mexico (COFEPRIS)",
 }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  XML / STYLE HELPERS
-# ═══════════════════════════════════════════════════════════════════════════
-BORDER_OPTS = {"val": "single", "sz": 4, "color": "CCCCCC"}
+def lookup_earliest_approval_date(drug_name: str, jurisdiction: str) -> str:
+    jur_full = JURISDICTION_FULL.get(jurisdiction, jurisdiction)
 
+    prompt_1 = (
+        f"You are a pharmaceutical regulatory expert.\n"
+        f"Drug: {drug_name}\n"
+        f"Jurisdiction: {jur_full}\n\n"
+        f"Task: List EVERY regulatory marketing-authorisation approval date "
+        f"for this drug in this jurisdiction (all indications, formulations, "
+        f"brand names). Use only factual, publicly verifiable data.\n\n"
+        f"Rules:\n"
+        f"- Respond ONLY with a JSON object, NO markdown, NO explanation.\n"
+        f"- Format: {{\"dates\": [\"YYYY-MM-DD\", ...], \"source\": \"<brief source>\"}}\n"
+        f"- If you are NOT confident or the drug is not approved there, "
+        f"return: {{\"dates\": [], \"source\": \"unknown\"}}\n"
+    )
 
-def _set_cell_bg(cell, hex_color: str):
-    tc   = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    shd  = OxmlElement("w:shd")
-    shd.set(qn("w:val"),   "clear")
-    shd.set(qn("w:color"), "auto")
-    shd.set(qn("w:fill"),  hex_color.lstrip("#"))
-    tcPr.append(shd)
+    raw_1 = _call_gemini(prompt_1)
+    if not raw_1:
+        return "Not found"
 
-
-def _set_cell_border(cell, **kwargs):
-    tc        = cell._tc
-    tcPr      = tc.get_or_add_tcPr()
-    tcBorders = OxmlElement("w:tcBorders")
-    for side, opts in kwargs.items():
-        el = OxmlElement(f"w:{side}")
-        el.set(qn("w:val"),   opts.get("val",   "single"))
-        el.set(qn("w:sz"),    str(opts.get("sz", 4)))
-        el.set(qn("w:space"), "0")
-        el.set(qn("w:color"), opts.get("color", "CCCCCC"))
-        tcBorders.append(el)
-    tcPr.append(tcBorders)
-
-
-def _page_break(doc: Document):
-    para = doc.add_paragraph()
-    run  = para.add_run()
-    br   = OxmlElement("w:br")
-    br.set(qn("w:type"), "page")
-    run._r.append(br)
-
-
-def _set_para_border_bottom(para, color="2F5597", sz=12):
-    pPr  = para._p.get_or_add_pPr()
-    pBdr = OxmlElement("w:pBdr")
-    bot  = OxmlElement("w:bottom")
-    bot.set(qn("w:val"),   "single")
-    bot.set(qn("w:sz"),    str(sz))
-    bot.set(qn("w:space"), "1")
-    bot.set(qn("w:color"), color)
-    pBdr.append(bot)
-    pPr.append(pBdr)
-
-
-def _make_header_cell(cell, text):
-    _set_cell_bg(cell, HEADER_HEX)
-    _set_cell_border(cell, top=BORDER_OPTS, bottom=BORDER_OPTS,
-                     left=BORDER_OPTS, right=BORDER_OPTS)
-    p   = cell.paragraphs[0]
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = p.add_run(str(text))
-    run.bold = True
-    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-    run.font.size = Pt(9)
-    cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-
-
-def _make_data_cell(cell, text, bg=WHITE_HEX, font_size=9):
-    _set_cell_bg(cell, bg)
-    _set_cell_border(cell, top=BORDER_OPTS, bottom=BORDER_OPTS,
-                     left=BORDER_OPTS, right=BORDER_OPTS)
-    p   = cell.paragraphs[0]
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = p.add_run(str(text) if text is not None else "—")
-    run.font.size = Pt(font_size)
-    run.font.name = "Calibri"
-    cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-
-
-def _signal_cell(cell, signal_text: str):
-    hex_c = SIGNAL_HEX.get(signal_text, "FFFFFF")
-    _set_cell_bg(cell, hex_c)
-    _set_cell_border(cell, top=BORDER_OPTS, bottom=BORDER_OPTS,
-                     left=BORDER_OPTS, right=BORDER_OPTS)
-    p   = cell.paragraphs[0]
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = p.add_run(signal_text)
-    run.bold = True
-    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-    run.font.size = Pt(9)
-    cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-
-
-def _score_cell(cell, score_val):
     try:
-        hex_c = SCORE_HEX.get(int(score_val), "FFFFFF")
-    except (ValueError, TypeError):
-        hex_c = "BDC3C7"
-    _set_cell_bg(cell, hex_c)
-    _set_cell_border(cell, top=BORDER_OPTS, bottom=BORDER_OPTS,
-                     left=BORDER_OPTS, right=BORDER_OPTS)
-    p   = cell.paragraphs[0]
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = p.add_run(str(score_val))
-    run.bold = True
-    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-    run.font.size = Pt(9)
-    cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        data_1 = json.loads(_clean_json(raw_1))
+        dates_1 = data_1.get("dates", [])
+    except (json.JSONDecodeError, AttributeError):
+        print(f"    ⚠ Pass-1 JSON parse failed for {drug_name}/{jurisdiction}")
+        return "Not found"
 
+    valid_dates = [pd.to_datetime(d, errors="coerce") for d in dates_1]
+    valid_dates = [d for d in valid_dates if pd.notna(d)]
+    if not valid_dates:
+        return "Not found"
 
-def _fig_to_docx(doc, fig, width_inches=5.5):
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-    buf.seek(0)
-    plt.close(fig)
-    doc.add_picture(buf, width=Inches(width_inches))
-    doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
-    doc.add_paragraph()
+    earliest = min(valid_dates).strftime("%Y-%m-%d")
 
+    prompt_2 = (
+        f"You are a pharmaceutical regulatory expert.\n"
+        f"Drug: {drug_name}\n"
+        f"Jurisdiction: {jur_full}\n\n"
+        f"A previous search returned the earliest approval date as {earliest}.\n"
+        f"Is this date CORRECT for the first marketing-authorisation approval "
+        f"of this drug in this jurisdiction?\n\n"
+        f"Rules:\n"
+        f"- Respond ONLY with a JSON object, NO markdown.\n"
+        f"- Format: {{\"confirmed\": true/false, \"corrected_date\": \"YYYY-MM-DD or null\", "
+        f"\"reason\": \"brief\"}}\n"
+        f"- If you are not sure, set confirmed to false and corrected_date to null.\n"
+    )
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  DOCUMENT SETUP
-# ═══════════════════════════════════════════════════════════════════════════
-def _setup_document() -> Document:
-    doc = Document()
-    for section in doc.sections:
-        section.top_margin    = Inches(1.0)
-        section.bottom_margin = Inches(1.0)
-        section.left_margin   = Inches(1.2)
-        section.right_margin  = Inches(1.0)
-
-    for name, size, color in [
-        ("Heading 1", 15, BRAND_BLUE),
-        ("Heading 2", 12, ACCENT_BLUE),
-        ("Heading 3", 11, BRAND_BLUE),
-    ]:
+    raw_2 = _call_gemini(prompt_2)
+    if raw_2:
         try:
-            s = doc.styles[name]
-            s.font.size      = Pt(size)
-            s.font.color.rgb = color
-            s.font.bold      = True
-            s.font.name      = "Calibri"
-        except KeyError:
+            data_2 = json.loads(_clean_json(raw_2))
+            if data_2.get("confirmed"):
+                return earliest
+            corrected = data_2.get("corrected_date")
+            if corrected:
+                cd = pd.to_datetime(corrected, errors="coerce")
+                if pd.notna(cd):
+                    return cd.strftime("%Y-%m-%d")
+        except (json.JSONDecodeError, AttributeError):
             pass
 
-    doc.styles["Normal"].font.name = "Calibri"
-    doc.styles["Normal"].font.size = Pt(11)
-    return doc
+    return earliest
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  COVER PAGE
+#  2. PTE LOOKUP
 # ═══════════════════════════════════════════════════════════════════════════
-def _cover_page(doc, drug_name: str):
-    for _ in range(7):
-        doc.add_paragraph()
-
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = p.add_run(drug_name)
-    run.bold = True
-    run.font.size = Pt(26)
-    run.font.color.rgb = BRAND_BLUE
-    run.font.name = "Calibri"
-
-    doc.add_paragraph()
-
-    p2 = doc.add_paragraph()
-    p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run2 = p2.add_run("Global Launch Sequencing & Geographic Arbitrage Analysis")
-    run2.italic = True
-    run2.font.size = Pt(14)
-    run2.font.color.rgb = ACCENT_BLUE
-    run2.font.name = "Calibri"
-
-    doc.add_paragraph()
-    _set_para_border_bottom(doc.add_paragraph(), sz=16)
-    doc.add_paragraph()
-
-    p3 = doc.add_paragraph()
-    p3.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r1 = p3.add_run("Report Date:  ")
-    r1.bold = True
-    r1.font.size = Pt(12)
-    r1.font.name = "Calibri"
-    r2 = p3.add_run(date.today().strftime("%d %B %Y"))
-    r2.font.size = Pt(12)
-    r2.font.name = "Calibri"
-    r2.font.color.rgb = BRAND_BLUE
-
-    _page_break(doc)
+PTE_RULES = {
+    "IN": {"allowed": False},
+    "BR": {"allowed": False},
+    "CN": {"allowed": True, "max_ext_years": 5, "max_effective_from_approval_years": 14},
+    "AU": {"allowed": True, "max_ext_years": 5},
+    "RU": {"allowed": True, "max_ext_years": 5},
+    "US": {"allowed": True, "max_ext_years": 5},
+    "JP": {"allowed": True, "max_ext_years": 5},
+    "KR": {"allowed": True, "max_ext_years": 5, "max_effective_from_approval_years": 14},
+    "TW": {"allowed": True, "max_ext_years": 5},
+    "CA": {"allowed": True, "max_ext_years": 2, "post_expiry": True},
+    "MX": {"allowed": False, "note": "USMCA mandates PTE but implementing regulations incomplete"},
+}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  LLM PROMPT
-# ═══════════════════════════════════════════════════════════════════════════
-def _build_drug_narrative_prompt(drug, drug_sl, drug_arb) -> str:
-    exp_lines = []
-    for _, r in drug_sl.iterrows():
-        jur    = JUR_FULL.get(str(r.get("Jurisdiction", "")), str(r.get("Jurisdiction", "")))
-        cat    = r.get("Step 1 Claim Category", "")
-        expiry = str(r.get("Adjusted Expiry (with PTE)", "N/A"))
-        gap    = str(r.get("Expiry Gap (Years)", "N/A"))
-        pte_st = r.get("PTE Status", "")
-        pte_m  = r.get("PTE Months (Granted)", "0")
-        pat_no = r.get("Patent Number", "N/A")
-        exp_lines.append(
-            f"  {jur} | Patent: {pat_no} | {cat} | Expiry: {expiry} | Gap: {gap} yrs"
-            f" | PTE: {pte_st} ({pte_m} months)"
+def lookup_pte(drug_name: str, patent_number: str, jurisdiction: str) -> dict:
+    rules = PTE_RULES.get(jurisdiction, {})
+    if not rules.get("allowed"):
+        return {"pte_months": 0, "pte_status": "Not applicable", "pte_source": ""}
+
+    jur_full = JURISDICTION_FULL.get(jurisdiction, jurisdiction)
+    registry_hint = {
+        "CN": "CNIPA patent register",
+        "AU": "AusPat (IP Australia)",
+        "RU": "Rospatent / FIPS register",
+        "US": "USPTO Orange Book / Patent Center",
+        "JP": "JPO (Japan Patent Office) register",
+        "KR": "KIPO (Korean Intellectual Property Office) register",
+        "TW": "TIPO (Taiwan Intellectual Property Office) register",
+        "CA": "Health Canada CSP (Certificate of Supplementary Protection) Registry",
+        "MX": "IMPI records / court rulings",
+    }.get(jurisdiction, "national patent office")
+
+    if jurisdiction == "CA":
+        task_desc = (
+            f"Task: Has a Certificate of Supplementary Protection (CSP) been ISSUED "
+            f"for this patent in Canada? If yes, how many months of additional "
+            f"protection was granted? Note: CSP takes effect after patent expiry "
+            f"and is capped at 2 years (24 months).\n\n"
+        )
+    else:
+        task_desc = (
+            f"Task: Has a patent term extension (PTE) been GRANTED for this patent "
+            f"in this jurisdiction? If yes, how many months was the extension?\n\n"
         )
 
-    arb_lines = []
-    dim4_score  = "N/A"
-    dim4_rating = "N/A"
-    if not drug_arb.empty:
-        dim4_score  = drug_arb["Dimension IV Score"].iloc[0]
-        dim4_rating = drug_arb["Dimension IV Rating"].iloc[0]
-        for _, r in drug_arb.iterrows():
-            jur         = JUR_FULL.get(str(r.get("Jurisdiction", "")), str(r.get("Jurisdiction", "")))
-            loe         = r.get("Product LOE (Year)", "N/A")
-            gap_us      = r.get("Gap vs US (Years)", "N/A")
-            gap_longest = r.get("Gap vs Longest LOE (Years)", "N/A")
-            signal      = r.get("Arbitrage Signal", "N/A")
-            gap_kp      = r.get("Key Protection Gap", "N/A")
-            arb_lines.append(
-                f"  {jur} | LOE: {loe} | Gap vs US: {gap_us} yrs"
-                f" | Gap vs Longest LOE: {gap_longest} yrs"
-                f" | Signal: {signal} | Protection gap: {gap_kp}"
-            )
+    prompt = (
+        f"You are a patent-term-extension (PTE) expert.\n"
+        f"Drug: {drug_name}\n"
+        f"Patent number: {patent_number}\n"
+        f"Jurisdiction: {jur_full}\n"
+        f"Registry to check: {registry_hint}\n\n"
+        f"{task_desc}"
+        f"Rules:\n"
+        f"- Respond ONLY with JSON, NO markdown.\n"
+        f"- Format: {{"
+        f"\"pte_status\": \"Granted\" | \"Pending\" | \"Not filed\" | \"Not found\","
+        f"\"extension_months\": <int or null>,"
+        f"\"source\": \"<brief>\""
+        f"}}\n"
+        f"- If unsure, use \"Not found\" and null.\n"
+    )
 
-    jurs_in_data = set()
-    for _, r in drug_sl.iterrows():
-        jurs_in_data.add(str(r.get("Jurisdiction", "")))
-    if not drug_arb.empty:
-        for _, r in drug_arb.iterrows():
-            jurs_in_data.add(str(r.get("Jurisdiction", "")))
+    raw = _call_gemini(prompt)
+    if not raw:
+        return {"pte_months": 0, "pte_status": "Not found", "pte_source": ""}
 
-    all_target_jurs   = {"CN", "IN", "BR", "AU", "RU", "US", "CA", "JP", "MX", "TW", "KR"}
-    jurs_present      = jurs_in_data & all_target_jurs
-    jurs_full_names   = ", ".join(sorted(JUR_FULL.get(j, j) for j in all_target_jurs))
-    jurs_analysed_names = ", ".join(sorted(JUR_FULL.get(j, j) for j in jurs_present))
+    try:
+        data = json.loads(_clean_json(raw))
+        status = data.get("pte_status", "Not found")
+        months = data.get("extension_months")
+        source = data.get("source", "")
 
-    return f"""
-You are a senior pharmaceutical patent analyst writing a drug-level patent
-assessment for an internal IP strategy report.
+        if months is None or status != "Granted":
+            return {"pte_months": 0, "pte_status": status, "pte_source": source}
 
-DRUG: {drug}
+        max_months = rules.get("max_ext_years", 5) * 12
+        months = min(int(months), max_months)
+        return {"pte_months": months, "pte_status": status, "pte_source": source}
 
-PATENT EXPIRY DATA (one row per jurisdiction):
-{chr(10).join(exp_lines) if exp_lines else '  No data.'}
-
-GEOGRAPHIC ARBITRAGE DATA (one row per jurisdiction):
-{chr(10).join(arb_lines) if arb_lines else '  No data.'}
-
-OVERALL DIMENSION IV SCORE: {dim4_score} — {dim4_rating}
-
-TARGET JURISDICTIONS CONSIDERED: {jurs_full_names}
-JURISDICTIONS WITH BLOCKING PATENTS ANALYSED: {jurs_analysed_names}
-
-TASK:
-Write a detailed, analytical drug-level narrative (220–280 words) structured
-into exactly these three sections. Use the exact plain-text section headers shown
-below on their own line (no markdown, no asterisks, no bullets):
-
-PATENT LANDSCAPE OVERVIEW
-Write 7–8 sentences summarising the breadth and strength of patent protection
-for this drug across all jurisdictions, including the range of expiry years
-and whether PTE extensions have been granted.
-Do NOT give analysis of US. It is only for reference. Analyse other jurisdictions
-based on the US information. Mention the Patent Numbers.
-Mention that patents from {jurs_full_names} were considered, but only the blocking
-ones were analysed. Jurisdictions not present in the analysis data lacked blocking
-patents — do NOT say "no data is available", instead say they were considered but
-not included as they lacked blocking patents.
-Highlight any jurisdictions with particularly strong or weak patent protection,
-and note the overall Dimension IV Score and Rating for the drug.
-
-GEOGRAPHIC ARBITRAGE ANALYSIS
-Write 10–12 sentences analysing where the strongest and weakest arbitrage
-opportunities exist. Reference specific jurisdictions, LOE years, gap vs US,
-gap vs longest LOE, and arbitrage signal ratings. Explain the strategic
-significance of the "Gap vs Longest LOE" metric — it measures how many years
-earlier a jurisdiction loses exclusivity compared to the jurisdiction with the
-longest protection.
-
-KEY PROTECTION GAPS
-Write 7–8 sentences identifying any missing claim categories or jurisdictions
-with weak or absent protection, and explain what this means for a potential
-generic or biosimilar entrant.
-
-Rules:
-- Do NOT include any recommendations or strategic advice sections.
-- Formal, precise tone. No filler phrases.
-- Do NOT give Analysis for US patents. Compare other Patents with the US information.
-- Use full jurisdiction names, not abbreviations.
-- Do NOT invent any numbers or dates — use only the data provided above.
-- Plain text only. No markdown, no bold, no asterisks, no bullet points.
-""".strip()
+    except (json.JSONDecodeError, AttributeError, ValueError):
+        return {"pte_months": 0, "pte_status": "Not found", "pte_source": ""}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  CHART
+#  3. EXPIRY CALCULATION
 # ═══════════════════════════════════════════════════════════════════════════
-def _chart_drug_loe(drug: str, drug_arb: pd.DataFrame):
-    df = drug_arb[drug_arb["Jurisdiction"] != "US"].copy()
-    df["LOE"] = pd.to_numeric(df["Product LOE (Year)"], errors="coerce")
-    df = df.dropna(subset=["LOE"]).sort_values("LOE")
-    if df.empty:
-        return None
+def compute_expiry(filing_date, approval_date_str: str, pte_months: int, jurisdiction: str) -> dict:
+    result = {"base_expiry": "Not found", "adjusted_expiry": "Not found", "pte_capped": False}
 
-    today  = date.today().year
-    labels = [JUR_FULL.get(j, j) for j in df["Jurisdiction"]]
-    colors = ["#" + SIGNAL_HEX.get(s, "BDC3C7") for s in df["Arbitrage Signal"]]
+    if pd.isna(filing_date):
+        return result
 
-    fig, ax = plt.subplots(figsize=(5.5, max(2.5, 0.55 * len(df) + 1)))
-    bars = ax.barh(labels, df["LOE"] - today, left=today,
-                   color=colors, edgecolor="white", linewidth=0.8)
-    ax.axvline(x=today, color="#E74C3C", linestyle="--", linewidth=1.5, label="Today")
-    ax.set_xlabel("Year", fontsize=9)
-    ax.set_title(f"{drug} — Loss of Exclusivity by Jurisdiction",
-                 fontsize=10, fontweight="bold")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    for bar, loe in zip(bars, df["LOE"]):
-        ax.text(bar.get_x() + bar.get_width() - 0.2,
-                bar.get_y() + bar.get_height() / 2,
-                str(int(loe)), va="center", ha="right",
-                fontsize=8, fontweight="bold", color="white")
+    base = filing_date.date() + relativedelta(years=20)
+    result["base_expiry"] = base
 
-    patches = [mpatches.Patch(color="#" + v, label=k) for k, v in SIGNAL_HEX.items()]
-    ax.legend(handles=patches, fontsize=7, loc="lower right", framealpha=0.8, ncol=1)
-    fig.tight_layout()
-    return fig
+    if pte_months == 0:
+        result["adjusted_expiry"] = base
+        return result
+
+    rules = PTE_RULES.get(jurisdiction, {})
+    adjusted = base + relativedelta(months=pte_months)
+
+    max_eff = rules.get("max_effective_from_approval_years")
+    if max_eff and approval_date_str and approval_date_str != "Not found":
+        approval_dt = pd.to_datetime(approval_date_str, errors="coerce")
+        if pd.notna(approval_dt):
+            cap = approval_dt.date() + relativedelta(years=max_eff)
+            if adjusted > cap:
+                adjusted = cap
+                result["pte_capped"] = True
+
+    result["adjusted_expiry"] = adjusted
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  RENDER LLM NARRATIVE
+#  4. EXPIRY GAP
 # ═══════════════════════════════════════════════════════════════════════════
-NARRATIVE_HEADERS = [
-    "PATENT LANDSCAPE OVERVIEW",
-    "GEOGRAPHIC ARBITRAGE ANALYSIS",
-    "KEY PROTECTION GAPS",
-]
+def compute_expiry_gap(adjusted_expiry) -> int | str:
+    """Fallback calculation for non-US rows."""
+    exp = pd.to_datetime(adjusted_expiry, errors="coerce")
+    if pd.isna(exp):
+        return "N/A"
+    return exp.year - date.today().year
 
 
-def _render_narrative(doc, narrative: str):
-    pattern = "(" + "|".join(re.escape(h) for h in NARRATIVE_HEADERS) + ")"
-    parts   = re.split(pattern, narrative)
+# ═══════════════════════════════════════════════════════════════════════════
+#  5. KEY PROTECTION GAP — data-driven (no Gemini)
+# ═══════════════════════════════════════════════════════════════════════════
+def determine_protection_gap(categories_present: set[str]) -> str:
+    present = categories_present & KEEP_CLAIM_CATEGORIES
+    absent  = KEEP_CLAIM_CATEGORIES - present
 
-    for part in parts:
-        part = part.strip()
-        if not part:
+    if not present:
+        return "No blocking patents; all categories absent"
+    if not absent:
+        return "Full protection; all categories covered"
+
+    present_str = ", ".join(sorted(present))
+    absent_str  = ", ".join(sorted(absent))
+    return f"{present_str} present; {absent_str} absent"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  6. GEOGRAPHIC ARBITRAGE SCORE (per country, 1–5)
+# ═══════════════════════════════════════════════════════════════════════════
+def compute_arbitrage_score(loe_year: int, gap_vs_longest: int, current_year: int) -> int:
+    if loe_year == current_year:
+        return 5
+    if gap_vs_longest >= 5:
+        return 4
+    if gap_vs_longest >= 3:
+        return 3
+    if gap_vs_longest == 2:
+        return 2
+    return 1
+
+
+def get_dimension_iv_rating(avg_score: float) -> str:
+    if avg_score <= 1.0:
+        return "FAIL — No viable geographic arbitrage"
+    elif avg_score <= 2.0:
+        return "Limited Geographic Arbitrage Opportunity"
+    elif avg_score <= 3.0:
+        return "Moderate Geographic Arbitrage Opportunity"
+    elif avg_score <= 4.0:
+        return "Strong Geographic Arbitrage Opportunity"
+    else:
+        return "Very Strong Geographic Arbitrage Opportunity"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  7. ARBITRAGE ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════════
+def compute_arbitrage(shortlisted: pd.DataFrame, full_filtered: pd.DataFrame) -> pd.DataFrame:
+    current_year = date.today().year
+
+    cats_lookup: dict[tuple, set] = {}
+    for _, row in full_filtered.iterrows():
+        key = (row["Drug Name"], row["Jurisdiction"])
+        cat = str(row.get("Step 1 Claim Category", "")).strip().title()
+        if cat in KEEP_CLAIM_CATEGORIES:
+            cats_lookup.setdefault(key, set()).add(cat)
+
+    drugs = shortlisted["Drug Name"].unique()
+    arb_rows = []
+
+    for drug in sorted(drugs):
+        drug_df = shortlisted[shortlisted["Drug Name"] == drug].copy()
+
+        drug_df["_adj_dt"] = pd.to_datetime(drug_df["Adjusted Expiry (with PTE)"], errors="coerce")
+        loe_by_jur = drug_df.groupby("Jurisdiction")["_adj_dt"].max().dropna()
+
+        if loe_by_jur.empty:
             continue
-        if "STRATEGIC RECOMMENDATIONS" in part.upper() or "RECOMMENDATION" in part.upper():
-            continue
-        if part in NARRATIVE_HEADERS:
-            p   = doc.add_paragraph()
-            run = p.add_run(part.title())
-            run.bold           = True
-            run.font.size      = Pt(11)
-            run.font.name      = "Calibri"
-            run.font.color.rgb = BRAND_BLUE
-            p.paragraph_format.space_before = Pt(8)
-            p.paragraph_format.space_after  = Pt(2)
+
+        loe_years = loe_by_jur.dt.year
+        us_loe = loe_years.get("US")
+        max_loe = int(loe_years.max())
+        max_loe_jur = loe_years.idxmax()
+        sorted_jurs = loe_years.sort_values(ascending=True)
+        prev_loe = None
+        country_scores = {}
+
+        for launch_order, (jur, loe_year) in enumerate(sorted_jurs.items(), start=1):
+            if jur == "US":
+                gap_vs_us = "N/A"
+            elif us_loe is not None:
+                gap_vs_us = int(us_loe) - int(loe_year)
+            else:
+                gap_vs_us = "US data missing"
+
+            if jur == max_loe_jur:
+                gap_vs_longest = "N/A (longest)"
+            else:
+                gap_vs_longest = max_loe - int(loe_year)
+
+            if jur == "US":
+                ctc_gap = "N/A"
+            elif prev_loe is None:
+                ctc_gap = 0
+            else:
+                ctc_gap = int(loe_year) - int(prev_loe)
+
+            cats_present = cats_lookup.get((drug, jur), set())
+            gap_desc = determine_protection_gap(cats_present)
+
+            if jur == "US":
+                score = "N/A"
+                signal = "Reference market"
+            else:
+                gap_for_scoring = 0 if gap_vs_longest == "N/A (longest)" else int(gap_vs_longest)
+                score = compute_arbitrage_score(
+                    loe_year=int(loe_year),
+                    gap_vs_longest=gap_for_scoring,
+                    current_year=current_year,
+                )
+                country_scores[jur] = score
+
+                if score == 5:
+                    signal = "Immediate opportunity"
+                elif score == 4:
+                    signal = "Strong arbitrage"
+                elif score == 3:
+                    signal = "Meaningful arbitrage"
+                elif score == 2:
+                    signal = "Limited arbitrage"
+                else:
+                    signal = "No arbitrage"
+
+            arb_rows.append({
+                "Drug Name": drug,
+                "Launch Order": launch_order,
+                "Jurisdiction": jur,
+                "Product LOE (Year)": int(loe_year),
+                "Gap vs US (Years)": gap_vs_us,
+                "Gap vs Longest LOE (Years)": gap_vs_longest,
+                "Country-to-Country Arbitrage (Years)": ctc_gap,
+                "Key Protection Gap": gap_desc,
+                "Arbitrage Score": score,
+                "Arbitrage Signal": signal,
+            })
+
+            if jur != "US":
+                prev_loe = loe_year
+
+        if country_scores:
+            dim4 = round(sum(country_scores.values()) / len(country_scores), 2)
+            dim4_rating = get_dimension_iv_rating(dim4)
         else:
-            p   = doc.add_paragraph()
-            run = p.add_run(part)
-            run.font.size = Pt(11)
-            run.font.name = "Calibri"
-            p.paragraph_format.space_after = Pt(6)
+            dim4 = "N/A"
+            dim4_rating = "N/A"
+
+        for row in arb_rows:
+            if row["Drug Name"] == drug:
+                row["Dimension IV Score"] = dim4
+                row["Dimension IV Rating"] = dim4_rating
+
+    return pd.DataFrame(arb_rows)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  PATENT EXPIRY SUMMARY
+#  BIGQUERY HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
-def _patent_expiry_summary(doc, drug_sl: pd.DataFrame):
-    p   = doc.add_paragraph()
-    run = p.add_run("Patent Expiry Summary")
-    run.bold = True
-    run.font.size = Pt(11)
-    run.font.name = "Calibri"
-    run.font.color.rgb = BRAND_BLUE
-    _set_para_border_bottom(p, sz=6)
-
-    exp_cols = ["Patent Number", "Jurisdiction", "Step 1 Claim Category",
-                "Adjusted Expiry (with PTE)", "Expiry Gap (Years)",
-                "PTE Status", "PTE Months (Granted)"]
-    exp_cols = [c for c in exp_cols if c in drug_sl.columns]
-    exp_df   = drug_sl[exp_cols].copy()
-
-    if "Adjusted Expiry (with PTE)" in exp_df.columns:
-        exp_df["Adjusted Expiry (with PTE)"] = pd.to_datetime(
-            exp_df["Adjusted Expiry (with PTE)"], errors="coerce"
-        ).dt.strftime("%Y-%m-%d").fillna("Not found")
-
-    etbl = doc.add_table(rows=1 + len(exp_df), cols=len(exp_cols))
-    etbl.style     = "Table Grid"
-    etbl.alignment = WD_TABLE_ALIGNMENT.CENTER
-
-    for i, h in enumerate(exp_cols):
-        _make_header_cell(etbl.rows[0].cells[i], h)
-
-    for r_idx, (_, row_data) in enumerate(exp_df.iterrows()):
-        bg  = LIGHT_BLUE_HEX if r_idx % 2 == 0 else WHITE_HEX
-        row = etbl.rows[r_idx + 1]
-        for c_idx, col in enumerate(exp_cols):
-            _make_data_cell(row.cells[c_idx], row_data[col], bg=bg)
-
-    exp_widths = [0.8, 1.8, 1.4, 1.0, 1.2, 1.1][:len(exp_cols)]
-    for ci, w in enumerate(exp_widths):
-        for cell in etbl.columns[ci].cells:
-            cell.width = Inches(w)
-
-    doc.add_paragraph()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  PDF CONVERSION & GCS UPLOAD
-# ═══════════════════════════════════════════════════════════════════════════
-def convert_docx_to_pdf(docx_path: str) -> str:
-    """Convert a .docx file to PDF.
-
-    Primary path (cross-platform, works on Windows/Linux/macOS and inside the
-    Docker/Cloud Run container):
-        mammoth   — converts .docx → HTML  (preserves structure)
-        xhtml2pdf — renders HTML → PDF     (pure pip, no system deps)
-
-    Fallback path (only used if mammoth/xhtml2pdf are unavailable AND a local
-    Word/LibreOffice bridge exists): docx2pdf. Note that docx2pdf requires
-    Microsoft Word (Windows COM / macOS AppleScript) and therefore does NOT
-    work on a headless Linux container, which is why it is no longer the
-    default.
-
-    Install:
-        pip install mammoth xhtml2pdf --break-system-packages
-
-    Returns the path to the generated PDF.
-    """
-    pdf_path = os.path.splitext(docx_path)[0] + ".pdf"
-
-    # ── Primary: mammoth + xhtml2pdf (cross-platform) ─────────────────────────
-    try:
-        import mammoth
-        from xhtml2pdf import pisa
-    except ImportError:
-        mammoth = None
-        pisa = None
-
-    if mammoth is not None and pisa is not None:
-        style_map = """
-            p[style-name='Heading 2'] => h2:fresh
-            r[style-name='Strong']    => strong
-        """
-        with open(docx_path, "rb") as f:
-            raw_html = mammoth.convert_to_html(f, style_map=style_map).value
-
-        full_html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  @page {{ margin: 1.8cm 2cm 2cm 2cm; }}
-  body  {{ font-family: Arial, sans-serif; font-size: 9pt; color: #222; margin:0; padding:0; }}
-  h1    {{ color: #1F3864; font-size: 14pt; border-bottom: 3px solid #2F5496; padding-bottom:4px; }}
-  h2    {{ color: #2F5496; font-size: 11pt; border-bottom: 1px solid #2F5496; padding-bottom:2px; margin:10px 0 3px 0; }}
-  p     {{ margin: 0 0 5px 0; line-height: 1.35; text-align: justify; }}
-  ul    {{ margin: 2px 0 6px 0; padding-left: 18px; }}
-  li    {{ margin-bottom: 2px; line-height: 1.3; }}
-  table {{ border-collapse: collapse; width: 100%; margin: 5px 0 8px 0; font-size: 8.5pt; }}
-  th    {{ background: #2F5496; color: #ffffff; font-weight: bold; text-align: center; padding: 4px 6px; border: 1px solid #2F5496; }}
-  td    {{ border: 1px solid #CCCCCC; padding: 4px 6px; vertical-align: top; }}
-  hr    {{ border: none; border-bottom: 2px solid #2F5496; margin: 10px 0 6px 0; }}
-</style>
-</head>
-<body>
-{raw_html}
-</body>
-</html>"""
-
-        with open(pdf_path, "wb") as pdf_file:
-            result = pisa.CreatePDF(full_html.encode("utf-8"), dest=pdf_file,
-                                    encoding="utf-8")
-        if result.err:
-            raise RuntimeError(f"xhtml2pdf conversion error code: {result.err}")
-        if not os.path.exists(pdf_path):
-            raise RuntimeError(f"PDF not created at expected path: {pdf_path}")
-        return pdf_path
-
-    # ── Fallback: docx2pdf (Windows/macOS with Word only) ─────────────────────
-    try:
-        from docx2pdf import convert as _docx2pdf_convert
-    except ImportError:
-        raise RuntimeError(
-            "No DOCX→PDF backend available.\n"
-            "Install the cross-platform backend with:\n"
-            "  pip install mammoth xhtml2pdf --break-system-packages"
-        )
-
-    _docx2pdf_convert(docx_path, pdf_path)
-    if not os.path.exists(pdf_path):
-        raise RuntimeError(f"PDF not created at expected path: {pdf_path}")
-    return pdf_path
-
-
-def upload_to_gcs(local_pdf: str, drug_name: str,
-                  bucket_name: str = "cognito-gcs") -> str:
-    """Upload PDF to gs://{bucket_name}/Cognito_new/reports/{drug_name}/Loe_Report(Secondary_Market).pdf
-    Returns the full GCS URI."""
-    try:
-        from google.cloud import storage
-    except ImportError:
-        raise RuntimeError(
-            "google-cloud-storage not installed.\n"
-            "Run: pip install google-cloud-storage --break-system-packages"
-        )
-
-    safe_drug = drug_name.replace("/", "_").replace(" ", "_")
-    blob_name = f"Cognito_new/reports/{safe_drug}/Loe_Report(Secondary_Market).pdf"
+def load_from_bigquery() -> pd.DataFrame:
+    """Load latest rows from Master_LOE (deduplicated by Patent_Number, latest created_at)."""
+    print(f"\nConnecting to BigQuery …")
+    print(f"  Project : {BQ_PROJECT_ID}")
+    print(f"  Dataset : {BQ_DATASET_ID}")
+    print(f"  Table   : {BQ_TABLE_ID}")
 
     credentials = _get_credentials()
-    client = storage.Client(project=BQ_PROJECT_ID, credentials=credentials)
+    client = bigquery.Client(
+        project=BQ_PROJECT_ID,
+        credentials=credentials,
+        location=BQ_LOCATION,
+    )
 
-    bucket = client.bucket(bucket_name)
-    blob   = bucket.blob(blob_name)
-    blob.upload_from_filename(local_pdf, content_type="application/pdf")
+    table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_ID}"
+    query = f"""
+    SELECT * EXCEPT(rn) FROM (
+        SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY Patent_Number
+            ORDER BY created_at DESC
+        ) AS rn
+        FROM `{table_ref}`
+    ) WHERE rn = 1
+    """
+    print(f"  Query   : ROW_NUMBER dedup on Patent_Number")
 
-    gcs_uri = f"gs://{bucket_name}/{blob_name}"
-    print(f"      ✓ Uploaded → {gcs_uri}")
-    return gcs_uri
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  BUILD SINGLE-DRUG REPORT
-# ═══════════════════════════════════════════════════════════════════════════
-def _build_drug_report(drug, drug_sl, drug_arb, output_dir):
-    doc = _setup_document()
-
-    # Cover
-    _cover_page(doc, drug)
-
-    # Dimension IV badge
-    if not drug_arb.empty:
-        dim4_score  = drug_arb["Dimension IV Score"].iloc[0]
-        dim4_rating = drug_arb["Dimension IV Rating"].iloc[0]
-        rating_hex  = RATING_HEX.get(str(dim4_rating), "BDC3C7")
-
-        badge = doc.add_table(rows=1, cols=2)
-        badge.alignment = WD_TABLE_ALIGNMENT.LEFT
-
-        c0 = badge.rows[0].cells[0]
-        _set_cell_bg(c0, HEADER_HEX)
-        _set_cell_border(c0, top=BORDER_OPTS, bottom=BORDER_OPTS,
-                         left=BORDER_OPTS, right=BORDER_OPTS)
-        p   = c0.paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = p.add_run("Dimension IV Score")
-        run.bold = True; run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-        run.font.size = Pt(10); c0.width = Inches(1.8)
-
-        c1 = badge.rows[0].cells[1]
-        _set_cell_bg(c1, rating_hex)
-        _set_cell_border(c1, top=BORDER_OPTS, bottom=BORDER_OPTS,
-                         left=BORDER_OPTS, right=BORDER_OPTS)
-        p   = c1.paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = p.add_run(f"{dim4_score}  —  {dim4_rating}")
-        run.bold = True; run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-        run.font.size = Pt(10); c1.width = Inches(4.5)
-
-        doc.add_paragraph()
-
-    # Geographic Arbitrage Map Table
-    if not drug_arb.empty:
-        p   = doc.add_paragraph()
-        run = p.add_run("Geographic Arbitrage Map")
-        run.bold = True; run.font.size = Pt(11)
-        run.font.name = "Calibri"; run.font.color.rgb = BRAND_BLUE
-        _set_para_border_bottom(p, sz=6)
-
-        arb_cols = ["Jurisdiction", "Product LOE (Year)", "Gap vs US (Years)",
-                    "Gap vs Longest LOE (Years)", "Key Protection Gap",
-                    "Arbitrage Score", "Arbitrage Signal",
-                    "Rationale", "Created At", "Updated At"]
-        arb_cols = [c for c in arb_cols if c in drug_arb.columns]
-        arb_show = drug_arb[arb_cols].copy()
-
-        sig_idx   = arb_cols.index("Arbitrage Signal") if "Arbitrage Signal" in arb_cols else -1
-        score_idx = arb_cols.index("Arbitrage Score")  if "Arbitrage Score"  in arb_cols else -1
-
-        atbl = doc.add_table(rows=1 + len(arb_show), cols=len(arb_cols))
-        atbl.style = "Table Grid"; atbl.alignment = WD_TABLE_ALIGNMENT.CENTER
-        for i, h in enumerate(arb_cols):
-            _make_header_cell(atbl.rows[0].cells[i], h)
-        for r_idx, (_, row_data) in enumerate(arb_show.iterrows()):
-            bg  = LIGHT_BLUE_HEX if r_idx % 2 == 0 else WHITE_HEX
-            row = atbl.rows[r_idx + 1]
-            for c_idx, col in enumerate(arb_cols):
-                cell = row.cells[c_idx]
-                val  = str(row_data[col]) if row_data[col] is not None else "—"
-                if c_idx == sig_idx:
-                    _signal_cell(cell, val)
-                elif c_idx == score_idx:
-                    _score_cell(cell, val)
-                else:
-                    _make_data_cell(cell, val, bg=bg)
-        arb_widths = [0.85, 0.9, 0.9, 1.0, 1.8, 0.8, 1.1, 2.2, 1.2, 1.2][:len(arb_cols)]
-        for ci, w in enumerate(arb_widths):
-            for cell in atbl.columns[ci].cells:
-                cell.width = Inches(w)
-        doc.add_paragraph()
-
-        fig = _chart_drug_loe(drug, drug_arb)
-        if fig:
-            _fig_to_docx(doc, fig, width_inches=5.0)
-
-    # LLM Narrative
-    p   = doc.add_paragraph()
-    run = p.add_run("Analysis")
-    run.bold = True; run.font.size = Pt(11)
-    run.font.name = "Calibri"; run.font.color.rgb = BRAND_BLUE
-    _set_para_border_bottom(p, sz=6)
-
-    prompt    = _build_drug_narrative_prompt(drug, drug_sl, drug_arb)
-    narrative = _call_gemini(prompt)
-    time.sleep(1)
-    _render_narrative(doc, narrative)
-
-    # Patent Expiry Summary (last)
-    _page_break(doc)
-    _patent_expiry_summary(doc, drug_sl)
-
-    output_path = os.path.join(output_dir, "Loe_Report(Secondary_Market).docx")
-    doc.save(output_path)
-    return output_path
+    df = client.query(query).to_dataframe()
+    df = df.astype(str).replace("None", pd.NA).replace("<NA>", pd.NA)
+    print(f"  ✓ Loaded {len(df):,} latest rows from BigQuery")
+    return df
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  TERMINAL HELPERS
-# ═══════════════════════════════════════════════════════════════════════════
-def _get_output_dir() -> str:
-    while True:
-        path = input("\nEnter output DIRECTORY for per-drug reports: ").strip().strip('"').strip("'")
-        if not path:
-            print("  ✗ Path cannot be empty."); continue
-        if not os.path.isdir(path):
-            try:
-                os.makedirs(path, exist_ok=True)
-                print(f"  ✓ Created: {path}")
-            except OSError as e:
-                print(f"  ✗ Cannot create directory: {e}"); continue
-        else:
-            print(f"  ✓ Output dir: {path}")
-        return path
+def _to_snake_case(col: str) -> str:
+    """Convert any column name to snake_case."""
+    s = col.strip()
+    s = re.sub(r"[^0-9a-zA-Z]+", "_", s)
+    s = s.strip("_").lower()
+    return s
+
+
+def write_to_bigquery(df: pd.DataFrame, table_id: str) -> None:
+    """Write only NEW rows to a BigQuery table (skip existing patent numbers)."""
+    df = df.copy()
+    df.columns = [_to_snake_case(c) for c in df.columns]
+    df = df.astype(str).replace("nan", pd.NA).replace("<NA>", pd.NA)
+    df = df.drop_duplicates()
+
+    credentials = _get_credentials()
+    client = bigquery.Client(
+        project=BQ_PROJECT_ID,
+        credentials=credentials,
+        location=BQ_LOCATION,
+    )
+
+    full_table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_id}"
+
+    # Skip rows where patent_number already exists in BQ
+    if "patent_number" in df.columns:
+        try:
+            existing = client.query(
+                f"SELECT DISTINCT patent_number FROM `{full_table_id}`"
+            ).to_dataframe()
+            if not existing.empty:
+                existing_patents = set(existing["patent_number"].astype(str).str.strip())
+                before = len(df)
+                df = df[~df["patent_number"].astype(str).str.strip().isin(existing_patents)]
+                skipped = before - len(df)
+                if skipped > 0:
+                    print(f"  [DEDUP] Skipped {skipped} rows (patent_number already in {table_id})")
+        except Exception as e:
+            print(f"  [DEDUP] Could not check existing rows ({e}) — writing all")
+    elif "drug_name" in df.columns:
+        # For arbitrage_summary_table — dedup on drug_name + jurisdiction
+        try:
+            existing = client.query(
+                f"SELECT DISTINCT drug_name, jurisdiction FROM `{full_table_id}`"
+            ).to_dataframe()
+            if not existing.empty:
+                existing["_key"] = (existing["drug_name"].astype(str).str.strip() + "|"
+                                    + existing["jurisdiction"].astype(str).str.strip())
+                existing_keys = set(existing["_key"])
+                df["_key"] = (df["drug_name"].astype(str).str.strip() + "|"
+                              + df.get("jurisdiction", pd.Series("")).astype(str).str.strip())
+                before = len(df)
+                df = df[~df["_key"].isin(existing_keys)].drop(columns=["_key"])
+                skipped = before - len(df)
+                if skipped > 0:
+                    print(f"  [DEDUP] Skipped {skipped} rows (already in {table_id})")
+        except Exception as e:
+            print(f"  [DEDUP] Could not check existing rows ({e}) — writing all")
+
+    if df.empty:
+        print(f"  ✓ All rows already exist in `{full_table_id}` — nothing to write.")
+        return
+
+    job_config = bigquery.LoadJobConfig(
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        autodetect=True,
+    )
+
+    job = client.load_table_from_dataframe(df, full_table_id, job_config=job_config)
+    job.result()
+    print(f"  ✓ Written {len(df):,} new rows → `{full_table_id}`")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════════════
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="IPD4 Patent Analysis Tool")
+    parser.add_argument("drug", nargs="?", default=None,
+                        help="Optional: single drug name to process. Omit to process all drugs.")
+    args = parser.parse_args()
+
     print("=" * 60)
-    print("  IPD PER-DRUG REPORT GENERATOR  —  Gemini 2.5 Flash")
-    print("  Data source: Google BigQuery")
-    print("  Output     : gs://cognito-gcs/Cognito_new/reports/{drug_name}/Loe_Report(Secondary_Market).pdf")
+    print("  IPD PATENT ANALYSIS TOOL")
     print("=" * 60)
 
-    if not os.getenv("GEMINI_API_KEY"):
-        print("  ✗ GEMINI_API_KEY not set — aborting.")
-        sys.exit(1)
+    print("\n" + "=" * 60)
+    print("  Starting analysis…")
+    print("=" * 60)
 
-    # Load data from BigQuery
-    print("\n  Loading data from BigQuery…")
-    shortlisted, arb_df = load_data_from_bigquery()
+    # ── Load from BigQuery ────────────────────────────────────────────────
+    df = load_from_bigquery()
+    # Rename BQ underscore columns → space-separated names the rest of the code expects
+    df.columns = df.columns.str.strip().str.replace("_", " ")
+    # BQ has "PTE months"; code expects "PTE (months)"
+    df.rename(columns={"PTE months": "PTE (months)"}, inplace=True)
+    df = df.apply(lambda col: col.str.strip() if col.dtype == "object" else col)
+    df = df.drop_duplicates()
 
-    if shortlisted.empty:
-        print("  ✗ Shortlisted table is empty — aborting.")
-        sys.exit(1)
+    # ── Filter to single drug if specified ────────────────────────────────
+    if args.drug:
+        df = df[df["Drug Name"].str.lower() == args.drug.lower()].reset_index(drop=True)
+        print(f"\n[Filter] Processing single drug: '{args.drug}' → {len(df)} rows")
+        if df.empty:
+            print("No rows match this drug name. Exiting.")
+            return
 
-    if "Drug Name" not in shortlisted.columns:
-        print("  ✗ 'drug_name' column not found in shortlisted table — check mapping.")
-        sys.exit(1)
+    total = len(df)
+    print(f"\nTotal rows loaded           : {total}")
 
-    # Generate one report per drug
-    drugs = sorted(shortlisted["Drug Name"].dropna().unique())
-    print(f"\n  Generating {len(drugs)} report(s)…\n")
+    # Filter 1: Jurisdiction
+    f1 = df["Jurisdiction"].isin(TARGET_JURISDICTIONS)
+    print(f"After Jurisdiction filter   : {f1.sum()} (removed {total - f1.sum()})")
 
-    uploaded_uris = []
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for idx, drug in enumerate(drugs, start=1):
-            print(f"  [{idx}/{len(drugs)}] {drug}")
+    # ── FIX: Normalize Grant Date before parsing ──────────────────────────
+    grant_date_normalized = df["Grant Date"].apply(_normalize_year_only)
+    df["Grant Date"] = grant_date_normalized
 
-            drug_sl  = shortlisted[shortlisted["Drug Name"] == drug].copy()
-            drug_arb = (
-                arb_df[arb_df["Drug Name"] == drug].copy()
-                if not arb_df.empty and "Drug Name" in arb_df.columns
-                else pd.DataFrame()
-            )
+    # Filter 2: Grant Date is a valid date
+    grant_date_parsed = pd.to_datetime(grant_date_normalized, errors="coerce")
+    f2 = f1 & grant_date_parsed.notna()
+    print(f"After Grant Date filter     : {f2.sum()} (removed {f1.sum() - f2.sum()})")
 
-            # Build DOCX in a per-drug subfolder to avoid filename collisions
-            drug_tmp = os.path.join(tmpdir, re.sub(r'[^\w\s-]', '', drug).strip().replace(' ', '_'))
-            os.makedirs(drug_tmp, exist_ok=True)
+    # Filter 3: Tag = BLOCKING
+    f3 = f2 & (df["Tag"].str.upper() == "BLOCKING")
+    print(f"After Tag=BLOCKING filter   : {f3.sum()} (removed {f2.sum() - f3.sum()})")
 
-            docx_path = _build_drug_report(drug, drug_sl, drug_arb, drug_tmp)
-            print(f"      ✓ DOCX built")
+    # Filter 4: Step 1 Claim Category
+    f4 = f3 & (df["Step 1 Claim Category"].str.strip().str.title().isin(KEEP_CLAIM_CATEGORIES))
+    print(f"After Claim Category filter : {f4.sum()} (removed {f3.sum() - f4.sum()})")
+    print(f"{'='*60}")
 
-            print(f"      Converting to PDF …", end=" ", flush=True)
+    shortlisted = df[f4].reset_index(drop=True)
+    cols_present = [c for c in KEEP_COLUMNS if c in shortlisted.columns]
+    shortlisted = shortlisted[cols_present].copy()
+
+    # Keep a copy of full filtered data (before dedup) for category lookup
+    full_filtered = shortlisted.copy()
+
+    # ── Build "Years to Entry" lookup from US rows in original df ─────────
+    years_to_entry_map: dict[tuple, float] = {}
+    if "Years to Entry" in df.columns:
+        us_rows = df[df["Jurisdiction"] == "US"].dropna(subset=["Years to Entry"])
+        for _, row in us_rows.iterrows():
+            key = (row["Drug Name"], row["Patent Number"])
             try:
-                pdf_path = convert_docx_to_pdf(docx_path)
-                print("done")
-            except RuntimeError as exc:
-                print(f"FAILED\n      ✗ {exc}")
-                continue
+                years_to_entry_map[key] = float(row["Years to Entry"])
+            except (ValueError, TypeError):
+                pass
+        print(f"\n'Years to Entry' entries loaded for US: {len(years_to_entry_map)}")
+    else:
+        print("\n  ⚠ Column 'Years to Entry' not found in input — "
+              "falling back to calculated gap for all rows.")
 
-            print(f"      Uploading to GCS …", end=" ", flush=True)
-            try:
-                uri = upload_to_gcs(pdf_path, drug)
-                uploaded_uris.append(uri)
-            except Exception as exc:
-                print(f"FAILED\n      ✗ {exc}")
+    # ── 1. Fill missing Approval Dates ───────────────────────────────────
+    approval_cache: dict[tuple, str] = {}
+    groups_to_query: set[tuple] = set()
+
+    for idx, row in shortlisted.iterrows():
+        key = (row["Drug Name"], row["Jurisdiction"])
+        val = row.get("Approval Date", "")
+        is_missing = pd.isna(val) or val == "" or pd.isna(pd.to_datetime(val, errors="coerce"))
+        if is_missing:
+            groups_to_query.add(key)
+
+    print(f"\nApproval-date lookups needed: {len(groups_to_query)}")
+
+    for drug, jur in sorted(groups_to_query):
+        result = lookup_earliest_approval_date(drug, jur)
+        approval_cache[(drug, jur)] = result
+        print(f"  ✓ {drug} / {jur} → {result}")
+        time.sleep(1)
+
+    for idx, row in shortlisted.iterrows():
+        key = (row["Drug Name"], row["Jurisdiction"])
+        if key in approval_cache:
+            shortlisted.at[idx, "Approval Date"] = approval_cache[key]
+
+    # ── 2. PTE lookup ────────────────────────────────────────────────────
+    pte_cache: dict[tuple, dict] = {}
+    pte_groups: set[tuple] = set()
+
+    for idx, row in shortlisted.iterrows():
+        jur = row["Jurisdiction"]
+        pat_type = str(row.get("Type", "")).strip().lower()
+        if pat_type == "forecasted":
+            continue
+        if PTE_RULES.get(jur, {}).get("allowed"):
+            key = (row["Drug Name"], row["Patent Number"], jur)
+            pte_groups.add(key)
+
+    print(f"\nPTE lookups needed: {len(pte_groups)}")
+
+    for drug, pat, jur in sorted(pte_groups):
+        result = lookup_pte(drug, pat, jur)
+        pte_cache[(drug, pat, jur)] = result
+        print(f"  ✓ {pat} ({jur}) → {result['pte_status']}, {result['pte_months']} months")
+        time.sleep(1)
+
+    shortlisted["PTE Status"]           = ""
+    shortlisted["PTE Months (Granted)"] = 0
+    shortlisted["PTE Source"]           = ""
+
+    for idx, row in shortlisted.iterrows():
+        key = (row["Drug Name"], row["Patent Number"], row["Jurisdiction"])
+        if key in pte_cache:
+            info = pte_cache[key]
+            shortlisted.at[idx, "PTE Status"]           = info["pte_status"]
+            shortlisted.at[idx, "PTE Months (Granted)"] = info["pte_months"]
+            shortlisted.at[idx, "PTE Source"]           = info["pte_source"]
+        else:
+            shortlisted.at[idx, "PTE Status"] = "Not applicable"
+
+    # ── 3. Compute expiry dates ──────────────────────────────────────────
+    shortlisted["Filing Date"] = shortlisted["Filing Date"].apply(_normalize_year_only)
+    filing_dates      = pd.to_datetime(shortlisted["Filing Date"], errors="coerce")
+    base_expiries     = []
+    adjusted_expiries = []
+    pte_capped_flags  = []
+
+    for idx, row in shortlisted.iterrows():
+        filing_dt = filing_dates.iloc[idx]
+        approval  = row.get("Approval Date", "Not found")
+        pte_m     = int(row.get("PTE Months (Granted)", 0) or 0)
+        jur       = row["Jurisdiction"]
+
+        exp = compute_expiry(filing_dt, approval, pte_m, jur)
+        base_expiries.append(exp["base_expiry"])
+        adjusted_expiries.append(exp["adjusted_expiry"])
+        pte_capped_flags.append(exp["pte_capped"])
+
+    shortlisted["Base Patent Term (Filing+20y)"] = base_expiries
+    shortlisted["Adjusted Expiry (with PTE)"]    = adjusted_expiries
+    shortlisted["PTE Capped (Post-Approval Cap)"]      = pte_capped_flags
+
+    # ── 3b. Type-based expiry override ───────────────────────────────────
+    if "Type" in df.columns:
+        filtered_df = df[f4].copy()
+        has_non_forecasted: dict[tuple, bool] = {}
+        for _, row in filtered_df.iterrows():
+            key = (row["Drug Name"], row["Jurisdiction"])
+            pat_type = str(row.get("Type", "")).strip()
+            if pat_type.lower() != "forecasted" and pat_type != "":
+                has_non_forecasted[key] = True
+
+        current_year_date = date(date.today().year, 1, 1)
+        overrides_base = 0
+        overrides_current_year = 0
+
+        for idx, row in shortlisted.iterrows():
+            key = (row["Drug Name"], row["Jurisdiction"])
+            if has_non_forecasted.get(key, False):
+                shortlisted.at[idx, "Adjusted Expiry (with PTE)"] = row["Base Patent Term (Filing+20y)"]
+                shortlisted.at[idx, "PTE Months (Granted)"] = 0
+                shortlisted.at[idx, "PTE Status"] = "Overridden (non-forecasted patent exists)"
+                shortlisted.at[idx, "PTE Capped (Post-Approval Cap)"] = False
+                overrides_base += 1
+            else:
+                shortlisted.at[idx, "Adjusted Expiry (with PTE)"] = current_year_date
+                shortlisted.at[idx, "PTE Months (Granted)"] = 0
+                shortlisted.at[idx, "PTE Status"] = "Overridden (all forecasted)"
+                shortlisted.at[idx, "PTE Capped (Post-Approval Cap)"] = False
+                overrides_current_year += 1
+
+        print(f"\nType-based expiry overrides:")
+        print(f"  → Set to Base Term (non-forecasted exists): {overrides_base}")
+        print(f"  → Set to Current Year (all forecasted):     {overrides_current_year}")
+    else:
+        print("\n  ⚠ Column 'Type' not found in input — skipping Type-based expiry override.")
+
+    # ── 4. Deduplicate ───────────────────────────────────────────────────
+    before_dedup = len(shortlisted)
+    shortlisted["Adjusted Expiry (with PTE)"] = pd.to_datetime(
+        shortlisted["Adjusted Expiry (with PTE)"], errors="coerce"
+    )
+    shortlisted = (
+        shortlisted
+        .sort_values("Adjusted Expiry (with PTE)", ascending=False, na_position="last")
+        .drop_duplicates(subset=["Drug Name", "Jurisdiction"], keep="first")
+        .sort_values(["Drug Name", "Jurisdiction"])
+        .reset_index(drop=True)
+    )
+    print(f"\nAfter Deduplication         : {len(shortlisted)} (removed {before_dedup - len(shortlisted)})")
+
+    # ── 5. Expiry Gap ────────────────────────────────────────────────────
+    def get_expiry_gap(row):
+        if row["Jurisdiction"] == "US" and years_to_entry_map:
+            key = (row["Drug Name"], row["Patent Number"])
+            val = years_to_entry_map.get(key)
+            if val is not None:
+                return val
+        return compute_expiry_gap(row["Adjusted Expiry (with PTE)"])
+
+    shortlisted["Expiry Gap (Years)"] = shortlisted.apply(get_expiry_gap, axis=1)
+
+    # ── 6. Arbitrage Analysis ────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"ARBITRAGE ANALYSIS")
+    print(f"{'='*60}")
+    arb_df = compute_arbitrage(shortlisted, full_filtered)
+
+    if not arb_df.empty:
+        non_ref = arb_df[arb_df["Arbitrage Score"] != "N/A"]
+        for score_val in [5, 4, 3, 2, 1]:
+            count = (non_ref["Arbitrage Score"] == score_val).sum()
+            if count > 0:
+                print(f"  Score {score_val}: {count} entries")
+
+        print(f"\n  Dimension IV Scores:")
+        for drug in arb_df["Drug Name"].unique():
+            row = arb_df[arb_df["Drug Name"] == drug].iloc[0]
+            print(f"    {drug}: {row['Dimension IV Score']} — {row['Dimension IV Rating']}")
+
+    # ── 7. Merge Dimension IV Score back to shortlisted ──────────────────
+    if not arb_df.empty:
+        dim4_map = (
+            arb_df[["Drug Name", "Dimension IV Score", "Dimension IV Rating"]]
+            .drop_duplicates(subset=["Drug Name"])
+        )
+        shortlisted = shortlisted.merge(dim4_map, on="Drug Name", how="left")
+
+    # ── 8. Final columns ─────────────────────────────────────────────────
+    final_cols = [
+        "Drug Name", "Patent Number", "Jurisdiction", "Tag",
+        "Step 1 Claim Category",
+        "Filing Date", "Grant Date", "Approval Date",
+        "Base Patent Term (Filing+20y)",
+        "PTE Status", "PTE Months (Granted)", "PTE Source",
+        "Adjusted Expiry (with PTE)", "PTE Capped (Post-Approval Cap)",
+        "Expiry Gap (Years)",
+        "Dimension IV Score", "Dimension IV Rating",
+    ]
+    final_cols = [c for c in final_cols if c in shortlisted.columns]
+    shortlisted = shortlisted[final_cols]
+
+    # ── 9. Save to BigQuery ──────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"WRITING TO BIGQUERY")
+    print(f"{'='*60}")
+
+    write_to_bigquery(shortlisted, "shortlisted_secondary_patents_table")
+    if not arb_df.empty:
+        write_to_bigquery(arb_df, "arbitrage_summary_table")
 
     print(f"\n{'='*60}")
-    print(f"  ✓ Done — {len(uploaded_uris)}/{len(drugs)} PDF(s) uploaded")
-    for uri in uploaded_uris:
-        print(f"    {uri}")
-    print(f"{'='*60}\n")
+    print(f"FINAL SUMMARY")
+    print(f"{'='*60}")
+    print(f"Total rows loaded           : {total}")
+    print(f"After Jurisdiction filter   : {f1.sum()}")
+    print(f"After Grant Date filter     : {f2.sum()}")
+    print(f"After Tag=BLOCKING filter   : {f3.sum()}")
+    print(f"After Claim Category filter : {f4.sum()}")
+    print(f"After Deduplication         : {len(shortlisted)}")
+    print(f"{'='*60}")
+    print(f"Jurisdictions    : {shortlisted['Jurisdiction'].value_counts().to_dict()}")
+    print(f"Claim Categories : {shortlisted['Step 1 Claim Category'].value_counts().to_dict()}")
+    print(f"{'='*60}")
+    print(f"\n✓ Done — tables written to dataset `{BQ_DATASET_ID}`")
 
 
 if __name__ == "__main__":
