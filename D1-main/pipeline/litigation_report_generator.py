@@ -486,7 +486,7 @@ def build_pdf(df: pd.DataFrame, p1: str, p2: str, output_pdf: Path) -> None:
 
 # ── GCS upload (same destination as reports.py) ───────────────────────────────
 GCS_BUCKET    = os.getenv("GCS_BUCKET",      "cognito-prod")
-GCS_BASE_PATH = "Cognito_new/Reports"
+GCS_BASE_PATH = "Cognito_new/reports"
 GCS_SUBFOLDER = "IP"
 GCS_FILENAME  = "Litigation_Analysis.pdf"
 
@@ -501,7 +501,7 @@ def _get_gcs_client():
 
 
 def _upload_to_gcs(local_path: str, drug_name: str) -> str:
-    """Upload PDF to gs://{GCS_BUCKET}/Cognito_new/Reports/{drug_name}/IP/Litigation_Analysis.pdf"""
+    """Upload PDF to gs://{GCS_BUCKET}/Cognito_new/reports/{drug_name}/IP/Litigation_Analysis.pdf"""
     from google.cloud import storage
     import re as _re
 
