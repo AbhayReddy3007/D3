@@ -1,0 +1,37 @@
+In the end, we have a final gbq table
+
+it has the following columns
+
+drug_id,product,pillar,dimension,score,rationale,timestamp
+
+
+
+I will specify drug_id later
+
+Product = drug name
+
+pillar = IP 
+
+
+
+We have 4 dimensions here
+
+
+
+
+
+Primary Market Entry Horizon - Master_LOE
+
+
+
+Patent Strength and Invalidity Opportunity - patent_strength_table
+
+
+
+Patent Thicket and Circumvention Feasibility - 
+
+
+
+Global Launch Sequencing & Arbitrage
+
+Write a script to push 
