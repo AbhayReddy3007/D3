@@ -422,23 +422,24 @@ def _upload_to_gcs(local_pdf: str, drug_name: str) -> str:
     client = storage.Client(project=BQ_PROJECT_ID, credentials=credentials)
     bucket = client.bucket(GCS_BUCKET)
 
-    # Archive existing version
-    try:
-        existing = bucket.blob(blob_name)
-        if existing.exists():
-            ts_str = (existing.updated or datetime.now(timezone.utc)).strftime("%Y%m%d-%H%M%S")
-            archive_name = (
-                f"{GCS_BASE_PATH}/{safe_drug}/{GCS_SUBFOLDER}"
-                f"/archive/{ts_str}_{GCS_FILENAME}"
-            )
-            bucket.copy_blob(existing, bucket, archive_name)
-            print(f"    archived prior version -> gs://{GCS_BUCKET}/{archive_name}")
-    except Exception as e:
-        print(f"    [WARN] archive step failed: {e}")
-
+    # Upload new version
     blob = bucket.blob(blob_name)
     blob.upload_from_filename(local_pdf, content_type="application/pdf")
     print(f"    Uploaded -> {gcs_uri}")
+
+    # Save timestamped archive copy
+    try:
+        ts_str = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        archive_name = (
+            f"{GCS_BASE_PATH}/{safe_drug}/{GCS_SUBFOLDER}"
+            f"/archive/{ts_str}_{GCS_FILENAME}"
+        )
+        archive_blob = bucket.blob(archive_name)
+        archive_blob.upload_from_filename(local_pdf, content_type="application/pdf")
+        print(f"    📦 archive copy -> gs://{GCS_BUCKET}/{archive_name}")
+    except Exception as e:
+        print(f"    [WARN] archive copy failed: {e}")
+
     return gcs_uri
 
 
