@@ -776,7 +776,7 @@ def main():
                     print(f"    ✗ Upload failed for {drug_name}: {exc}")
                     total_failed.append((label, drug_name, str(exc)))
 
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             print(f"    [FATAL] {label} failed: {exc}")
             traceback.print_exc()
             total_failed.append((label, str(exc)))
