@@ -128,12 +128,8 @@ def discover_drugs():
     """
     Discover drugs from the clinical_efficacy BigQuery table.
 
-    Uses the same env vars as phase_fetcher.py:
-      BQ_PROJECT_ID  — GCP project  (fallback: PROJECT_ID)
-      BQ_DATASET_ID  — BQ dataset
-      BQ_TABLE_NAME  — table name   (fallback: 'clinical_efficacy')
-
     Returns a sorted list of distinct, non-empty molecule names.
+    Also identifies marketed drugs (highest phase = Marketed/Approved/Launched).
     """
     try:
         from dotenv import load_dotenv
@@ -185,11 +181,35 @@ def discover_drugs():
         print(f"{RED}ERROR: No drugs found in {fq_table}{RESET}")
         sys.exit(1)
 
-    print(f"[DISCOVERY] {len(drugs)} drug(s) from {fq_table}")
+    # Identify marketed drugs
+    marketed_query = f"""
+    SELECT DISTINCT TRIM(molecule_name) AS drug
+    FROM `{fq_table}`
+    WHERE molecule_name IS NOT NULL
+      AND LOWER(TRIM(phase)) IN ('marketed', 'approved', 'launched', 'registered')
+    """
+    global MARKETED_DRUGS
+    MARKETED_DRUGS = set()
+    try:
+        marketed_rows = client.query(marketed_query).result()
+        MARKETED_DRUGS = {row.drug for row in marketed_rows}
+        if MARKETED_DRUGS:
+            print(f"[DISCOVERY] {len(MARKETED_DRUGS)} marketed drug(s) (will skip forecasting):")
+            for d in sorted(MARKETED_DRUGS):
+                print(f"    ⊘ {d}")
+    except Exception as e:
+        print(f"{YELLOW}[DISCOVERY] Could not identify marketed drugs: {e}{RESET}")
+
+    print(f"[DISCOVERY] {len(drugs)} drug(s) total, {len(drugs) - len(MARKETED_DRUGS)} eligible for forecast")
     for i, d in enumerate(drugs):
-        print(f"  {i + 1:>3}. {d}")
+        marker = " [MARKETED]" if d in MARKETED_DRUGS else ""
+        print(f"  {i + 1:>3}. {d}{marker}")
 
     return drugs
+
+
+# Global set of marketed drugs — populated by discover_drugs()
+MARKETED_DRUGS = set()
 
 
 # ── Per-drug worker functions (run in child processes) ────────────────────────
@@ -879,9 +899,9 @@ def main():
     parser.add_argument(
         "--mode",
         choices=["all", "patents", "forecast", "ipd", "reports", "refresh-scores", "blocking", "step6-reports", "forecast-reports", "ipd3-rerun"],
-        default="ipd3-rerun",
+        default="all",
         help=(
-            "all              = full pipeline\n"
+            "all              = full pipeline (default)\n"
             "patents          = patent pipeline only\n"
             "forecast         = forecast → merge → ipd → reports\n"
             "ipd              = IPD BQ upload only\n"
@@ -946,6 +966,12 @@ def main():
     all_drugs = discover_drugs()
     drugs = shard_drugs(all_drugs)
 
+    # Separate non-marketed drugs for forecasting
+    forecast_drugs = [d for d in drugs if d not in MARKETED_DRUGS]
+    if len(forecast_drugs) < len(drugs):
+        print(f"\n[FORECAST FILTER] {len(drugs) - len(forecast_drugs)} marketed drug(s) "
+              f"excluded from forecasting, {len(forecast_drugs)} remaining")
+
     if not drugs:
         print(f"{YELLOW}This task has no drugs to process. Exiting cleanly.{RESET}")
         return
@@ -970,7 +996,10 @@ def main():
 
     if args.mode == "all":
         run_patents(drugs, args.workers, args.dry_run)
-        run_forecast(drugs, args.workers, args.dry_run, resume=args.resume)
+        if forecast_drugs:
+            run_forecast(forecast_drugs, args.workers, args.dry_run, resume=args.resume)
+        else:
+            print(f"\n{YELLOW}[SKIP] All drugs are marketed — skipping forecast stage{RESET}")
         run_merge(args.dry_run, resume=args.resume)
         run_ipd(drugs, args.workers, args.dry_run, resume=args.resume)
         run_reports(drugs, args.workers, args.dry_run, resume=args.resume)
@@ -979,11 +1008,10 @@ def main():
         run_patents(drugs, args.workers, args.dry_run)
 
     elif args.mode == "forecast":
-        # Forecast onward: skip the patents stage but run everything after
-        # forecast as well (merge → IPD → reports). Resume defaults to ON
-        # for this mode so a re-run picks up where it left off across
-        # every stage — step3/4/5/6, merge, ipd2/3/4, and reports.
-        run_forecast(drugs, args.workers, args.dry_run, resume=args.resume)
+        if forecast_drugs:
+            run_forecast(forecast_drugs, args.workers, args.dry_run, resume=args.resume)
+        else:
+            print(f"\n{YELLOW}[SKIP] All drugs are marketed — skipping forecast{RESET}")
         run_merge(args.dry_run, resume=args.resume)
         run_ipd(drugs, args.workers, args.dry_run, resume=args.resume)
         run_reports(drugs, args.workers, args.dry_run, resume=args.resume)
@@ -1023,18 +1051,21 @@ def main():
                 print(f"{RED}✗ Blocking report failed for {drug}: {e}{RESET}")
 
     elif args.mode == "step6-reports":
-        # Step 1: Run forecast step6 per drug
+        # Step 1: Run forecast step6 per drug (non-marketed only)
         banner("FORECAST STEP 6 (Patent Forecast Generator)")
-        step6_script = FORECAST_DIR / "step6.py"
-        step6_worker = functools.partial(
-            _forecast_step_worker,
-            step_script=step6_script,
-            step_label="Step 6 — Patent Forecast Generator",
-            extra_args=None,
-            drug_flag="--drug",
-            resume=args.resume,
-        )
-        run_parallel("Step 6 — Patent Forecast Generator", step6_worker, drugs, args.workers, args.dry_run)
+        if forecast_drugs:
+            step6_script = FORECAST_DIR / "step6.py"
+            step6_worker = functools.partial(
+                _forecast_step_worker,
+                step_script=step6_script,
+                step_label="Step 6 — Patent Forecast Generator",
+                extra_args=None,
+                drug_flag="--drug",
+                resume=args.resume,
+            )
+            run_parallel("Step 6 — Patent Forecast Generator", step6_worker, forecast_drugs, args.workers, args.dry_run)
+        else:
+            print(f"{YELLOW}[SKIP] All drugs are marketed — skipping step6{RESET}")
 
         # Step 2: Run only 2bqreport + forecast_report (with --only filter)
         banner("REPORTS (2bqreport + forecast_report)")
