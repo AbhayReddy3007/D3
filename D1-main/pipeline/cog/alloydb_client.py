@@ -26,6 +26,7 @@ Environment variables (same as a2.py):
 
 import json
 import os
+import atexit
 import urllib.parse
 from typing import Dict, List, Optional
 
@@ -61,7 +62,9 @@ def _get_conn(retries=3, backoff=2.0):
     last_err = None
     for attempt in range(retries):
         try:
-            return psycopg2.connect(DATABASE_URL, connect_timeout=30)
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=30)
+            _open_connections.append(conn)
+            return conn
         except psycopg2.OperationalError as e:
             last_err = e
             if attempt < retries - 1:
@@ -73,6 +76,23 @@ def _get_conn(retries=3, backoff=2.0):
             else:
                 print(f"[ALLOYDB] All {retries} connection attempts failed.")
     raise last_err
+
+
+# Track open connections and close them at interpreter shutdown to prevent
+# "Connector.py _close AttributeError: 'NoneType' ... 'from_iterable'" errors
+_open_connections = []
+
+def _cleanup_connections():
+    """Close all open connections before Python teardown."""
+    for conn in _open_connections:
+        try:
+            if conn and not conn.closed:
+                conn.close()
+        except Exception:
+            pass
+    _open_connections.clear()
+
+atexit.register(_cleanup_connections)
 
 
 # ── Ensure schema exists ─────────────────────────────────────────────────────
