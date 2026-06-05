@@ -511,24 +511,25 @@ def _upload_to_gcs(local_path: str, drug_name: str) -> str:
 
     client = _get_gcs_client()
     bucket = client.bucket(GCS_BUCKET)
-    blob   = bucket.blob(blob_name)
 
-    # Archive existing version before overwriting
-    try:
-        existing = bucket.blob(blob_name)
-        if existing.exists():
-            ts_str = (existing.updated or datetime.now(timezone.utc)).strftime("%Y%m%d-%H%M%S")
-            archive_name = (
-                f"{GCS_BASE_PATH}/{safe_name}/{GCS_SUBFOLDER}"
-                f"/archive/{ts_str}_{GCS_FILENAME}"
-            )
-            bucket.copy_blob(existing, bucket, archive_name)
-            print(f"    📦 archived prior version → gs://{GCS_BUCKET}/{archive_name}")
-    except Exception as e:
-        print(f"    [WARN] archive step failed: {e}")
-
+    # Upload new version
+    blob = bucket.blob(blob_name)
     blob.upload_from_filename(local_path, content_type="application/pdf")
     print(f"    ✅ Uploaded → {gcs_uri}")
+
+    # Save timestamped archive copy
+    try:
+        ts_str = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        archive_name = (
+            f"{GCS_BASE_PATH}/{safe_name}/{GCS_SUBFOLDER}"
+            f"/archive/{ts_str}_{GCS_FILENAME}"
+        )
+        archive_blob = bucket.blob(archive_name)
+        archive_blob.upload_from_filename(local_path, content_type="application/pdf")
+        print(f"    📦 archive copy → gs://{GCS_BUCKET}/{archive_name}")
+    except Exception as e:
+        print(f"    [WARN] archive copy failed: {e}")
+
     return gcs_uri
 
 
