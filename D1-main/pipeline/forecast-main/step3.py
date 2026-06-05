@@ -136,7 +136,7 @@ def load_loe_table() -> pd.DataFrame:
     Renames underscore-separated BQ column names to space-separated names
     expected by the rest of the pipeline.
     """
-    query = f"SELECT * FROM `{_LOE_TABLE}`"
+    query = f"SELECT DISTINCT * FROM `{_LOE_TABLE}`"
     try:
         df = _BQ_CLIENT.query(query).to_dataframe()
         df.columns = [c.strip() for c in df.columns]
