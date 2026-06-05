@@ -98,49 +98,73 @@ def _get_gcs_client():
     return storage.Client(project=os.getenv("BQ_PROJECT_ID", "cognito-prod-394707"), credentials=credentials)
 
 
-def _archive_existing_blob(bucket, blob_name: str, safe_name: str,
-                           gcs_filename: str) -> None:
-    """Copy any existing blob at `blob_name` to
-    `…/{drug}/IP/archive/<YYYYMMDD-HHMMSS>_<gcs_filename>` before overwrite.
+def _docx_to_pdf(docx_path: str, pdf_path: str) -> str:
+    """Convert DOCX to PDF using LibreOffice headless."""
+    import subprocess
+    output_dir = str(Path(pdf_path).parent)
+    try:
+        subprocess.run(
+            ["libreoffice", "--headless", "--convert-to", "pdf",
+             "--outdir", output_dir, docx_path],
+            check=True, capture_output=True, timeout=120,
+        )
+        # LibreOffice names output after the input stem
+        lo_output = str(Path(output_dir) / (Path(docx_path).stem + ".pdf"))
+        if lo_output != pdf_path and Path(lo_output).exists():
+            Path(lo_output).rename(pdf_path)
+        print(f"    Converted to PDF: {pdf_path}")
+        return pdf_path
+    except FileNotFoundError:
+        print("    [WARN] LibreOffice not found — uploading DOCX as-is")
+        # Fallback: just copy docx as the "pdf" path so upload works
+        import shutil
+        shutil.copy2(docx_path, pdf_path)
+        return pdf_path
+    except Exception as e:
+        print(f"    [WARN] PDF conversion failed ({e}) — uploading DOCX as-is")
+        import shutil
+        shutil.copy2(docx_path, pdf_path)
+        return pdf_path
 
-    Best-effort: a failure here logs a warning and returns; the caller
-    proceeds with the upload regardless. Run weekly, this gives you a
-    per-week archive of every report version.
+
+def _save_archive_copy(bucket, local_path: str, safe_name: str,
+                       gcs_filename: str, content_type: str = "application/pdf") -> None:
+    """Save a timestamped copy of the file in the archive/ subfolder.
+
+    Called AFTER the main upload so both the live file and the archive
+    copy are written from the same local source in one operation.
     """
     try:
-        existing = bucket.blob(blob_name)
-        if not existing.exists():
-            return
-        existing.reload()
-        prior_ts = existing.updated or existing.time_created or datetime.now()
-        ts_str = prior_ts.strftime("%Y%m%d-%H%M%S")
+        ts_str = datetime.now().strftime("%Y%m%d-%H%M%S")
         archive_name = (
             f"{GCS_BASE_PATH}/{safe_name}/{GCS_SUBFOLDER}"
             f"/archive/{ts_str}_{gcs_filename}"
         )
-        bucket.copy_blob(existing, bucket, new_name=archive_name)
-        print(f"    📦 archived prior version → gs://{GCS_BUCKET}/{archive_name}")
+        blob = bucket.blob(archive_name)
+        blob.upload_from_filename(local_path, content_type=content_type)
+        print(f"    📦 archive copy → gs://{GCS_BUCKET}/{archive_name}")
     except Exception as arch_exc:
-        print(f"    [WARN] archive step failed for {gcs_filename}: {arch_exc}")
+        print(f"    [WARN] archive copy failed for {gcs_filename}: {arch_exc}")
+
+
+def _delete_old_blob(bucket, safe_name: str, old_filename: str) -> None:
+    """Delete an old file from GCS (e.g. remove .docx after switching to .pdf)."""
+    try:
+        old_blob_name = f"{GCS_BASE_PATH}/{safe_name}/{GCS_SUBFOLDER}/{old_filename}"
+        old_blob = bucket.blob(old_blob_name)
+        if old_blob.exists():
+            old_blob.delete()
+            print(f"    🗑️  deleted old file → gs://{GCS_BUCKET}/{old_blob_name}")
+    except Exception as e:
+        print(f"    [WARN] could not delete old {old_filename}: {e}")
 
 
 def upload_to_gcs(local_path: str, drug_name: str, gcs_filename: str) -> str:
     """
     Upload a local file to:
-        gs://cognito-gcs/Cognito_new/reports/{drug_name}/IP/{gcs_filename}
+        gs://cognito-prod/Cognito_new/reports/{drug_name}/IP/{gcs_filename}
+    Also saves a timestamped archive copy alongside.
     Returns the GCS URI.
-
-    Archiving:
-      Before overwriting an existing blob at the destination path, the
-      current version is COPIED to:
-          gs://…/{drug_name}/IP/archive/<YYYYMMDD-HHMMSS>_<gcs_filename>
-      …using the existing blob's upload time as the timestamp (not now)
-      so the archive name reflects when the prior report was generated.
-      This gives you a per-week run history since the pipeline runs once
-      a week — every Monday's run preserves the prior Monday's file.
-
-      The archive step is best-effort: if it fails (e.g., permissions),
-      we log and continue with the upload rather than blocking the run.
     """
     from google.cloud import storage  # noqa: F811
 
@@ -152,15 +176,16 @@ def upload_to_gcs(local_path: str, drug_name: str, gcs_filename: str) -> str:
     bucket = client.bucket(GCS_BUCKET)
     blob   = bucket.blob(blob_name)
 
-    # ── Archive existing version, if any ────────────────────────────────────
-    _archive_existing_blob(bucket, blob_name, safe_name, gcs_filename)
-
-    # ── Upload the new version (overwrites in place) ────────────────────────
     ct = "application/pdf"
     if gcs_filename.endswith(".docx"):
         ct = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
+    # ── Upload the new version ──
     blob.upload_from_filename(local_path, content_type=ct)
+
+    # ── Save timestamped archive copy ──
+    _save_archive_copy(bucket, local_path, safe_name, gcs_filename, ct)
+
     return gcs_uri
 
 
@@ -248,8 +273,8 @@ def _run_1bqreport(mod) -> list:
             client = storage.Client(project=os.getenv("BQ_PROJECT_ID", "cognito-prod-394707"), credentials=_get_credentials())
             bucket = client.bucket(GCS_BUCKET)
             blob   = bucket.blob(blob_name)
-            _archive_existing_blob(bucket, blob_name, safe_name, mod.GCS_FILE_NAME)
             blob.upload_from_filename(local_path, content_type="application/pdf")
+            _save_archive_copy(bucket, local_path, safe_name, mod.GCS_FILE_NAME)
             print(f"  Upload successful: {gcs_uri}")
         except Exception as e:
             print(f"  [ERROR] GCS upload failed for {drug_name}: {e}")
@@ -305,16 +330,16 @@ def _run_2bqreport(mod) -> list:
         gcs_uris = []
         for drug_name in (drug_names if isinstance(drug_names, list) else [drug_names]):
             safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", str(drug_name))
-            blob_name = f"{GCS_BASE_PATH}/{safe_name}/{GCS_SUBFOLDER}/{mod.GCS_FILE_NAME}"
+            pdf_filename = mod.GCS_FILE_NAME.replace(".docx", ".pdf")
+            blob_name = f"{GCS_BASE_PATH}/{safe_name}/{GCS_SUBFOLDER}/{pdf_filename}"
             gcs_uri   = f"gs://{GCS_BUCKET}/{blob_name}"
             print(f"  Uploading to GCS: {gcs_uri}")
             try:
                 blob = bucket.blob(blob_name)
-                _archive_existing_blob(bucket, blob_name, safe_name, mod.GCS_FILE_NAME)
-                blob.upload_from_filename(
-                    local_path,
-                    content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                )
+                blob.upload_from_filename(local_path, content_type="application/pdf")
+                _save_archive_copy(bucket, local_path, safe_name, pdf_filename)
+                # Delete old .docx if it exists
+                _delete_old_blob(bucket, safe_name, mod.GCS_FILE_NAME)
                 print(f"  Upload successful: {gcs_uri}")
                 gcs_uris.append(gcs_uri)
             except Exception as e:
@@ -363,11 +388,14 @@ def _run_2bqreport(mod) -> list:
                 drug_data[k] = v
 
         safe = re.sub(r"[^a-zA-Z0-9_-]", "_", drug)
-        output_path = str(output_dir / f"{safe}_Patent_Strength.docx")
+        docx_path = str(output_dir / f"{safe}_Patent_Strength.docx")
+        pdf_path  = str(output_dir / f"{safe}_Patent_Strength.pdf")
 
         try:
-            mod.build_report(drug_data, output_path)
-            results.append((drug, output_path))
+            mod.build_report(drug_data, docx_path)
+            # Convert DOCX → PDF using LibreOffice
+            _docx_to_pdf(docx_path, pdf_path)
+            results.append((drug, pdf_path))
         except Exception as exc:
             print(f"    [ERROR] Patent Strength report failed for '{drug}': {exc}")
 
