@@ -108,23 +108,28 @@ def _load_forecast_scored(drug_name: str = None) -> pd.DataFrame:
 
 
 def _load_master_loe(drug_name: str = None) -> pd.DataFrame:
-    """Load Master_LOE data from BQ, optionally filtered by drug."""
+    """Load latest Master_LOE rows (deduplicated by Patent_Number, latest created_at)."""
     client = _get_bq_client()
+    from google.cloud import bigquery
+
+    drug_filter = ""
+    params = []
     if drug_name:
-        query = f"""
-        SELECT DISTINCT * FROM `{MASTER_LOE_TABLE}`
-        WHERE LOWER(Drug_Name) = LOWER(@drug)
-        """
-        from google.cloud import bigquery
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("drug", "STRING", drug_name)
-            ]
-        )
-        df = client.query(query, job_config=job_config).to_dataframe()
-    else:
-        query = f"SELECT DISTINCT * FROM `{MASTER_LOE_TABLE}`"
-        df = client.query(query).to_dataframe()
+        drug_filter = "WHERE LOWER(Drug_Name) = LOWER(@drug)"
+        params = [bigquery.ScalarQueryParameter("drug", "STRING", drug_name)]
+
+    query = f"""
+    SELECT * EXCEPT(rn) FROM (
+        SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY Patent_Number
+            ORDER BY created_at DESC
+        ) AS rn
+        FROM `{MASTER_LOE_TABLE}`
+        {drug_filter}
+    ) WHERE rn = 1
+    """
+    job_config = bigquery.QueryJobConfig(query_parameters=params) if params else None
+    df = client.query(query, job_config=job_config).to_dataframe()
     return df
 
 
