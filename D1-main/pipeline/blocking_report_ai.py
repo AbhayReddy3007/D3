@@ -184,15 +184,25 @@ def _load_from_bigquery(drug_name: str = None) -> List[Dict]:
     )
 
     table_ref = f"`{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_ID}`"
+    drug_filter = ""
     if drug_name:
         safe_drug = drug_name.replace("'", "\\'")
-        query = f"SELECT DISTINCT * FROM {table_ref} WHERE Drug_Name = '{safe_drug}'"
-    else:
-        query = f"SELECT DISTINCT * FROM {table_ref}"
+        drug_filter = f"WHERE Drug_Name = '{safe_drug}'"
 
-    print(f"[BQ] Running query: {query}")
+    query = f"""
+    SELECT * EXCEPT(rn) FROM (
+        SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY Patent_Number
+            ORDER BY created_at DESC
+        ) AS rn
+        FROM {table_ref}
+        {drug_filter}
+    ) WHERE rn = 1
+    """
+
+    print(f"[BQ] Running ROW_NUMBER dedup query on Master_LOE")
     df = client.query(query).to_dataframe()
-    print(f"[BQ] Loaded {len(df)} distinct rows from BigQuery.")
+    print(f"[BQ] Loaded {len(df)} latest rows from BigQuery.")
 
     # Normalise column names: BQ uses underscores, code expects spaces
     df.columns = [c.strip().replace("_", " ") for c in df.columns]
