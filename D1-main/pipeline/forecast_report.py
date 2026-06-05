@@ -4,7 +4,7 @@ forecast_report.py
 Generates polished PDF forecast reports for drugs.
 
 Reads data from BigQuery:
-  - patent_forecast_scored  (scored forecasts from Step 6 pipeline)
+  - forecasted_loe  (scored forecasts from Step 6 pipeline)
   - Master_LOE              (combined LOE + forecast table)
 
 Usage:
@@ -47,10 +47,9 @@ _genai_client = genai.Client(api_key=api_key) if api_key else None
 # ── BQ CONFIG ─────────────────────────────────────────────────────────────── #
 BQ_PROJECT_ID      = os.getenv("BQ_PROJECT_ID", "cognito-prod-394707")
 BQ_DATASET_ID      = os.getenv("BQ_DATASET_ID", "cognito_prod_datamart")
-BQ_SERVICE_ACCOUNT = os.getenv("BQ_SERVICE_ACCOUNT")
 
 FORECAST_SCORED_TABLE = os.getenv("BQ_FORECAST_SCORED_TABLE",
-    f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.patent_forecast_scored")
+    f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.forecasted_loe")
 MASTER_LOE_TABLE      = os.getenv("BQ_MASTER_LOE_TABLE",
     f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.Master_LOE")
 
@@ -69,11 +68,9 @@ def _get_bq_client():
     from google.cloud import bigquery
     from google.oauth2 import service_account
 
-    if BQ_SERVICE_ACCOUNT:
-        credentials = service_account.Credentials.from_service_account_file(
-            BQ_SERVICE_ACCOUNT,
-            scopes=["https://www.googleapis.com/auth/cloud-platform"],
-        )
+    cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if cred_path and os.path.exists(cred_path):
+        credentials = service_account.Credentials.from_service_account_file(cred_path)
         _bq_client = bigquery.Client(credentials=credentials, project=BQ_PROJECT_ID)
     else:
         _bq_client = bigquery.Client(project=BQ_PROJECT_ID)
@@ -84,23 +81,29 @@ def _get_bq_client():
 # ── LOAD DATA FROM BQ ────────────────────────────────────────────────────── #
 
 def _load_forecast_scored(drug_name: str = None) -> pd.DataFrame:
-    """Load scored forecast data from BQ, optionally filtered by drug."""
+    """Load deduplicated forecast data from forecasted_loe using ROW_NUMBER."""
     client = _get_bq_client()
+    from google.cloud import bigquery
+
+    drug_filter = ""
+    params = []
     if drug_name:
-        query = f"""
-        SELECT DISTINCT * FROM `{FORECAST_SCORED_TABLE}`
-        WHERE LOWER(drug_name) = LOWER(@drug)
-        """
-        from google.cloud import bigquery
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("drug", "STRING", drug_name)
-            ]
-        )
-        df = client.query(query, job_config=job_config).to_dataframe()
-    else:
-        query = f"SELECT DISTINCT * FROM `{FORECAST_SCORED_TABLE}`"
-        df = client.query(query).to_dataframe()
+        drug_filter = "WHERE drug_name = @drug"
+        params = [bigquery.ScalarQueryParameter("drug", "STRING", drug_name)]
+
+    query = f"""
+    SELECT * EXCEPT(rn) FROM (
+        SELECT *,
+            ROW_NUMBER() OVER (
+                PARTITION BY drug_name, patent_number, jurisdiction, step1_claim_category
+                ORDER BY scored_at DESC
+            ) AS rn
+        FROM `{FORECAST_SCORED_TABLE}`
+        {drug_filter}
+    ) WHERE rn = 1
+    """
+    job_config = bigquery.QueryJobConfig(query_parameters=params) if params else None
+    df = client.query(query, job_config=job_config).to_dataframe()
     return df
 
 
@@ -126,7 +129,7 @@ def _load_master_loe(drug_name: str = None) -> pd.DataFrame:
 
 
 def _list_drugs() -> list:
-    """List all distinct drugs in the forecast scored table."""
+    """List all distinct drugs in the forecasted_loe table."""
     client = _get_bq_client()
     query = f"""
     SELECT DISTINCT drug_name
