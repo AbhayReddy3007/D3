@@ -14,6 +14,8 @@ from dateutil.relativedelta import relativedelta
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
+from cog import drug_filter
+
 # ── BIGQUERY CONFIG ──────────────────────────────────────────────────────────
 BQ_PROJECT_ID  = "cognito-prod-394707"
 BQ_DATASET_ID  = "cognito_prod_datamart"
@@ -515,12 +517,110 @@ def _to_snake_case(col: str) -> str:
     return s
 
 
+# ─────────────────────────────────────────────
+# Cache of already-analysed (drug, jurisdiction[, patent]) combos
+# ─────────────────────────────────────────────
+# `shortlisted_secondary_patents_table` is this script's own output. Master_LOE
+# (the upstream source) never gets Approval Date / PTE written back to it, so
+# without this check every re-run would re-issue the same Gemini calls for
+# combos that were already looked up in a previous run — pure wasted LLM
+# spend. We read the latest row per patent_number (by created_at, same
+# pattern used everywhere else in this pipeline) and reuse those values.
+SHORTLISTED_TABLE = "shortlisted_secondary_patents_table"
+
+
+def load_existing_analysis_cache() -> tuple[dict, dict]:
+    """
+    Returns (approval_cache, pte_cache):
+      approval_cache: {(drug, jurisdiction): approval_date_str}
+      pte_cache:       {(drug, patent_number, jurisdiction): {"pte_status", "pte_months", "pte_source"}}
+
+    Reads the latest row per patent_number from this script's own previous
+    output (shortlisted_secondary_patents_table), so already-looked-up
+    combos are never re-sent to Gemini on a re-run.
+    """
+    approval_cache: dict = {}
+    pte_cache: dict = {}
+
+    credentials = _get_credentials()
+    client = bigquery.Client(project=BQ_PROJECT_ID, credentials=credentials, location=BQ_LOCATION)
+    table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{SHORTLISTED_TABLE}"
+
+    try:
+        # created_at may not exist yet on a brand-new table — ALTER TABLE is
+        # a no-op if it's already there.
+        client.query(
+            f"ALTER TABLE `{table_ref}` ADD COLUMN IF NOT EXISTS created_at TIMESTAMP"
+        ).result()
+    except Exception as e:
+        print(f"  [CACHE] Could not ensure created_at column on {SHORTLISTED_TABLE} ({e})")
+
+    try:
+        query = f"""
+        SELECT * EXCEPT(rn) FROM (
+            SELECT
+                drug_name, patent_number, jurisdiction,
+                approval_date, pte_status, pte_months_granted, pte_source,
+                ROW_NUMBER() OVER (
+                    PARTITION BY patent_number
+                    ORDER BY created_at DESC NULLS LAST
+                ) AS rn
+            FROM `{table_ref}`
+        ) WHERE rn = 1
+        """
+        df = client.query(query).to_dataframe()
+    except Exception as e:
+        print(f"  [CACHE] No existing analysis found in {SHORTLISTED_TABLE} ({e}) "
+              f"— all lookups will run fresh this run")
+        return approval_cache, pte_cache
+
+    if df.empty:
+        print(f"  [CACHE] {SHORTLISTED_TABLE} is empty — all lookups will run fresh this run")
+        return approval_cache, pte_cache
+
+    for _, row in df.iterrows():
+        drug = str(row.get("drug_name", "")).strip()
+        jur = str(row.get("jurisdiction", "")).strip()
+        pat = str(row.get("patent_number", "")).strip()
+        if not drug or not jur:
+            continue
+
+        appr = row.get("approval_date")
+        if pd.notna(appr) and str(appr).strip() not in ("", "Not found", "None", "nan"):
+            key = (drug, jur)
+            if key not in approval_cache:
+                approval_cache[key] = str(appr).strip()
+
+        status = row.get("pte_status")
+        if pat and pd.notna(status) and str(status).strip() not in ("", "None", "nan"):
+            months_raw = row.get("pte_months_granted")
+            try:
+                months = int(float(months_raw)) if pd.notna(months_raw) else 0
+            except (ValueError, TypeError):
+                months = 0
+            pte_cache[(drug, pat, jur)] = {
+                "pte_status": str(status).strip(),
+                "pte_months": months,
+                "pte_source": str(row.get("pte_source", "") or "").strip(),
+            }
+
+    print(f"  [CACHE] Reused {len(approval_cache)} approval-date and "
+          f"{len(pte_cache)} PTE lookup(s) already analysed in a previous run")
+    return approval_cache, pte_cache
+
+
 def write_to_bigquery(df: pd.DataFrame, table_id: str) -> None:
     """Write only NEW rows to a BigQuery table (skip existing patent numbers)."""
     df = df.copy()
     df.columns = [_to_snake_case(c) for c in df.columns]
     df = df.astype(str).replace("nan", pd.NA).replace("<NA>", pd.NA)
     df = df.drop_duplicates()
+
+    # Stamp every row with when it was analysed. created_at is what lets a
+    # re-run identify "already analysed" combos via load_existing_analysis_cache()
+    # above, and matches the created_at convention used elsewhere in this
+    # pipeline (Master_LOE, 1bqreport.py, 2bqreport.py, 4bqreport.py).
+    df["created_at"] = pd.Timestamp.utcnow()
 
     credentials = _get_credentials()
     client = bigquery.Client(
@@ -573,6 +673,7 @@ def write_to_bigquery(df: pd.DataFrame, table_id: str) -> None:
     job_config = bigquery.LoadJobConfig(
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         autodetect=True,
+        schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
     )
 
     job = client.load_table_from_dataframe(df, full_table_id, job_config=job_config)
@@ -609,11 +710,24 @@ def main():
 
     # ── Filter to single drug if specified ────────────────────────────────
     if args.drug:
+        if not drug_filter.require_allowed_drug(args.drug):
+            return
         df = df[df["Drug Name"].str.lower() == args.drug.lower()].reset_index(drop=True)
         print(f"\n[Filter] Processing single drug: '{args.drug}' → {len(df)} rows")
         if df.empty:
             print("No rows match this drug name. Exiting.")
             return
+    else:
+        before_names = sorted(df["Drug Name"].dropna().unique())
+        allowed_names = drug_filter.filter_allowed_drugs(before_names)
+        if len(allowed_names) != len(before_names):
+            allowed_norm = {drug_filter.normalize(d) for d in allowed_names}
+            df = df[df["Drug Name"].apply(lambda d: drug_filter.normalize(d) in allowed_norm)].reset_index(drop=True)
+            print(f"\n[DRUG FILTER] {len(before_names) - len(allowed_names)} non-GLP-1 "
+                  f"drug(s) excluded; {len(df)} rows remaining")
+            if df.empty:
+                print("No GLP-1 drugs remain after applying the drug-universe filter.")
+                return
 
     total = len(df)
     print(f"\nTotal rows loaded           : {total}")
@@ -662,18 +776,31 @@ def main():
         print("\n  ⚠ Column 'Years to Entry' not found in input — "
               "falling back to calculated gap for all rows.")
 
+    # ── 0. Reuse results already analysed in a previous run ───────────────
+    # Checked against this script's own output table (latest row per
+    # patent_number, by created_at) — see load_existing_analysis_cache().
+    print(f"\n{'='*60}")
+    print("Checking for previously-analysed approval-date / PTE results...")
+    print(f"{'='*60}")
+    persisted_approval_cache, persisted_pte_cache = load_existing_analysis_cache()
+
     # ── 1. Fill missing Approval Dates ───────────────────────────────────
-    approval_cache: dict[tuple, str] = {}
+    approval_cache: dict[tuple, str] = dict(persisted_approval_cache)
     groups_to_query: set[tuple] = set()
 
     for idx, row in shortlisted.iterrows():
         key = (row["Drug Name"], row["Jurisdiction"])
         val = row.get("Approval Date", "")
         is_missing = pd.isna(val) or val == "" or pd.isna(pd.to_datetime(val, errors="coerce"))
-        if is_missing:
+        if is_missing and key not in approval_cache:
             groups_to_query.add(key)
 
-    print(f"\nApproval-date lookups needed: {len(groups_to_query)}")
+    all_groups = {(row["Drug Name"], row["Jurisdiction"]) for _, row in shortlisted.iterrows()
+                 if pd.isna(row.get("Approval Date", "")) or row.get("Approval Date", "") == ""
+                 or pd.isna(pd.to_datetime(row.get("Approval Date", ""), errors="coerce"))}
+    reused_approval = len(all_groups) - len(groups_to_query)
+    print(f"\nApproval-date lookups needed: {len(groups_to_query)} "
+          f"(reused {reused_approval} from previous run(s))")
 
     for drug, jur in sorted(groups_to_query):
         result = lookup_earliest_approval_date(drug, jur)
@@ -687,8 +814,9 @@ def main():
             shortlisted.at[idx, "Approval Date"] = approval_cache[key]
 
     # ── 2. PTE lookup ────────────────────────────────────────────────────
-    pte_cache: dict[tuple, dict] = {}
+    pte_cache: dict[tuple, dict] = dict(persisted_pte_cache)
     pte_groups: set[tuple] = set()
+    pte_eligible: set[tuple] = set()
 
     for idx, row in shortlisted.iterrows():
         jur = row["Jurisdiction"]
@@ -697,9 +825,12 @@ def main():
             continue
         if PTE_RULES.get(jur, {}).get("allowed"):
             key = (row["Drug Name"], row["Patent Number"], jur)
-            pte_groups.add(key)
+            pte_eligible.add(key)
+            if key not in pte_cache:
+                pte_groups.add(key)
 
-    print(f"\nPTE lookups needed: {len(pte_groups)}")
+    print(f"\nPTE lookups needed: {len(pte_groups)} "
+          f"(reused {len(pte_eligible) - len(pte_groups)} from previous run(s))")
 
     for drug, pat, jur in sorted(pte_groups):
         result = lookup_pte(drug, pat, jur)
