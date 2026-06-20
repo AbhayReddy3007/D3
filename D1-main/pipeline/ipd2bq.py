@@ -77,6 +77,8 @@ print(f"[IPD2BQ] alloydb_client located at: {_alloydb_dir}/alloydb_client.py")
 
 from alloydb_client import AlloyDBClient
 
+from cog import drug_filter
+
 # ── BigQuery Config (from .env) ───────────────────────────────────────────────
 BQ_PROJECT_ID  = os.getenv("BQ_PROJECT_ID", "cognito-prod-394707")
 BQ_DATASET_ID  = os.getenv("BQ_DATASET_ID", "cognito_prod_datamart")
@@ -1105,6 +1107,7 @@ def _write_bq_table(rows: list[dict], table_id: str, schema: list) -> None:
     job_config = bigquery.LoadJobConfig(
         schema=schema,
         write_disposition="WRITE_APPEND",
+        schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
     )
     job = client.load_table_from_dataframe(df_out, full_table, job_config=job_config)
     job.result()
@@ -1157,6 +1160,7 @@ PATENT_STRENGTH_SCHEMA = [
     bigquery.SchemaField("key_strengths",          "STRING"),
     bigquery.SchemaField("filing_date",            "STRING"),
     bigquery.SchemaField("grant_date",             "STRING"),
+    bigquery.SchemaField("created_at",             "TIMESTAMP"),
 ]
 
 COUNTRY_SCORE_SCHEMA = [
@@ -1222,6 +1226,7 @@ def build_output_bigquery(df_shortlist, results, country_scores=None):
             "key_strengths":      summary.get("key_strengths", ""),
             "filing_date":        str(row_data.get("Filing Date", "")),
             "grant_date":         str(row_data.get("Grant Date", "")),
+            "created_at":         datetime.utcnow(),
         }
         row_out.update(_sf_fields(r, "sf1", SF1_SCORE_LABELS))
         row_out.update(_sf_fields(r, "sf2", SF2_SCORE_LABELS))
@@ -1388,6 +1393,74 @@ def load_from_bigquery() -> pd.DataFrame:
     return df
 
 
+# ── Fallback cache: rebuild from BigQuery if the GCS checkpoint is missing ───
+#
+# The GCS checkpoint (ipd2_checkpoints/scoring_checkpoint.json) is the
+# primary, finer-grained (per drug+patent+sub-factor) cache and is checked
+# first in _score_all() below. This is a second line of defense: if that
+# checkpoint is ever lost (deleted, corrupted, never written), already-scored
+# patents can still be recovered from patent_strength_table itself — using
+# the latest row per patent_number by created_at, same convention as the
+# rest of this pipeline — instead of re-running every Gemini call.
+
+def load_existing_score_cache() -> dict:
+    """
+    Returns {checkpoint_key(drug, patent_number): {sf1: {...}, sf2: {...}, ...}}
+    reconstructed from the latest row per patent_number in patent_strength_table.
+    """
+    cache: dict = {}
+    try:
+        client = _bq_client()
+        full_table = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.patent_strength_table"
+        query = f"""
+        SELECT * EXCEPT(rn) FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY patent_number
+                ORDER BY created_at DESC NULLS LAST
+            ) AS rn
+            FROM `{full_table}`
+        ) WHERE rn = 1
+        """
+        df = client.query(query).to_dataframe()
+    except Exception as e:
+        print(f"📂 [BQ FALLBACK] Could not read patent_strength_table ({e}) — skipping")
+        return cache
+
+    if df.empty:
+        return cache
+
+    for _, row in df.iterrows():
+        drug = str(row.get("drug_name", "")).strip()
+        pn   = str(row.get("patent_number", "")).strip()
+        if not drug or not pn:
+            continue
+        key = checkpoint_key(drug, pn)
+        entry = {}
+        for sf_key in ("sf1", "sf2", "sf3", "sf4"):
+            score_val = row.get(f"{sf_key}_score")
+            if pd.isna(score_val):
+                continue  # this sub-factor wasn't completed — leave it out
+                          # so the normal scoring loop still fills it in
+            findings = [
+                row.get(f"{sf_key}_key_finding_1", ""),
+                row.get(f"{sf_key}_key_finding_2", ""),
+                row.get(f"{sf_key}_key_finding_3", ""),
+            ]
+            entry[sf_key] = {
+                "score": int(score_val),
+                "score_reason": row.get(f"{sf_key}_score_reason", "") or "",
+                "reasoning": row.get(f"{sf_key}_reasoning", "") or "",
+                "key_findings": [f for f in findings if f],
+                "chunks_used": int(row.get(f"{sf_key}_chunks_used", 0) or 0),
+            }
+        if entry:
+            cache[key] = entry
+
+    print(f"📂 [BQ FALLBACK] Reconstructed {len(cache)} patent score(s) from "
+          f"patent_strength_table (used only to fill gaps in the GCS checkpoint)")
+    return cache
+
+
 def main():
     parser = argparse.ArgumentParser(description="Score patents on legal robustness sub-factors")
     parser.add_argument("drug", nargs="?", default=None,
@@ -1420,6 +1493,8 @@ def main():
     print(f"Shortlisted {len(df_shortlist)} patents from BigQuery (Tag=Blocking AND Grant Date present AND Type\u2260Forecasted).")
 
     if args.drug:
+        if not drug_filter.require_allowed_drug(args.drug):
+            return
         df_shortlist = df_shortlist[
             df_shortlist["Drug Name"].str.lower() == args.drug.lower()
         ].reset_index(drop=True)
@@ -1427,6 +1502,16 @@ def main():
         if df_shortlist.empty:
             print("No patents match this drug name. Exiting.")
             return
+    else:
+        before_drugs = sorted(df_shortlist["Drug Name"].dropna().unique())
+        allowed_names = drug_filter.filter_allowed_drugs(before_drugs)
+        if len(allowed_names) != len(before_drugs):
+            allowed_norm = {drug_filter.normalize(d) for d in allowed_names}
+            df_shortlist = df_shortlist[
+                df_shortlist["Drug Name"].apply(lambda d: drug_filter.normalize(d) in allowed_norm)
+            ].reset_index(drop=True)
+            print(f"[DRUG FILTER] {len(before_drugs) - len(allowed_names)} non-GLP-1 "
+                  f"drug(s) excluded; {len(df_shortlist)} patents remaining.")
 
     if df_shortlist.empty:
         print("No patents match the shortlist criteria. Exiting.")
@@ -1442,6 +1527,23 @@ def main():
     # ── 2. Load checkpoint ────────────────────────────────────────────────────
     checkpoint_path = args.checkpoint
     cache = {} if args.reset else load_checkpoint(checkpoint_path)
+
+    if not args.reset:
+        # Fill any gaps in the GCS checkpoint from BigQuery itself, so a
+        # lost/corrupted checkpoint doesn't force a full re-score of patents
+        # that were already analysed and written out in a previous run.
+        bq_cache = load_existing_score_cache()
+        added = 0
+        for key, entry in bq_cache.items():
+            existing = cache.setdefault(key, {})
+            for sf_key, sf_val in entry.items():
+                if sf_key not in existing:
+                    existing[sf_key] = sf_val
+                    added += 1
+        if added:
+            print(f"📂 [BQ FALLBACK] Filled {added} sub-factor result(s) missing "
+                  f"from the GCS checkpoint")
+
     active_sfs = ["sf1", "sf2", "sf3", "sf4"]
 
     # ── 3. Connect to AlloyDB ─────────────────────────────────────────────────
