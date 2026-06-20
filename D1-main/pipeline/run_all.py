@@ -26,6 +26,10 @@ Usage:
   python run_all.py                   # Refresh scores + all reports (default)
   python run_all.py --mode all        # full pipeline
   python run_all.py --mode all --skip-forecast  # full pipeline minus forecasting
+  python run_all.py --mode all --skip-forecast --drug Semaglutide  # single drug test
+
+Cloud Run env vars (no rebuild needed):
+  PIPELINE_MODE=all  PIPELINE_SKIP_FORECAST=true  PIPELINE_DRUG=Cagrilintide+Semaglutide
   python run_all.py --mode patents    # only patents stage
   python run_all.py --mode forecast   # forecast → merge → IPD → reports (skips patents)
   python run_all.py --mode ipd        # only IPD stage
@@ -917,7 +921,7 @@ def main():
     parser.add_argument(
         "--mode",
         choices=["all", "patents", "forecast", "ipd", "reports", "refresh-scores", "blocking", "step6-reports", "forecast-reports", "ipd3-rerun"],
-        default="all",
+        default=os.getenv("PIPELINE_MODE", "all"),
         help=(
             "all              = full pipeline (default)\n"
             "patents          = patent pipeline only\n"
@@ -969,12 +973,21 @@ def main():
         ),
     )
     parser.add_argument(
-        "--skip-forecast", action="store_true", default=False,
+        "--skip-forecast", action="store_true",
+        default=os.getenv("PIPELINE_SKIP_FORECAST", "").lower() in ("1", "true", "yes"),
         help=(
             "Skip the entire forecasting stage (steps 3-6) when running "
             "in 'all' mode. The pipeline will go straight from patents → "
             "merge → IPD → reports. Useful when forecast data is already "
             "up to date or not needed for a particular run."
+        ),
+    )
+    parser.add_argument(
+        "--drug", type=str, default=os.getenv("PIPELINE_DRUG") or None,
+        help=(
+            "Run the pipeline for a single drug only (e.g. --drug Semaglutide). "
+            "Useful for testing. The drug must be in the GLP-1 universe. "
+            "Can also be set via PIPELINE_DRUG env var for Cloud Run."
         ),
     )
 
@@ -987,12 +1000,20 @@ def main():
     banner(
         f"LOE PIPELINE — mode={args.mode} | workers={args.workers} | "
         f"skip-forecast={args.skip_forecast} | "
+        f"drug={args.drug or 'all'} | "
         f"task={task_index}/{task_count}"
     )
 
     # Discover drugs from clinical_efficacy BQ table, then shard for this task
-    all_drugs = discover_drugs()
-    drugs = shard_drugs(all_drugs)
+    if args.drug:
+        from cog import drug_filter
+        if not drug_filter.require_allowed_drug(args.drug):
+            sys.exit(1)
+        drugs = [args.drug]
+        print(f"\n[SINGLE-DRUG MODE] Running for '{args.drug}' only")
+    else:
+        all_drugs = discover_drugs()
+        drugs = shard_drugs(all_drugs)
 
     # Separate non-marketed drugs for forecasting
     forecast_drugs = [d for d in drugs if d not in MARKETED_DRUGS]
