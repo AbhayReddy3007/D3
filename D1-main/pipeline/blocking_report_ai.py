@@ -3,7 +3,7 @@ blocking_report_ai.py
 ──────────────────────
 AI-powered 2-page blocking analysis report.
 
-Feeds patent data from the ADK pipeline cache to Gemini 2.0 Flash,
+Feeds patent data from the ADK pipeline cache to Gemini 2.5 Flash,
 which writes a concise analyst-quality report. The output is rendered as a
 strictly 2-page PDF.
 
@@ -28,6 +28,9 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cog import drug_filter
 
 from dotenv import load_dotenv
 import pandas as pd
@@ -603,6 +606,9 @@ if __name__ == "__main__":
 
     if not args.drug_name and not args.excel:
         print("[INFO] No drug name or --excel provided — loading all drugs from BigQuery")
+
+    if args.drug_name and not drug_filter.require_allowed_drug(args.drug_name):
+        sys.exit(1)
 
     patents, drug_name, analysis_date = load_patents(
         drug_name=args.drug_name, excel_path=args.excel
