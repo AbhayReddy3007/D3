@@ -64,6 +64,11 @@ print(f"[IPD3BQ] alloydb_client located at: {_alloydb_dir}/alloydb_client.py")
 
 from alloydb_client import AlloyDBClient
 
+# Imported as `glp1_universe` (not `drug_filter`) because this file already
+# uses the local name `drug_filter` as a parameter/CLI concept — a single
+# drug name to restrict processing to. See process_patents()'s signature.
+from cog import drug_filter as glp1_universe
+
 # ── BigQuery Config (from .env) ───────────────────────────────────────────────
 BQ_PROJECT_ID  = os.getenv("BQ_PROJECT_ID", "cognito-prod-394707")
 BQ_DATASET_ID  = os.getenv("BQ_DATASET_ID", "cognito_prod_datamart")
@@ -888,6 +893,10 @@ def write_circumvention_to_bq(circumvention_by_drug: dict):
         print(f"[BQ] Could not read schema for type alignment ({e}) — using autodetect")
 
     df_circ = df_circ.drop_duplicates()
+    # created_at lets a re-run verify (via load_completed_drugs_from_bq below)
+    # that a drug marked "completed" in the GCS checkpoint actually has rows
+    # here — not just that the checkpoint claims it does.
+    df_circ["created_at"] = pd.Timestamp.utcnow()
 
     # Skip rows where Drug_Name + Patent_Category already exist in BQ
     try:
@@ -915,6 +924,7 @@ def write_circumvention_to_bq(circumvention_by_drug: dict):
     job_config = bigquery.LoadJobConfig(
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         autodetect=True,
+        schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
     )
     job = client.load_table_from_dataframe(df_circ, table_ref, job_config=job_config,
                                            location=BQ_LOCATION)
@@ -1001,6 +1011,7 @@ def write_score_to_bq(drug_scores: list, refresh=False):
         print(f"[BQ] Could not read schema for type alignment ({e}) — using autodetect")
 
     df_score = df_score.drop_duplicates()
+    df_score["created_at"] = pd.Timestamp.utcnow()
 
     if refresh:
         # Delete existing score rows for the drugs we're about to write
@@ -1043,6 +1054,7 @@ def write_score_to_bq(drug_scores: list, refresh=False):
     job_config = bigquery.LoadJobConfig(
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         autodetect=True,
+        schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
     )
     job = client.load_table_from_dataframe(df_score, table_ref, job_config=job_config,
                                            location=BQ_LOCATION)
@@ -1127,6 +1139,22 @@ def process_patents(skip_circumvention=False, drug_filter=None, refresh_scores=F
         print("No rows found with Tag = 'NON-BLOCKING'.")
         return
 
+    # ── GLP-1 drug-universe guard ───────────────────────────────────────────
+    if drug_filter:
+        if not glp1_universe.require_allowed_drug(drug_filter):
+            return
+    else:
+        before_names = sorted(non_blocking["Drug Name"].dropna().unique())
+        allowed_names = glp1_universe.filter_allowed_drugs(before_names)
+        if len(allowed_names) != len(before_names):
+            allowed_norm = {glp1_universe.normalize(d) for d in allowed_names}
+            non_blocking = non_blocking[
+                non_blocking["Drug Name"].apply(lambda d: glp1_universe.normalize(d) in allowed_norm)
+            ].copy()
+            if non_blocking.empty:
+                print("No GLP-1 drugs remain after applying the drug-universe filter.")
+                return
+
     drugs = non_blocking["Drug Name"].unique()
 
     # ── GCS Checkpoint: skip drugs already completed ──────────────────────
@@ -1144,6 +1172,31 @@ def process_patents(skip_circumvention=False, drug_filter=None, refresh_scores=F
                 print(f"[CHECKPOINT] {len(completed_drugs)} drug(s) already done in GCS: {completed_drugs}")
         except Exception as e:
             print(f"[CHECKPOINT] Could not load ipd3 checkpoint: {e}")
+
+    # ── Cross-check against BigQuery: a drug is only truly "done" if its
+    # circumvention rows actually made it into Circumvention_Table. The
+    # checkpoint above is written right after the (cheap, deterministic)
+    # score computation — BEFORE circumvention analysis runs for that drug
+    # — so if circumvention crashed or the BQ write failed after the
+    # checkpoint was saved, the drug would otherwise be skipped forever on
+    # every future run. created_at on Circumvention_Table rows lets us
+    # verify this against the real output, not just the checkpoint's claim.
+    if completed_drugs and not skip_circumvention:
+        try:
+            client = _get_bq_client()
+            circ_table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_CIRC_TABLE}"
+            existing = client.query(
+                f"SELECT DISTINCT Drug_Name FROM `{circ_table_ref}`"
+            ).to_dataframe()
+            drugs_with_circ = set(existing["Drug_Name"].astype(str).str.strip()) if not existing.empty else set()
+            missing = completed_drugs - drugs_with_circ
+            if missing:
+                print(f"[CHECKPOINT] {len(missing)} drug(s) marked done but missing from "
+                      f"{BQ_CIRC_TABLE} — will reprocess: {sorted(missing)}")
+                completed_drugs -= missing
+        except Exception as e:
+            print(f"[CHECKPOINT] Could not verify against {BQ_CIRC_TABLE} ({e}) "
+                  f"— trusting the GCS checkpoint as-is")
 
     def _save_ipd3_checkpoint():
         try:
