@@ -25,6 +25,7 @@ Pipeline order (sequential between stages):
 Usage:
   python run_all.py                   # Refresh scores + all reports (default)
   python run_all.py --mode all        # full pipeline
+  python run_all.py --mode all --skip-forecast  # full pipeline minus forecasting
   python run_all.py --mode patents    # only patents stage
   python run_all.py --mode forecast   # forecast → merge → IPD → reports (skips patents)
   python run_all.py --mode ipd        # only IPD stage
@@ -179,6 +180,23 @@ def discover_drugs():
 
     if not drugs:
         print(f"{RED}ERROR: No drugs found in {fq_table}{RESET}")
+        sys.exit(1)
+
+    # ── Restrict to the GLP-1 drug universe ────────────────────────────────
+    # `clinical_efficacy` may contain drugs outside the GLP-1 scope (other
+    # therapy areas, legacy rows, etc). The canonical definition of "in
+    # scope" is the vw_drug_details_full query in cog/drug_filter.py — every
+    # downstream stage (patents, forecast, IPD, reports) is driven by the
+    # list returned here, so filtering happens once, up front.
+    from cog import drug_filter
+    before = len(drugs)
+    drugs = drug_filter.filter_allowed_drugs(drugs)
+    if before != len(drugs):
+        print(f"[DISCOVERY] {before - len(drugs)} non-GLP-1 drug(s) excluded "
+              f"from clinical_efficacy; {len(drugs)} remaining in scope")
+    if not drugs:
+        print(f"{RED}ERROR: No GLP-1 drugs remain after filtering {fq_table} "
+              f"against the canonical drug universe.{RESET}")
         sys.exit(1)
 
     # Identify marketed drugs
@@ -950,6 +968,15 @@ def main():
             "a bug to force the next run to redo work."
         ),
     )
+    parser.add_argument(
+        "--skip-forecast", action="store_true", default=False,
+        help=(
+            "Skip the entire forecasting stage (steps 3-6) when running "
+            "in 'all' mode. The pipeline will go straight from patents → "
+            "merge → IPD → reports. Useful when forecast data is already "
+            "up to date or not needed for a particular run."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -959,6 +986,7 @@ def main():
     task_count = os.environ.get("CLOUD_RUN_TASK_COUNT", "N/A")
     banner(
         f"LOE PIPELINE — mode={args.mode} | workers={args.workers} | "
+        f"skip-forecast={args.skip_forecast} | "
         f"task={task_index}/{task_count}"
     )
 
@@ -996,7 +1024,9 @@ def main():
 
     if args.mode == "all":
         run_patents(drugs, args.workers, args.dry_run)
-        if forecast_drugs:
+        if args.skip_forecast:
+            print(f"\n{YELLOW}[SKIP] Forecasting stage skipped (--skip-forecast){RESET}")
+        elif forecast_drugs:
             run_forecast(forecast_drugs, args.workers, args.dry_run, resume=args.resume)
         else:
             print(f"\n{YELLOW}[SKIP] All drugs are marketed — skipping forecast stage{RESET}")
