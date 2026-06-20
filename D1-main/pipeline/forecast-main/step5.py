@@ -48,6 +48,12 @@ from google.oauth2 import service_account
 
 load_dotenv(override=True)
 
+# ── Drug universe filter (GLP-1 agonists only) ─────────────────────────────────
+_p = str(Path(__file__).resolve().parent.parent)
+if _p not in sys.path:
+    sys.path.insert(0, _p)
+from cog import drug_filter
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Config — edit these or set via environment variables
 # ─────────────────────────────────────────────────────────────────────────────
@@ -975,18 +981,17 @@ def export_to_excel(assessment: Dict, output_path: str) -> Optional[str]:
 
 def _fetch_all_companies(therapy: str = "GLP-1") -> List[str]:
     src_table = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{os.getenv('BQ_SOURCE_TABLE', 'patent_pipeline')}"
+    # Companies are scoped to the same GLP-1 drug universe as the rest of the
+    # pipeline (cog/drug_filter.py) — this was previously a near-duplicate
+    # query missing the antagonist exclusion; now there's one definition.
+    glp1_filter = drug_filter.get_glp1_query().strip()
+    # get_glp1_query() returns a full SELECT; we only need its WHERE clause
+    # here since this query selects Parent_Company_Name, not cleaned_generic_name.
+    where_clause = glp1_filter.split("WHERE", 1)[1]
     query = f"""
     SELECT DISTINCT Parent_Company_Name
     FROM `{src_table}`
-    WHERE
-      ( UPPER(cleaned_Target) LIKE '%GLUCAGON LIKE PEPTIDE 1%'
-        OR UPPER(cleaned_Target) LIKE '%GLP-1%'
-        OR UPPER(cleaned_Target) LIKE '%GLUCAGON LIKE PEPTIDE-1%'
-      )
-      OR
-      ( data_source = 'IPD'
-        AND Mechanism_of_Action = 'Glucagon-like peptide-1 (GLP-1) agonist'
-      )
+    WHERE {where_clause}
     ORDER BY Parent_Company_Name
     """
     try:
