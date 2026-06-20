@@ -65,6 +65,10 @@ for _p in [str(_here), str(_parent)]:
 # `cog/` package. Importing from `cog` works for both interactive runs
 # (script mode, after sys.path insert above) and pipeline orchestration.
 import importlib  # still used below for optional/dynamic loads
+# Imported as `glp1_universe` (not `drug_filter`) because this file already
+# uses the local name `drug_filter` for a different concept — a CLI-supplied
+# set of drug names to shard by. See the --drugs argument near the bottom.
+from cog import drug_filter as glp1_universe
 try:
     from cog import indexer as _indexer
     from cog import blocking_analyser as _analyser
@@ -106,7 +110,7 @@ _BQ_CLIENT = bigquery.Client(
     credentials=_get_credentials(),
 )
 
-_LOE_TABLE           = "cognito-prod-394707.cognito_prod_datamart.loe_table"
+_LOE_TABLE           = "cognito-prod-394707.cognito_prod_datamart.loe_table_2"
 _CLINICAL_TABLE      = "cognito-prod-394707.cognito_prod_datamart.clinical_efficacy"
 
 
@@ -965,6 +969,7 @@ async def step1_ip_landscape(drug_filter: Optional[set] = None) -> pd.DataFrame:
         return pd.DataFrame()
 
     all_drugs = sorted(df["Drug Name"].dropna().unique().tolist())
+    all_drugs = glp1_universe.filter_allowed_drugs(all_drugs)
 
     if drug_filter:
         wanted = {d.strip().lower() for d in drug_filter if d and str(d).strip()}
@@ -1198,6 +1203,7 @@ async def step2_patent_layering(drug_filter: Optional[set] = None) -> pd.DataFra
         return pd.DataFrame()
 
     all_drugs = sorted(df["Drug Name"].dropna().unique().tolist())
+    all_drugs = glp1_universe.filter_allowed_drugs(all_drugs)
 
     if drug_filter:
         wanted = {d.strip().lower() for d in drug_filter if d and str(d).strip()}
