@@ -65,6 +65,7 @@ from .approval_date_fetcher import fetch_approval_dates
 from .excel_exporter import export_to_excel, export_combined_excel
 
 from . import gcs_cache
+from . import drug_filter
 
 # ── Environment config ───────────────────────────────────────────────────────
 
@@ -224,6 +225,17 @@ async def get_dimension_i_patent_data(
     if jurisdictions:
         print(f"[PIPELINE] Jurisdiction filter: {jurisdictions}")
     print(f"{'='*60}")
+
+    # ── Drug-universe guard — only GLP-1 agonists per the canonical query ──────
+    if not drug_filter.require_allowed_drug(drug_name):
+        return {
+            "drug_name":     drug_name,
+            "error":         f"'{drug_name}' is not in the GLP-1 drug universe "
+                             f"(vw_drug_details_full) — out of scope for this pipeline.",
+            "patents":       [],
+            "source_files":  [],
+            "analysis_date": datetime.now().strftime("%Y-%m-%d"),
+        }
 
     _bq_table   = bq_table_name      or BQ_TABLE_NAME
     _bq_project = bq_project_id      or BQ_PROJECT_ID
