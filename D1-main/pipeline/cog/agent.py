@@ -94,6 +94,9 @@ from .excel_exporter import (
     export_combined_bigquery,
 )
 
+# ── Drug universe filter (GLP-1 agonists only) ────────────────────────────────
+from . import drug_filter
+
 
 # ─────────────────────────────────────────────
 # Helpers
@@ -141,6 +144,18 @@ async def process_all_drugs() -> dict:
         return {
             "status":  "error",
             "message": f"No drug folders found in GCS bucket '{GCS_BUCKET_NAME}'.",
+            "results": [],
+        }
+
+    # Restrict to the GLP-1 drug universe — any other drug folder (legacy
+    # uploads, accidental mis-named folders, unrelated therapy areas) is
+    # out of scope and must not be analysed or billed for LLM calls.
+    drug_folders = drug_filter.filter_allowed_drugs(drug_folders)
+    if not drug_folders:
+        return {
+            "status":  "error",
+            "message": "No GLP-1 drug folders found in GCS after applying the "
+                       "drug-universe filter (vw_drug_details_full).",
             "results": [],
         }
 
@@ -208,6 +223,10 @@ async def _process_single_drug(drug_name: str) -> dict:
     """
     # Resolve alias -> canonical INN so all lookups use the same name
     drug_name  = canonicalise_drug_name(drug_name)
+
+    if not drug_filter.require_allowed_drug(drug_name):
+        return {"drug": drug_name, "status": "out_of_scope", "excel_path": None}
+
     collection = get_or_create_collection(drug_name)
     pdf_refs   = list_drug_pdf_filenames_from_gcs(drug_name)
 
