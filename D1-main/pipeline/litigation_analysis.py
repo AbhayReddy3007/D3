@@ -86,6 +86,7 @@ from constants import (
     PATENT_GROUP_THREAD_BATCH_SIZE,
 )
 from prompts import BRAND_AND_INNOVATOR_PROMPT, LITIGATION_SEARCH_PROMPT
+from cog import drug_filter
 
 load_dotenv()
 
@@ -96,6 +97,10 @@ RETRIABLE_ERRORS_ALL        = (ResourceExhausted, InternalServerError, ServiceUn
 RETRIABLE_ERRORS_RATE_LIMIT = (ResourceExhausted,)
 
 # ── Default BigQuery query for GLP-1 drugs ─────────────────────────────────────
+# Sourced from cog/drug_filter.py — the single canonical definition of the
+# GLP-1 drug universe used across the whole pipeline. Kept as a module-level
+# constant here (rather than calling get_glp1_query() inline) so existing
+# callers/tests that import DEFAULT_DRUG_QUERY keep working.
 LITIGATION_TABLE = f"{BQ_PROJECT_ID}.{BQ_DATASET}.litigation_analysis_table"
 
 # Explicit BQ schema — avoids autodetect mis-typing nullable string columns
@@ -120,22 +125,7 @@ LITIGATION_TABLE_SCHEMA = [
     SchemaField("loaded_at",         "TIMESTAMP", mode="REQUIRED"),
 ]
 
-DEFAULT_DRUG_QUERY = """
-SELECT DISTINCT cleaned_generic_name
-FROM `cognito-prod-394707.cognito_prod_datamart.vw_drug_details_full`
-WHERE
-(
-    UPPER(cleaned_Target) LIKE '%GLUCAGON LIKE PEPTIDE 1%'
-    OR UPPER(cleaned_Target) LIKE '%GLP-1%'
-    OR UPPER(cleaned_Target) LIKE '%GLUCAGON LIKE PEPTIDE-1%'
-    OR (
-        data_source = 'IPD'
-        AND Mechanism_of_Action = 'Glucagon-like peptide-1 (GLP-1) agonist'
-    )
-)
-AND Mechanism_of_Action IS NOT NULL
-AND LOWER(Mechanism_of_Action) NOT LIKE '%antagonist%'
-"""
+DEFAULT_DRUG_QUERY = drug_filter.get_glp1_query()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -819,6 +809,15 @@ def main() -> None:
     if not drugs:
         raise ValueError(
             "No drugs specified. Use --drugs, --use-default-glp1-query, or --drug-query."
+        )
+
+    # Defense-in-depth: even when drugs arrive via --drugs (e.g. from
+    # run_all.py's discovery list), confirm every name is still in the
+    # GLP-1 universe before spending any Gemini calls on it.
+    drugs = drug_filter.filter_allowed_drugs(drugs)
+    if not drugs:
+        raise ValueError(
+            "All requested drugs were excluded by the GLP-1 drug-universe filter."
         )
 
     output_dir = Path(__file__).resolve().parent / "outputs"
