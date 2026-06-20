@@ -72,6 +72,9 @@ get_gcs_client     = _gcs.get_gcs_client
 GCS_BUCKET_NAME    = _gcs.GCS_BUCKET_NAME
 GCS_PATENTS_PREFIX = _gcs.GCS_PATENTS_PREFIX
 
+# ✅ Drug universe filter (GLP-1 agonists only)
+from cog import drug_filter
+
 # ─────────────────────────────────────────────
 # Gemini configuration (for inlined analysis)
 # ─────────────────────────────────────────────
@@ -406,6 +409,7 @@ def list_all_gcs_drugs():
 
     drugs = sorted({b.name.split("/")[1] for b in blobs if "/" in b.name})
     print(f"[GCS] Found {len(drugs)} drugs")
+    drugs = drug_filter.filter_allowed_drugs(drugs)
     return drugs
 
 # ─────────────────────────────────────────────
@@ -518,6 +522,10 @@ if __name__ == "__main__":
 
     if args.drug:
         drugs = [args.drug]
+        drugs = drug_filter.filter_allowed_drugs(drugs)
+        if not drugs:
+            print(f"'{args.drug}' is not in the GLP-1 drug universe — nothing to do.")
+            sys.exit(1)
     else:
         drugs = list_all_gcs_drugs()
 
