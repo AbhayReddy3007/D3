@@ -40,12 +40,13 @@ import pandas as pd
 # GCS-backed results cache
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cog import gcs_cache
+from cog import drug_filter
 
 _RESULTS_CACHE_SUBFOLDER = "results_cache"
 
 DEFAULT_PROJECT  = os.getenv("BQ_UPLOAD_PROJECT",  "cognito-prod-394707")
 DEFAULT_DATASET  = os.getenv("BQ_UPLOAD_DATASET",  "cognito_prod_datamart")
-DEFAULT_TABLE    = os.getenv("BQ_UPLOAD_TABLE",    "loe_table")
+DEFAULT_TABLE    = os.getenv("BQ_UPLOAD_TABLE",    "loe_table_2")
 DEFAULT_LOCATION = os.getenv("BQ_UPLOAD_LOCATION", "asia-south1")
 
 
@@ -534,6 +535,8 @@ Examples:
 
     # ── Load patent data from cache ──
     if args.drug:
+        if not drug_filter.require_allowed_drug(args.drug):
+            sys.exit(1)
         payload = load_drug_from_cache(args.drug)
         if not payload:
             sys.exit(1)
@@ -541,6 +544,15 @@ Examples:
     else:
         payloads = load_all_from_cache()
         if not payloads:
+            sys.exit(1)
+        before = len(payloads)
+        payloads = [p for p in payloads
+                   if drug_filter.is_allowed_drug(p.get("drug", ""))]
+        if before != len(payloads):
+            print(f"[DRUG FILTER] Excluded {before - len(payloads)} non-GLP-1 "
+                  f"drug(s) from results cache")
+        if not payloads:
+            print(f"\n[ERROR] No GLP-1 drugs remain after filtering")
             sys.exit(1)
 
     # ── Build rows ──
