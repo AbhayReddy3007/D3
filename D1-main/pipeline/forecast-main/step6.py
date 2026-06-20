@@ -62,6 +62,8 @@ _GEMINI_MODEL = "gemini-2.5-flash"
 _CURRENT_YEAR  = datetime.now().year
 _CURRENT_DATE  = datetime.now().strftime("%Y-%m-%d")
 
+from cog import drug_filter
+
 BQ_PROJECT_ID      = os.getenv("BQ_PROJECT_ID", "cognito-prod-394707")
 BQ_DATASET_ID      = os.getenv("BQ_DATASET_ID", "cognito_prod_datamart")
 BQ_TABLE_NAME      = os.getenv("BQ_TABLE_NAME")         # drug-company mapping table
@@ -120,6 +122,9 @@ def _load_drug_company_map() -> Dict[str, Dict]:
         client = _get_bq_client()
         fq_table = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_NAME}"
 
+        # Same GLP-1 drug universe as the rest of the pipeline (cog/drug_filter.py)
+        # — previously missing the antagonist exclusion present in the canonical query.
+        _glp1_where = drug_filter.get_glp1_query().strip().split("WHERE", 1)[1]
         query = f"""
         WITH base AS (
           SELECT DISTINCT
@@ -127,16 +132,7 @@ def _load_drug_company_map() -> Dict[str, Dict]:
             Parent_Company_Name,
             Drug_Geography
           FROM `{fq_table}`
-          WHERE
-            (
-              UPPER(cleaned_Target) LIKE '%GLUCAGON LIKE PEPTIDE 1%'
-              OR UPPER(cleaned_Target) LIKE '%GLP-1%'
-              OR UPPER(cleaned_Target) LIKE '%GLUCAGON LIKE PEPTIDE-1%'
-            )
-            OR (
-              data_source = 'IPD'
-              AND Mechanism_of_Action = 'Glucagon-like peptide-1 (GLP-1) agonist'
-            )
+          WHERE {_glp1_where}
         )
         SELECT
           b.cleaned_generic_name,
@@ -1234,6 +1230,14 @@ if __name__ == "__main__":
     if args.limit:
         drugs = drugs[:args.limit]
         print(f"\n[LIMIT] First {args.limit} drug(s) only")
+
+    # Defense-in-depth: confirm every drug is in the GLP-1 universe before
+    # spending any Gemini calls on it (run_all.py already filters upstream,
+    # but this script can also be invoked standalone).
+    drugs = drug_filter.filter_allowed_drugs(drugs)
+    if not drugs:
+        print("No GLP-1 drugs remain after applying the drug-universe filter.")
+        sys.exit(1)
 
     if args.dry_run:
         print(f"\n[DRY RUN] Would process {len(drugs)} drug(s):")
