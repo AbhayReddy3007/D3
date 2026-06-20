@@ -2,7 +2,7 @@
 """
 merge_to_master_loe.py
 ──────────────────────
-Merges loe_table + forecasted_loe → Master_LOE in BigQuery.
+Merges loe_table_2 + forecasted_loe → Master_LOE in BigQuery.
 
 - IP_Dimension_1_Score     → LOWEST  per Drug_Name
 - Avg_Years_to_Entry_US__EP → HIGHEST per Drug_Name
@@ -29,7 +29,7 @@ PROJECT_ID  = os.getenv("BQ_UPLOAD_PROJECT",  os.getenv("PROJECT_ID",  "cognito-
 DATASET_ID  = os.getenv("BQ_UPLOAD_DATASET",  os.getenv("BQ_DATASET_ID", "cognito_prod_datamart"))
 BQ_LOCATION = os.getenv("BQ_UPLOAD_LOCATION", "asia-south1")
 
-LOE_TABLE        = f"{PROJECT_ID}.{DATASET_ID}.loe_table"
+LOE_TABLE        = f"{PROJECT_ID}.{DATASET_ID}.loe_table_2"
 FORECASTED_TABLE = f"{PROJECT_ID}.{DATASET_ID}.forecasted_loe"
 MASTER_TABLE     = f"{PROJECT_ID}.{DATASET_ID}.Master_LOE"
 
