@@ -21,7 +21,7 @@ import os
 import re
 import json
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ── Load .env ─────────────────────────────────────────────────────────────────
@@ -560,7 +560,7 @@ def write_timestamps_to_bigquery(drug_names: list, ts: datetime = None) -> None:
         return
 
     if ts is None:
-        ts = datetime.utcnow()
+        ts = datetime.now(tz=timezone.utc)
 
     client    = _bq_client()
     table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_STRENGTH_TABLE}"
