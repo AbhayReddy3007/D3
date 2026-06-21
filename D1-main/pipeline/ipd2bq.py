@@ -24,7 +24,7 @@ import re
 import json
 import time
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
 # google.generativeai is deprecated. Use google.genai (new SDK) only.
 from google import genai
@@ -1226,7 +1226,7 @@ def build_output_bigquery(df_shortlist, results, country_scores=None):
             "key_strengths":      summary.get("key_strengths", ""),
             "filing_date":        str(row_data.get("Filing Date", "")),
             "grant_date":         str(row_data.get("Grant Date", "")),
-            "created_at":         datetime.utcnow(),
+            "created_at":         datetime.now(tz=timezone.utc),
         }
         row_out.update(_sf_fields(r, "sf1", SF1_SCORE_LABELS))
         row_out.update(_sf_fields(r, "sf2", SF2_SCORE_LABELS))
