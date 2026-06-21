@@ -39,7 +39,7 @@ import json
 import shutil
 import argparse
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 
 from docx import Document
 from docx.shared import Pt, Emu, RGBColor
@@ -242,7 +242,7 @@ def write_narrative_to_bigquery(drug_name: str, narrative: dict) -> None:
             updated_at                    = @now
         WHERE Drug_Name = @drug_name
     """
-    now_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    now_ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter(
