@@ -10,7 +10,7 @@ import csv
 import asyncio
 import argparse
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -388,7 +388,7 @@ def insert_into_bq(client, drug_name, result):
             "characterization": inv.get("characterization"),
             "confidence": str(inv.get("confidence")),
             "rationale": inv.get("rationale"),
-            "created_at": datetime.utcnow().isoformat()
+            "created_at": datetime.now(tz=timezone.utc).isoformat()
         })
 
     if rows:
