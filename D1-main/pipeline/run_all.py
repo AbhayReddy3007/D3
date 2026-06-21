@@ -24,19 +24,26 @@ Pipeline order (sequential between stages):
 
 Usage:
   python run_all.py                   # Refresh scores + all reports (default)
-  python run_all.py --mode all        # full pipeline
+  python run_all.py --mode all        # full pipeline (single-task or local only)
   python run_all.py --mode all --skip-forecast  # full pipeline minus forecasting
   python run_all.py --mode all --skip-forecast --drug Semaglutide  # single drug test
 
+  # Multi-task Cloud Run workflow (2 jobs):
+  #   Job 1: PIPELINE_MODE=patents              (10 tasks — patent indexing + analysis)
+  #   Job 2: PIPELINE_MODE=post-patents          (1 task — merge + IPD + reports)
+  #          PIPELINE_SKIP_FORECAST=true          (add this if forecast not needed)
+
 Cloud Run env vars (no rebuild needed):
-  PIPELINE_MODE=all  PIPELINE_SKIP_FORECAST=true  PIPELINE_DRUG=Cagrilintide+Semaglutide
-  python run_all.py --mode patents    # only patents stage
-  python run_all.py --mode forecast   # forecast → merge → IPD → reports (skips patents)
-  python run_all.py --mode ipd        # only IPD stage
-  python run_all.py --mode reports    # litigation analysis → litigation report → reports
+  PIPELINE_MODE, PIPELINE_SKIP_FORECAST, PIPELINE_DRUG
+
+  python run_all.py --mode patents       # only patents stage (multi-task safe)
+  python run_all.py --mode post-patents  # merge + IPD + reports (1 task only, after patents)
+  python run_all.py --mode forecast      # forecast → merge → IPD → reports (skips patents)
+  python run_all.py --mode ipd           # only IPD stage
+  python run_all.py --mode reports       # litigation analysis → litigation report → reports
   python run_all.py --mode refresh-scores  # ipd3 score refresh + all reports (default)
-  python run_all.py --workers 6       # limit parallelism (default: 10)
-  python run_all.py --dry-run         # print commands without executing
+  python run_all.py --workers 6          # limit parallelism (default: 10)
+  python run_all.py --dry-run            # print commands without executing
 """
 
 import argparse
@@ -920,11 +927,12 @@ def main():
     parser = argparse.ArgumentParser(description="LOE Pipeline orchestrator")
     parser.add_argument(
         "--mode",
-        choices=["all", "patents", "forecast", "ipd", "reports", "refresh-scores", "blocking", "step6-reports", "forecast-reports", "ipd3-rerun"],
+        choices=["all", "patents", "post-patents", "forecast", "ipd", "reports", "refresh-scores", "blocking", "step6-reports", "forecast-reports", "ipd3-rerun"],
         default=os.getenv("PIPELINE_MODE", "all"),
         help=(
-            "all              = full pipeline (default)\n"
-            "patents          = patent pipeline only\n"
+            "all              = full pipeline (single-task only; multi-task auto-downgrades to patents)\n"
+            "patents          = patent pipeline only (safe for multi-task)\n"
+            "post-patents     = merge + IPD + reports (run with 1 task AFTER patents job completes)\n"
             "forecast         = forecast → merge → ipd → reports\n"
             "ipd              = IPD BQ upload only\n"
             "reports          = all reports (standard + litigation)\n"
@@ -1044,7 +1052,36 @@ def main():
             print(f"{RED}[CHECKPOINT] Failed to clear: {e}{RESET}")
 
     if args.mode == "all":
-        run_patents(drugs, args.workers, args.dry_run)
+        task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
+        if task_count > 1:
+            # Multi-task: each task only runs its shard of patents. Merge/IPD/
+            # reports MUST run in a separate single-task job (post-patents mode)
+            # AFTER all patent tasks complete — otherwise task 0 would merge
+            # before tasks 1–N finish writing their drugs to loe_table.
+            print(f"\n{YELLOW}[MULTI-TASK] {task_count} tasks detected — running "
+                  f"patents only. Run a separate job with PIPELINE_MODE=post-patents "
+                  f"(1 task) after this job completes.{RESET}")
+            run_patents(drugs, args.workers, args.dry_run)
+        else:
+            # Single task: safe to run the full pipeline end-to-end.
+            run_patents(drugs, args.workers, args.dry_run)
+            if args.skip_forecast:
+                print(f"\n{YELLOW}[SKIP] Forecasting stage skipped (--skip-forecast){RESET}")
+            elif forecast_drugs:
+                run_forecast(forecast_drugs, args.workers, args.dry_run, resume=args.resume)
+            else:
+                print(f"\n{YELLOW}[SKIP] All drugs are marketed — skipping forecast stage{RESET}")
+            run_merge(args.dry_run, resume=args.resume)
+            run_ipd(drugs, args.workers, args.dry_run, resume=args.resume)
+            run_reports(drugs, args.workers, args.dry_run, resume=args.resume)
+
+    elif args.mode == "post-patents":
+        # Run AFTER the multi-task patents job completes. Must use 1 task.
+        task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
+        if task_count > 1:
+            print(f"{RED}ERROR: post-patents mode must run with exactly 1 task "
+                  f"(got {task_count}). Set --tasks 1 on your Cloud Run job.{RESET}")
+            sys.exit(1)
         if args.skip_forecast:
             print(f"\n{YELLOW}[SKIP] Forecasting stage skipped (--skip-forecast){RESET}")
         elif forecast_drugs:
