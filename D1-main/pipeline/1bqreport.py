@@ -2,7 +2,7 @@
 scoring_report.py - LOE Calculation (Primary Market) Report Generator
 """
 import argparse, os, re, sys, time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -923,7 +923,7 @@ def _write_rationale_to_bigquery(
     from google.cloud import bigquery as _bq
 
     # Single UTC timestamp shared by all drugs in this run.
-    run_timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    run_timestamp = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     total_affected = 0
     for drug_name, rationale in drug_rationales.items():
