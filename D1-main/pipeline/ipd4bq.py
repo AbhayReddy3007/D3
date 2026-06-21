@@ -620,7 +620,7 @@ def write_to_bigquery(df: pd.DataFrame, table_id: str) -> None:
     # re-run identify "already analysed" combos via load_existing_analysis_cache()
     # above, and matches the created_at convention used elsewhere in this
     # pipeline (Master_LOE, 1bqreport.py, 2bqreport.py, 4bqreport.py).
-    df["created_at"] = pd.Timestamp.utcnow()
+    df["created_at"] = pd.Timestamp.now(tz="UTC")
 
     credentials = _get_credentials()
     client = bigquery.Client(
