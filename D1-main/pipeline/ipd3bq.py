@@ -896,7 +896,7 @@ def write_circumvention_to_bq(circumvention_by_drug: dict):
     # created_at lets a re-run verify (via load_completed_drugs_from_bq below)
     # that a drug marked "completed" in the GCS checkpoint actually has rows
     # here — not just that the checkpoint claims it does.
-    df_circ["created_at"] = pd.Timestamp.utcnow()
+    df_circ["created_at"] = pd.Timestamp.now(tz="UTC")
 
     # Skip rows where Drug_Name + Patent_Category already exist in BQ
     try:
@@ -1011,7 +1011,7 @@ def write_score_to_bq(drug_scores: list, refresh=False):
         print(f"[BQ] Could not read schema for type alignment ({e}) — using autodetect")
 
     df_score = df_score.drop_duplicates()
-    df_score["created_at"] = pd.Timestamp.utcnow()
+    df_score["created_at"] = pd.Timestamp.now(tz="UTC")
 
     if refresh:
         # Delete existing score rows for the drugs we're about to write
@@ -1019,7 +1019,6 @@ def write_score_to_bq(drug_scores: list, refresh=False):
         for dn in drug_names:
             try:
                 delete_sql = f"DELETE FROM `{table_ref}` WHERE Drug_Name = @drug"
-                from google.cloud import bigquery
                 job_config = bigquery.QueryJobConfig(
                     query_parameters=[bigquery.ScalarQueryParameter("drug", "STRING", dn)]
                 )
@@ -1161,8 +1160,16 @@ def process_patents(skip_circumvention=False, drug_filter=None, refresh_scores=F
     _ipd3_ckpt_subfolder = "ipd3_checkpoints"
     _ipd3_ckpt_file = "completed_drugs.json"
     completed_drugs = set()
-    if refresh_scores or rerun:
-        print("[RERUN] Bypassing checkpoint, will reprocess all drugs")
+
+    # Allow clearing the checkpoint via env var (useful after a crash that
+    # left the checkpoint in an inconsistent state, e.g. score data computed
+    # but never written to BQ). Set CLEAR_IPD3_CHECKPOINT=true on Cloud Run.
+    _force_clear = os.getenv("CLEAR_IPD3_CHECKPOINT", "").lower() in ("1", "true", "yes")
+
+    if refresh_scores or rerun or _force_clear:
+        reason = ("CLEAR_IPD3_CHECKPOINT env var" if _force_clear
+                  else "RERUN" if rerun else "REFRESH")
+        print(f"[{reason}] Bypassing checkpoint, will reprocess all drugs")
     else:
         try:
             from cog import gcs_cache
@@ -1173,29 +1180,37 @@ def process_patents(skip_circumvention=False, drug_filter=None, refresh_scores=F
         except Exception as e:
             print(f"[CHECKPOINT] Could not load ipd3 checkpoint: {e}")
 
-    # ── Cross-check against BigQuery: a drug is only truly "done" if its
-    # circumvention rows actually made it into Circumvention_Table. The
-    # checkpoint above is written right after the (cheap, deterministic)
-    # score computation — BEFORE circumvention analysis runs for that drug
-    # — so if circumvention crashed or the BQ write failed after the
-    # checkpoint was saved, the drug would otherwise be skipped forever on
-    # every future run. created_at on Circumvention_Table rows lets us
-    # verify this against the real output, not just the checkpoint's claim.
+    # ── Cross-check against BigQuery: a drug is only truly "done" if BOTH
+    # its circumvention rows AND score rows actually made it into their
+    # respective BQ tables. The checkpoint is saved after the in-memory
+    # analysis — BEFORE the BQ writes — so if either write crashed (e.g.
+    # the UnboundLocalError in write_score_to_bq), the drug would otherwise
+    # be skipped forever on every future run. We verify against both tables.
     if completed_drugs and not skip_circumvention:
         try:
             client = _get_bq_client()
-            circ_table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_CIRC_TABLE}"
-            existing = client.query(
+            circ_table_ref  = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_CIRC_TABLE}"
+            score_table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_SCORE_TABLE}"
+
+            existing_circ = client.query(
                 f"SELECT DISTINCT Drug_Name FROM `{circ_table_ref}`"
             ).to_dataframe()
-            drugs_with_circ = set(existing["Drug_Name"].astype(str).str.strip()) if not existing.empty else set()
-            missing = completed_drugs - drugs_with_circ
+            drugs_with_circ = set(existing_circ["Drug_Name"].astype(str).str.strip()) if not existing_circ.empty else set()
+
+            existing_score = client.query(
+                f"SELECT DISTINCT Drug_Name FROM `{score_table_ref}`"
+            ).to_dataframe()
+            drugs_with_score = set(existing_score["Drug_Name"].astype(str).str.strip()) if not existing_score.empty else set()
+
+            # A drug is truly done only if it has rows in BOTH tables
+            drugs_fully_done = drugs_with_circ & drugs_with_score
+            missing = completed_drugs - drugs_fully_done
             if missing:
                 print(f"[CHECKPOINT] {len(missing)} drug(s) marked done but missing from "
-                      f"{BQ_CIRC_TABLE} — will reprocess: {sorted(missing)}")
+                      f"{BQ_CIRC_TABLE} and/or {BQ_SCORE_TABLE} — will reprocess: {sorted(missing)}")
                 completed_drugs -= missing
         except Exception as e:
-            print(f"[CHECKPOINT] Could not verify against {BQ_CIRC_TABLE} ({e}) "
+            print(f"[CHECKPOINT] Could not verify against BQ tables ({e}) "
                   f"— trusting the GCS checkpoint as-is")
 
     def _save_ipd3_checkpoint():
