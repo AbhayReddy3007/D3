@@ -335,8 +335,8 @@ def section_header(text: str, st: dict):
 
 
 def pte_table(df: pd.DataFrame, st: dict) -> list:
-    """PTE summary table: Drug | Jurisdiction | PTE Status | Months | Adjusted Expiry."""
-    needed = ["Drug Name", "Jurisdiction", "PTE Status", "PTE Months (Granted)", "Adjusted Expiry (with PTE)"]
+    """PTE summary table: Drug | Jurisdiction | Months | Adjusted Expiry."""
+    needed = ["Drug Name", "Jurisdiction", "PTE Months (Granted)", "Adjusted Expiry (with PTE)"]
     cols   = [c for c in needed if c in df.columns]
     sub    = df[cols].copy()
 
@@ -346,11 +346,11 @@ def pte_table(df: pd.DataFrame, st: dict) -> list:
 
     headers = {
         "Drug Name": "Drug", "Jurisdiction": "Jur.",
-        "PTE Status": "PTE Status", "PTE Months (Granted)": "PTE (mo.)",
+        "PTE Months (Granted)": "PTE (mo.)",
         "Adjusted Expiry (with PTE)": "Adj. Expiry",
     }
     display_cols = [headers.get(c, c) for c in cols]
-    col_w = [3.8*cm, 1.5*cm, 2.4*cm, 2*cm, 2.5*cm][:len(cols)]
+    col_w = [3.8*cm, 1.5*cm, 2*cm, 2.5*cm][:len(cols)]
     remaining = PAGE_W - 2*MARGIN - sum(col_w)
     if remaining > 0 and col_w:
         col_w[-1] += remaining
@@ -371,20 +371,6 @@ def pte_table(df: pd.DataFrame, st: dict) -> list:
         ("TOPPADDING",   (0, 0), (-1, -1), 2),
         ("BOTTOMPADDING",(0, 0), (-1, -1), 2),
     ])
-
-    # Colour-code PTE status column (index 2 if present)
-    if "PTE Status" in cols:
-        si = cols.index("PTE Status")
-        for i, row in enumerate(rows[1:], start=1):
-            val = row[si]
-            if val == "Granted":
-                ts.add("BACKGROUND", (si, i), (si, i), GREEN)
-                ts.add("TEXTCOLOR",  (si, i), (si, i), WHITE)
-            elif val in ("Pending",):
-                ts.add("BACKGROUND", (si, i), (si, i), AMBER)
-                ts.add("TEXTCOLOR",  (si, i), (si, i), WHITE)
-            elif val in ("Not applicable",):
-                ts.add("TEXTCOLOR",  (si, i), (si, i), colors.grey)
 
     return [Table(rows, colWidths=col_w, style=ts)]
 
