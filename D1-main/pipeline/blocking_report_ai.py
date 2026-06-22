@@ -3,7 +3,7 @@ blocking_report_ai.py
 ──────────────────────
 AI-powered 2-page blocking analysis report.
 
-Feeds patent data from the ADK pipeline cache to Gemini 2.5 Flash,
+Feeds patent data from the ADK pipeline cache to Gemini 2.0 Flash,
 which writes a concise analyst-quality report. The output is rendered as a
 strictly 2-page PDF.
 
@@ -187,10 +187,10 @@ def _load_from_bigquery(drug_name: str = None) -> List[Dict]:
     )
 
     table_ref = f"`{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_ID}`"
-    drug_filter = ""
+    drug_filter = "WHERE Type = 'Existing'"
     if drug_name:
         safe_drug = drug_name.replace("'", "\\'")
-        drug_filter = f"WHERE Drug_Name = '{safe_drug}'"
+        drug_filter = f"WHERE Drug_Name = '{safe_drug}' AND Type = 'Existing'"
 
     query = f"""
     SELECT * EXCEPT(rn) FROM (
