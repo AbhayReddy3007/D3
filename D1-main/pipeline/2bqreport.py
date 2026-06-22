@@ -814,8 +814,8 @@ def build_report(data: dict, output_path: str):
         run.font.size = Pt(13)
 
     cols         = ["Drug Name", "Patent Number", "SF1 Score", "SF2 Score",
-                    "SF3 Score", "SF4 Score", "Weighted Final Score", "Created At", "Updated At", "rationale"]
-    display_cols = ["Drug", "Patent No.", "SF1", "SF2", "SF3", "SF4", "Final", "Created At", "Updated At", "Rationale"]
+                    "SF3 Score", "SF4 Score", "Weighted Final Score"]
+    display_cols = ["Drug", "Patent No.", "SF1", "SF2", "SF3", "SF4", "Final"]
 
     df_table = df_final.copy()
     ws_col   = "Weighted Final Score"
@@ -846,11 +846,10 @@ def build_report(data: dict, output_path: str):
             cell = row_cells[i]
             cell.text = ""
             p = cell.paragraphs[0]
-            # Rationale is left-aligned; all others centred
-            p.alignment = WD_ALIGN_PARAGRAPH.LEFT if col == "rationale" else WD_ALIGN_PARAGRAPH.CENTER
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             run = p.add_run(str(val) if pd.notna(val) else "N/A")
             run.font.size = Pt(8)
-            if i >= 2 and col not in ("rationale", "Created At", "Updated At"):
+            if i >= 2:
                 try:
                     score_int = int(round(float(val)))
                     if score_int in SCORE_COLOR_MAP:
@@ -859,9 +858,9 @@ def build_report(data: dict, output_path: str):
                 except (ValueError, TypeError):
                     pass
 
-    # Column widths — rationale gets generous space; others stay narrow
-    widths = [Inches(1.0), Inches(1.0), Inches(0.45), Inches(0.45),
-              Inches(0.45), Inches(0.45), Inches(0.55), Inches(0.8), Inches(0.8), Inches(1.65)]
+    # Column widths
+    widths = [Inches(1.2), Inches(1.2), Inches(0.55), Inches(0.55),
+              Inches(0.55), Inches(0.55), Inches(0.65)]
     for row_obj in table.rows:
         for i, cell in enumerate(row_obj.cells):
             cell.width = widths[i]
