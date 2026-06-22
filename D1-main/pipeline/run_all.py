@@ -927,7 +927,7 @@ def main():
     parser = argparse.ArgumentParser(description="LOE Pipeline orchestrator")
     parser.add_argument(
         "--mode",
-        choices=["all", "patents", "post-patents", "forecast", "ipd", "reports", "refresh-scores", "blocking", "step6-reports", "forecast-reports", "ipd3-rerun"],
+        choices=["all", "patents", "post-patents", "forecast", "ipd", "ipd-reports", "reports", "refresh-scores", "blocking", "step6-reports", "forecast-reports", "ipd3-rerun"],
         default=os.getenv("PIPELINE_MODE", "all"),
         help=(
             "all              = full pipeline (single-task only; multi-task auto-downgrades to patents)\n"
@@ -1106,6 +1106,11 @@ def main():
 
     elif args.mode == "ipd":
         run_ipd(drugs, args.workers, args.dry_run, resume=args.resume)
+
+    elif args.mode == "ipd-reports":
+        # IPD + reports only — assumes Master_LOE is already populated
+        run_ipd(drugs, args.workers, args.dry_run, resume=args.resume)
+        run_reports(drugs, args.workers, args.dry_run, resume=args.resume)
 
     elif args.mode == "reports":
         run_reports(drugs, args.workers, args.dry_run, resume=args.resume)
