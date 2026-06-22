@@ -98,6 +98,14 @@ GCS_BUCKET    = "cognito-gcs"
 GCS_BASE_PATH = "Cognito_new/reports"
 GCS_FILE_NAME = "Patent_Strength_Analysis.pdf"
 
+SCORE_LABEL = {
+    1: "Very Robust",
+    2: "Robust",
+    3: "Moderate",
+    4: "Vulnerable",
+    5: "Highly Vulnerable",
+}
+
 REPORT_TITLE = "Patent Strength Scoring Analysis"
 
 
