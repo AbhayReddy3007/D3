@@ -886,7 +886,7 @@ def write_circumvention_to_bq(circumvention_by_drug: dict):
                 if bq_type in ("STRING",):
                     df_circ[col] = df_circ[col].astype(str).replace({"None": None, "nan": None, "NaN": None})
                 elif bq_type in ("INTEGER", "INT64"):
-                    df_circ[col] = pd.to_numeric(df_circ[col], errors="coerce").astype("Int64")
+                    df_circ[col] = pd.to_numeric(df_circ[col], errors="coerce").round(0).astype("Int64")
                 elif bq_type in ("FLOAT", "FLOAT64", "NUMERIC"):
                     df_circ[col] = pd.to_numeric(df_circ[col], errors="coerce")
     except Exception as e:
@@ -1004,7 +1004,7 @@ def write_score_to_bq(drug_scores: list, refresh=False):
                 if bq_type in ("STRING",):
                     df_score[col] = df_score[col].astype(str).replace({"None": None, "nan": None, "NaN": None})
                 elif bq_type in ("INTEGER", "INT64"):
-                    df_score[col] = pd.to_numeric(df_score[col], errors="coerce").astype("Int64")
+                    df_score[col] = pd.to_numeric(df_score[col], errors="coerce").round(0).astype("Int64")
                 elif bq_type in ("FLOAT", "FLOAT64", "NUMERIC"):
                     df_score[col] = pd.to_numeric(df_score[col], errors="coerce")
     except Exception as e:
