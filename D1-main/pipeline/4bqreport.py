@@ -10,6 +10,12 @@ Title Case names used throughout the report generation logic.
 
 API key read from .env  →  GEMINI_API_KEY
 Model: gemini-2.5-flash
+
+PDF conversion: LibreOffice (headless) — preserves all python-docx colors,
+cell backgrounds, and borders faithfully.
+
+Docker/Cloud Run setup:
+  RUN apt-get update && apt-get install -y libreoffice --no-install-recommends
 """
 
 import os
@@ -17,6 +23,7 @@ import sys
 import io
 import re
 import time
+import subprocess
 import tempfile
 from datetime import date
 
@@ -30,7 +37,7 @@ try:
     from dotenv import load_dotenv
 except ImportError:
     load_dotenv = lambda **kw: None  # Not needed on Cloud Run
-# google.generativeai is deprecated. Use google.genai (new SDK) only.
+
 from google import genai
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -46,76 +53,69 @@ from docx.oxml import OxmlElement
 # ═══════════════════════════════════════════════════════════════════════════
 #  BIGQUERY CONFIG
 # ═══════════════════════════════════════════════════════════════════════════
-BQ_PROJECT_ID  = "cognito-prod-394707"
-BQ_DATASET_ID  = "cognito_prod_datamart"
-BQ_TABLE_ID    = "Master_LOE"          # not used directly; kept for reference
+BQ_PROJECT_ID    = "cognito-prod-394707"
+BQ_DATASET_ID    = "cognito_prod_datamart"
+BQ_TABLE_ID      = "Master_LOE"          # not used directly; kept for reference
 CREDENTIALS_PATH = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
-BQ_LOCATION    = "asia-south1"
+BQ_LOCATION      = "asia-south1"
 
-# Table names
 SHORTLISTED_TABLE = "shortlisted_secondary_patents_table"
 ARBITRAGE_TABLE   = "arbitrage_summary_table"
 
-# ── snake_case  →  Title Case column mappings ─────────────────────────────
 SHORTLISTED_COL_MAP = {
-    "drug_name":                    "Drug Name",
-    "jurisdiction":                 "Jurisdiction",
-    "patent_number":                "Patent Number",
-    "step_1_claim_category":        "Step 1 Claim Category",
-    "adjusted_expiry_with_pte":     "Adjusted Expiry (with PTE)",
-    "expiry_gap_years":             "Expiry Gap (Years)",
-    "pte_status":                   "PTE Status",
-    "pte_months_granted":           "PTE Months (Granted)",
+    "drug_name":                "Drug Name",
+    "jurisdiction":             "Jurisdiction",
+    "patent_number":            "Patent Number",
+    "step_1_claim_category":    "Step 1 Claim Category",
+    "adjusted_expiry_with_pte": "Adjusted Expiry (with PTE)",
+    "expiry_gap_years":         "Expiry Gap (Years)",
+    "pte_status":               "PTE Status",
+    "pte_months_granted":       "PTE Months (Granted)",
 }
 
 ARBITRAGE_COL_MAP = {
-    "drug_name":                    "Drug Name",
-    "jurisdiction":                 "Jurisdiction",
-    "dimension_iv_score":           "Dimension IV Score",
-    "dimension_iv_rating":          "Dimension IV Rating",
-    "product_loe_year":             "Product LOE (Year)",
-    "gap_vs_us_years":              "Gap vs US (Years)",
-    "gap_vs_longest_loe_years":     "Gap vs Longest LOE (Years)",
-    "key_protection_gap":           "Key Protection Gap",
-    "arbitrage_score":              "Arbitrage Score",
-    "arbitrage_signal":             "Arbitrage Signal",
-    "rationale":                    "Rationale",
-    "created_at":                   "Created At",
-    "updated_at":                   "Updated At",
+    "drug_name":                "Drug Name",
+    "jurisdiction":             "Jurisdiction",
+    "dimension_iv_score":       "Dimension IV Score",
+    "dimension_iv_rating":      "Dimension IV Rating",
+    "product_loe_year":         "Product LOE (Year)",
+    "gap_vs_us_years":          "Gap vs US (Years)",
+    "gap_vs_longest_loe_years": "Gap vs Longest LOE (Years)",
+    "key_protection_gap":       "Key Protection Gap",
+    "arbitrage_score":          "Arbitrage Score",
+    "arbitrage_signal":         "Arbitrage Signal",
+    "rationale":                "Rationale",
+    "created_at":               "Created At",
+    "updated_at":               "Updated At",
 }
 
 
-
 # ═══════════════════════════════════════════════════════════════════════════
-#  BIGQUERY SCHEMA MIGRATION  —  create columns if absent
+#  BIGQUERY SCHEMA MIGRATION
 # ═══════════════════════════════════════════════════════════════════════════
 def _ensure_arbitrage_columns(client: bigquery.Client) -> None:
     """
-    Add 'rationale' (STRING), 'created_at' (TIMESTAMP), and 'updated_at'
-    (TIMESTAMP) columns to arbitrage_summary_table if they do not already
-    exist, then populate them appropriately.
+    Add rationale (STRING), created_at (TIMESTAMP), and updated_at (TIMESTAMP)
+    columns to arbitrage_summary_table if they do not already exist, then
+    populate them appropriately.
 
-    - created_at  : set once (first run) and never overwritten.
-    - updated_at  : set to CURRENT_TIMESTAMP() on every run.
+    created_at : set once (first run) and never overwritten.
+    updated_at : set to CURRENT_TIMESTAMP() on every run.
     """
     full_table = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{ARBITRAGE_TABLE}"
 
-    # Fetch current schema
-    table = client.get_table(full_table)
+    table    = client.get_table(full_table)
     existing = {f.name for f in table.schema}
 
     ddl_statements = []
-
     if "rationale" not in existing:
         ddl_statements.append(
             f"ALTER TABLE `{full_table}` ADD COLUMN IF NOT EXISTS rationale STRING"
         )
-
     if "created_at" not in existing:
         ddl_statements.append(
             f"ALTER TABLE `{full_table}` ADD COLUMN IF NOT EXISTS created_at TIMESTAMP"
         )
-
     if "updated_at" not in existing:
         ddl_statements.append(
             f"ALTER TABLE `{full_table}` ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP"
@@ -126,111 +126,83 @@ def _ensure_arbitrage_columns(client: bigquery.Client) -> None:
         client.query(stmt).result()
         print(f"           ✓ Done")
 
-    # Populate rationale where NULL
-    update_rationale = f"""
+    client.query(f"""
         UPDATE `{full_table}`
         SET rationale = CONCAT(
             'Arbitrage Score is ', CAST(arbitrage_score AS STRING),
             ' because of ', CAST(arbitrage_signal AS STRING)
         )
         WHERE rationale IS NULL
-    """
-    print("  [BQ] Populating rationale column …")
-    client.query(update_rationale).result()
-    print("       ✓ rationale populated")
+    """).result()
+    print("  [BQ] ✓ rationale populated")
 
-    # Populate created_at only where NULL (i.e. first time this row is seen)
-    update_created_at = f"""
+    client.query(f"""
         UPDATE `{full_table}`
         SET created_at = CURRENT_TIMESTAMP()
         WHERE created_at IS NULL
-    """
-    print("  [BQ] Populating created_at column (first-run rows only) …")
-    client.query(update_created_at).result()
-    print("       ✓ created_at populated")
+    """).result()
+    print("  [BQ] ✓ created_at populated (first-run rows only)")
 
-    # Always refresh updated_at to reflect the current run
-    update_updated_at = f"""
+    client.query(f"""
         UPDATE `{full_table}`
         SET updated_at = CURRENT_TIMESTAMP()
         WHERE TRUE
-    """
-    print("  [BQ] Refreshing updated_at column (all rows) …")
-    client.query(update_updated_at).result()
-    print("       ✓ updated_at refreshed")
+    """).result()
+    print("  [BQ] ✓ updated_at refreshed")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  BIGQUERY LOADER
 # ═══════════════════════════════════════════════════════════════════════════
 def _get_credentials():
-    """Get credentials: use service account file if available, else default (Cloud Run)."""
     if CREDENTIALS_PATH and os.path.exists(CREDENTIALS_PATH):
         return service_account.Credentials.from_service_account_file(CREDENTIALS_PATH)
-    return None  # Use ADC (Application Default Credentials)
+    return None  # Use ADC on Cloud Run
+
 
 def _get_bq_client() -> bigquery.Client:
-    """Return an authenticated BigQuery client."""
-    credentials = _get_credentials()
     return bigquery.Client(
         project=BQ_PROJECT_ID,
-        credentials=credentials,
+        credentials=_get_credentials(),
         location=BQ_LOCATION,
     )
 
 
 def _load_table(client: bigquery.Client, table_name: str) -> pd.DataFrame:
-    """Load an entire BQ table into a DataFrame (all columns as strings)."""
     full_ref = f"`{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}`"
-    query    = f"SELECT DISTINCT * FROM {full_ref}"
     print(f"  [BQ] Querying {full_ref} …")
-    df = client.query(query).to_dataframe().astype(str)
-    # Replace literal "None" / "nan" strings with proper NaN
+    df = client.query(f"SELECT DISTINCT * FROM {full_ref}").to_dataframe().astype(str)
     df.replace({"None": pd.NA, "nan": pd.NA, "<NA>": pd.NA}, inplace=True)
     print(f"       → {len(df)} rows, columns: {list(df.columns)}")
     return df
 
 
 def _rename_columns(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
-    """
-    Rename snake_case BQ columns to Title Case display names.
-    Only renames columns that exist; unknown columns are left as-is.
-    """
     existing_map = {k: v for k, v in col_map.items() if k in df.columns}
     df = df.rename(columns=existing_map)
-
-    # Warn about expected columns that were missing in the table
     missing = [v for k, v in col_map.items() if k not in existing_map]
     if missing:
-        print(f"  ⚠  The following expected columns were NOT found in BQ: {missing}")
+        print(f"  ⚠  Columns NOT found in BQ: {missing}")
     return df
 
 
 def load_data_from_bigquery() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Returns (shortlisted_df, arbitrage_df) with Title Case columns,
-    ready for the report generation functions.
-    """
     client = _get_bq_client()
 
-    # Ensure rationale + created_at + updated_at columns exist in BQ
     print("  Ensuring arbitrage table schema …")
     _ensure_arbitrage_columns(client)
 
-    # Shortlisted
     sl_raw = _load_table(client, SHORTLISTED_TABLE)
     sl_df  = _rename_columns(sl_raw, SHORTLISTED_COL_MAP)
     sl_df.columns = sl_df.columns.str.strip()
 
-    # Arbitrage Summary
     arb_raw = _load_table(client, ARBITRAGE_TABLE)
     arb_df  = _rename_columns(arb_raw, ARBITRAGE_COL_MAP)
     arb_df.columns = arb_df.columns.str.strip()
 
-    print(f"\n  ✓ Shortlisted  : {len(sl_df)} rows | "
+    print(f"\n  ✓ Shortlisted : {len(sl_df)} rows | "
           f"{sl_df['Drug Name'].nunique() if 'Drug Name' in sl_df.columns else '?'} drug(s)")
-    print(f"  ✓ Arbitrage    : {len(arb_df)} rows")
-
+    print(f"  ✓ Arbitrage   : {len(arb_df)} rows")
     return sl_df, arb_df
 
 
@@ -238,14 +210,11 @@ def load_data_from_bigquery() -> tuple[pd.DataFrame, pd.DataFrame]:
 #  GEMINI SETUP
 # ═══════════════════════════════════════════════════════════════════════════
 load_dotenv(override=True)
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL  = "gemini-2.5-flash"
 _genai_client = None
 
 
 def _get_genai_client():
-    """Lazily create the Gemini client so importing this module doesn't
-    crash when GEMINI_API_KEY is unset (the friendly check in main() then
-    handles it gracefully)."""
     global _genai_client
     if _genai_client is None:
         api_key = os.getenv("GEMINI_API_KEY")
@@ -298,10 +267,10 @@ RATING_HEX = {
     "FAIL — No viable geographic arbitrage":        "E74C3C",
 }
 JUR_FULL = {
-    "CN": "China", "IN": "India", "BR": "Brazil",
-    "AU": "Australia", "RU": "Russia", "US": "United States",
-    "JP": "Japan", "KR": "South Korea", "TW": "Taiwan",
-    "CA": "Canada", "MX": "Mexico",
+    "CN": "China",        "IN": "India",       "BR": "Brazil",
+    "AU": "Australia",    "RU": "Russia",      "US": "United States",
+    "JP": "Japan",        "KR": "South Korea", "TW": "Taiwan",
+    "CA": "Canada",       "MX": "Mexico",
 }
 
 
@@ -362,9 +331,9 @@ def _make_header_cell(cell, text):
     p   = cell.paragraphs[0]
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = p.add_run(str(text))
-    run.bold = True
+    run.bold           = True
     run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-    run.font.size = Pt(9)
+    run.font.size      = Pt(9)
     cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
 
 
@@ -388,9 +357,9 @@ def _signal_cell(cell, signal_text: str):
     p   = cell.paragraphs[0]
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = p.add_run(signal_text)
-    run.bold = True
+    run.bold           = True
     run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-    run.font.size = Pt(9)
+    run.font.size      = Pt(9)
     cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
 
 
@@ -405,9 +374,9 @@ def _score_cell(cell, score_val):
     p   = cell.paragraphs[0]
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = p.add_run(str(score_val))
-    run.bold = True
+    run.bold           = True
     run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-    run.font.size = Pt(9)
+    run.font.size      = Pt(9)
     cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
 
 
@@ -461,20 +430,20 @@ def _cover_page(doc, drug_name: str):
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = p.add_run(drug_name)
-    run.bold = True
-    run.font.size = Pt(26)
+    run.bold           = True
+    run.font.size      = Pt(26)
     run.font.color.rgb = BRAND_BLUE
-    run.font.name = "Calibri"
+    run.font.name      = "Calibri"
 
     doc.add_paragraph()
 
     p2 = doc.add_paragraph()
     p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run2 = p2.add_run("Global Launch Sequencing & Geographic Arbitrage Analysis")
-    run2.italic = True
-    run2.font.size = Pt(14)
+    run2.italic        = True
+    run2.font.size     = Pt(14)
     run2.font.color.rgb = ACCENT_BLUE
-    run2.font.name = "Calibri"
+    run2.font.name     = "Calibri"
 
     doc.add_paragraph()
     _set_para_border_bottom(doc.add_paragraph(), sz=16)
@@ -483,12 +452,12 @@ def _cover_page(doc, drug_name: str):
     p3 = doc.add_paragraph()
     p3.alignment = WD_ALIGN_PARAGRAPH.CENTER
     r1 = p3.add_run("Report Date:  ")
-    r1.bold = True
-    r1.font.size = Pt(12)
-    r1.font.name = "Calibri"
+    r1.bold       = True
+    r1.font.size  = Pt(12)
+    r1.font.name  = "Calibri"
     r2 = p3.add_run(date.today().strftime("%d %B %Y"))
-    r2.font.size = Pt(12)
-    r2.font.name = "Calibri"
+    r2.font.size      = Pt(12)
+    r2.font.name      = "Calibri"
     r2.font.color.rgb = BRAND_BLUE
 
     _page_break(doc)
@@ -512,7 +481,7 @@ def _build_drug_narrative_prompt(drug, drug_sl, drug_arb) -> str:
             f" | PTE: {pte_st} ({pte_m} months)"
         )
 
-    arb_lines = []
+    arb_lines   = []
     dim4_score  = "N/A"
     dim4_rating = "N/A"
     if not drug_arb.empty:
@@ -538,9 +507,9 @@ def _build_drug_narrative_prompt(drug, drug_sl, drug_arb) -> str:
         for _, r in drug_arb.iterrows():
             jurs_in_data.add(str(r.get("Jurisdiction", "")))
 
-    all_target_jurs   = {"CN", "IN", "BR", "AU", "RU", "US", "CA", "JP", "MX", "TW", "KR"}
-    jurs_present      = jurs_in_data & all_target_jurs
-    jurs_full_names   = ", ".join(sorted(JUR_FULL.get(j, j) for j in all_target_jurs))
+    all_target_jurs     = {"CN", "IN", "BR", "AU", "RU", "US", "CA", "JP", "MX", "TW", "KR"}
+    jurs_present        = jurs_in_data & all_target_jurs
+    jurs_full_names     = ", ".join(sorted(JUR_FULL.get(j, j) for j in all_target_jurs))
     jurs_analysed_names = ", ".join(sorted(JUR_FULL.get(j, j) for j in jurs_present))
 
     return f"""
@@ -679,9 +648,9 @@ def _render_narrative(doc, narrative: str):
 def _patent_expiry_summary(doc, drug_sl: pd.DataFrame):
     p   = doc.add_paragraph()
     run = p.add_run("Patent Expiry Summary")
-    run.bold = True
-    run.font.size = Pt(11)
-    run.font.name = "Calibri"
+    run.bold           = True
+    run.font.size      = Pt(11)
+    run.font.name      = "Calibri"
     run.font.color.rgb = BRAND_BLUE
     _set_para_border_bottom(p, sz=6)
 
@@ -709,7 +678,7 @@ def _patent_expiry_summary(doc, drug_sl: pd.DataFrame):
         for c_idx, col in enumerate(exp_cols):
             _make_data_cell(row.cells[c_idx], row_data[col], bg=bg)
 
-    exp_widths = [0.8, 1.8, 1.4, 1.0, 1.2, 1.1][:len(exp_cols)]
+    exp_widths = [1.2, 1.0, 1.4, 1.2, 1.0, 1.0, 1.0][:len(exp_cols)]
     for ci, w in enumerate(exp_widths):
         for cell in etbl.columns[ci].cells:
             cell.width = Inches(w)
@@ -718,113 +687,143 @@ def _patent_expiry_summary(doc, drug_sl: pd.DataFrame):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  PDF CONVERSION & GCS UPLOAD
+#  PDF CONVERSION  —  LibreOffice (headless)
 # ═══════════════════════════════════════════════════════════════════════════
-def convert_docx_to_pdf(docx_path: str) -> str:
-    """Convert a .docx file to PDF.
-
-    Primary path (cross-platform, works on Windows/Linux/macOS and inside the
-    Docker/Cloud Run container):
-        mammoth   — converts .docx → HTML  (preserves structure)
-        xhtml2pdf — renders HTML → PDF     (pure pip, no system deps)
-
-    Fallback path (only used if mammoth/xhtml2pdf are unavailable AND a local
-    Word/LibreOffice bridge exists): docx2pdf. Note that docx2pdf requires
-    Microsoft Word (Windows COM / macOS AppleScript) and therefore does NOT
-    work on a headless Linux container, which is why it is no longer the
-    default.
-
-    Install:
-        pip install mammoth xhtml2pdf --break-system-packages
-
-    Returns the path to the generated PDF.
+def _find_libreoffice() -> str:
     """
-    pdf_path = os.path.splitext(docx_path)[0] + ".pdf"
+    Return the path to the LibreOffice binary, trying common locations.
+    Raises RuntimeError if not found.
+    """
+    candidates = [
+        "libreoffice",           # on PATH (Linux/Cloud Run after apt install)
+        "soffice",               # alternate name
+        "/usr/bin/libreoffice",
+        "/usr/bin/soffice",
+        "/usr/lib/libreoffice/program/soffice",
+        # macOS
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        # Windows
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+    ]
+    for cmd in candidates:
+        try:
+            result = subprocess.run(
+                [cmd, "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                return cmd
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    raise RuntimeError(
+        "LibreOffice not found. Install it with:\n"
+        "  Linux/Cloud Run : apt-get install -y libreoffice --no-install-recommends\n"
+        "  macOS           : brew install --cask libreoffice\n"
+        "  Windows         : https://www.libreoffice.org/download/download/"
+    )
 
-    # ── Primary: mammoth + xhtml2pdf (cross-platform) ─────────────────────────
-    try:
-        import mammoth
-        from xhtml2pdf import pisa
-    except ImportError:
-        mammoth = None
-        pisa = None
 
-    if mammoth is not None and pisa is not None:
-        style_map = """
-            p[style-name='Heading 2'] => h2:fresh
-            r[style-name='Strong']    => strong
-        """
-        with open(docx_path, "rb") as f:
-            raw_html = mammoth.convert_to_html(f, style_map=style_map).value
+def convert_docx_to_pdf(docx_path: str) -> str:
+    """
+    Convert a .docx file to PDF using LibreOffice in headless mode.
 
-        full_html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  @page {{ margin: 1.8cm 2cm 2cm 2cm; }}
-  body  {{ font-family: Arial, sans-serif; font-size: 9pt; color: #222; margin:0; padding:0; }}
-  h1    {{ color: #1F3864; font-size: 14pt; border-bottom: 3px solid #2F5496; padding-bottom:4px; }}
-  h2    {{ color: #2F5496; font-size: 11pt; border-bottom: 1px solid #2F5496; padding-bottom:2px; margin:10px 0 3px 0; }}
-  p     {{ margin: 0 0 5px 0; line-height: 1.35; text-align: justify; }}
-  ul    {{ margin: 2px 0 6px 0; padding-left: 18px; }}
-  li    {{ margin-bottom: 2px; line-height: 1.3; }}
-  table {{ border-collapse: collapse; width: 100%; margin: 5px 0 8px 0; font-size: 8.5pt; }}
-  th    {{ background: #2F5496; color: #ffffff; font-weight: bold; text-align: center; padding: 4px 6px; border: 1px solid #2F5496; }}
-  td    {{ border: 1px solid #CCCCCC; padding: 4px 6px; vertical-align: top; }}
-  hr    {{ border: none; border-bottom: 2px solid #2F5496; margin: 10px 0 6px 0; }}
-</style>
-</head>
-<body>
-{raw_html}
-</body>
-</html>"""
+    LibreOffice is the only cross-platform backend that faithfully preserves
+    python-docx formatting — cell background colours (w:shd), custom font
+    colours, table borders, and embedded images all survive the conversion.
 
-        with open(pdf_path, "wb") as pdf_file:
-            result = pisa.CreatePDF(full_html.encode("utf-8"), dest=pdf_file,
-                                    encoding="utf-8")
-        if result.err:
-            raise RuntimeError(f"xhtml2pdf conversion error code: {result.err}")
-        if not os.path.exists(pdf_path):
-            raise RuntimeError(f"PDF not created at expected path: {pdf_path}")
-        return pdf_path
+    The mammoth + xhtml2pdf pipeline that was used previously strips all
+    Word XML formatting, which is why the generated PDFs had no colours.
 
-    # ── Fallback: docx2pdf (Windows/macOS with Word only) ─────────────────────
-    try:
-        from docx2pdf import convert as _docx2pdf_convert
-    except ImportError:
-        raise RuntimeError(
-            "No DOCX→PDF backend available.\n"
-            "Install the cross-platform backend with:\n"
-            "  pip install mammoth xhtml2pdf --break-system-packages"
+    Returns the path to the generated PDF file.
+
+    Docker / Cloud Run  — add to your Dockerfile:
+        RUN apt-get update && apt-get install -y libreoffice --no-install-recommends
+    """
+    lo_bin     = _find_libreoffice()
+    output_dir = os.path.dirname(os.path.abspath(docx_path))
+    pdf_path   = os.path.splitext(docx_path)[0] + ".pdf"
+
+    # LibreOffice writes to the same directory as the input file by default.
+    # We use a private --user-installation temp dir so parallel runs don't
+    # collide on the shared LibreOffice profile directory.
+    with tempfile.TemporaryDirectory(prefix="lo_profile_") as lo_profile:
+        cmd = [
+            lo_bin,
+            f"-env:UserInstallation=file://{lo_profile}",
+            "--headless",
+            "--norestore",
+            "--nofirststartwizard",
+            "--convert-to", "pdf",
+            "--outdir", output_dir,
+            os.path.abspath(docx_path),
+        ]
+        print(f"      [LO] {' '.join(cmd)}")
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=180,
         )
 
-    _docx2pdf_convert(docx_path, pdf_path)
+    stdout = result.stdout.decode("utf-8", errors="replace").strip()
+    stderr = result.stderr.decode("utf-8", errors="replace").strip()
+
+    if stdout:
+        print(f"      [LO stdout] {stdout}")
+    if stderr:
+        print(f"      [LO stderr] {stderr}")
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"LibreOffice exited with code {result.returncode}.\n"
+            f"stdout: {stdout}\nstderr: {stderr}"
+        )
+
     if not os.path.exists(pdf_path):
-        raise RuntimeError(f"PDF not created at expected path: {pdf_path}")
+        # LibreOffice sometimes sanitises the filename; search for any PDF
+        base    = os.path.splitext(os.path.basename(docx_path))[0]
+        matches = [
+            f for f in os.listdir(output_dir)
+            if f.endswith(".pdf") and base.lower() in f.lower()
+        ]
+        if matches:
+            pdf_path = os.path.join(output_dir, matches[0])
+        else:
+            raise RuntimeError(
+                f"PDF not found after LibreOffice conversion.\n"
+                f"Expected: {pdf_path}\n"
+                f"Files in output dir: {os.listdir(output_dir)}"
+            )
+
     return pdf_path
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  GCS UPLOAD
+# ═══════════════════════════════════════════════════════════════════════════
 def upload_to_gcs(local_pdf: str, drug_name: str,
                   bucket_name: str = "cognito-gcs") -> str:
-    """Upload PDF to gs://{bucket_name}/Cognito_new/reports/{drug_name}/Loe_Report(Secondary_Market).pdf
-    Returns the full GCS URI."""
+    """
+    Upload PDF to:
+        gs://{bucket_name}/Cognito_new/reports/{drug_name}/Loe_Report(Secondary_Market).pdf
+    Returns the full GCS URI.
+    """
     try:
         from google.cloud import storage
     except ImportError:
         raise RuntimeError(
             "google-cloud-storage not installed.\n"
-            "Run: pip install google-cloud-storage --break-system-packages"
+            "Run: pip install google-cloud-storage"
         )
 
     safe_drug = drug_name.replace("/", "_").replace(" ", "_")
     blob_name = f"Cognito_new/reports/{safe_drug}/Loe_Report(Secondary_Market).pdf"
 
-    credentials = _get_credentials()
-    client = storage.Client(project=BQ_PROJECT_ID, credentials=credentials)
-
-    bucket = client.bucket(bucket_name)
-    blob   = bucket.blob(blob_name)
+    client = storage.Client(project=BQ_PROJECT_ID, credentials=_get_credentials())
+    blob   = client.bucket(bucket_name).blob(blob_name)
     blob.upload_from_filename(local_pdf, content_type="application/pdf")
 
     gcs_uri = f"gs://{bucket_name}/{blob_name}"
@@ -838,10 +837,10 @@ def upload_to_gcs(local_pdf: str, drug_name: str,
 def _build_drug_report(drug, drug_sl, drug_arb, output_dir):
     doc = _setup_document()
 
-    # Cover
+    # ── Cover ──────────────────────────────────────────────────────────────
     _cover_page(doc, drug)
 
-    # Dimension IV badge
+    # ── Dimension IV badge ─────────────────────────────────────────────────
     if not drug_arb.empty:
         dim4_score  = drug_arb["Dimension IV Score"].iloc[0]
         dim4_rating = drug_arb["Dimension IV Rating"].iloc[0]
@@ -854,33 +853,47 @@ def _build_drug_report(drug, drug_sl, drug_arb, output_dir):
         _set_cell_bg(c0, HEADER_HEX)
         _set_cell_border(c0, top=BORDER_OPTS, bottom=BORDER_OPTS,
                          left=BORDER_OPTS, right=BORDER_OPTS)
-        p   = c0.paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p   = c0.paragraphs[0]
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run("Dimension IV Score")
-        run.bold = True; run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-        run.font.size = Pt(10); c0.width = Inches(1.8)
+        run.bold           = True
+        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+        run.font.size      = Pt(10)
+        c0.width           = Inches(1.8)
 
         c1 = badge.rows[0].cells[1]
         _set_cell_bg(c1, rating_hex)
         _set_cell_border(c1, top=BORDER_OPTS, bottom=BORDER_OPTS,
                          left=BORDER_OPTS, right=BORDER_OPTS)
-        p   = c1.paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p   = c1.paragraphs[0]
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run(f"{dim4_score}  —  {dim4_rating}")
-        run.bold = True; run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-        run.font.size = Pt(10); c1.width = Inches(4.5)
+        run.bold           = True
+        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+        run.font.size      = Pt(10)
+        c1.width           = Inches(4.5)
 
         doc.add_paragraph()
 
-    # Geographic Arbitrage Map Table
+    # ── Geographic Arbitrage Map ───────────────────────────────────────────
     if not drug_arb.empty:
         p   = doc.add_paragraph()
         run = p.add_run("Geographic Arbitrage Map")
-        run.bold = True; run.font.size = Pt(11)
-        run.font.name = "Calibri"; run.font.color.rgb = BRAND_BLUE
+        run.bold           = True
+        run.font.size      = Pt(11)
+        run.font.name      = "Calibri"
+        run.font.color.rgb = BRAND_BLUE
         _set_para_border_bottom(p, sz=6)
 
-        arb_cols = ["Jurisdiction", "Product LOE (Year)", "Gap vs US (Years)",
-                    "Gap vs Longest LOE (Years)", "Key Protection Gap",
-                    "Arbitrage Score", "Arbitrage Signal"]
+        arb_cols = [
+            "Jurisdiction",
+            "Product LOE (Year)",
+            "Gap vs US (Years)",
+            "Gap vs Longest LOE (Years)",
+            "Key Protection Gap",
+            "Arbitrage Score",
+            "Arbitrage Signal",
+        ]
         arb_cols = [c for c in arb_cols if c in drug_arb.columns]
         arb_show = drug_arb[arb_cols].copy()
 
@@ -888,9 +901,12 @@ def _build_drug_report(drug, drug_sl, drug_arb, output_dir):
         score_idx = arb_cols.index("Arbitrage Score")  if "Arbitrage Score"  in arb_cols else -1
 
         atbl = doc.add_table(rows=1 + len(arb_show), cols=len(arb_cols))
-        atbl.style = "Table Grid"; atbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+        atbl.style     = "Table Grid"
+        atbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+
         for i, h in enumerate(arb_cols):
             _make_header_cell(atbl.rows[0].cells[i], h)
+
         for r_idx, (_, row_data) in enumerate(arb_show.iterrows()):
             bg  = LIGHT_BLUE_HEX if r_idx % 2 == 0 else WHITE_HEX
             row = atbl.rows[r_idx + 1]
@@ -903,21 +919,25 @@ def _build_drug_report(drug, drug_sl, drug_arb, output_dir):
                     _score_cell(cell, val)
                 else:
                     _make_data_cell(cell, val, bg=bg)
+
         arb_widths = [1.0, 1.1, 1.0, 1.1, 2.0, 0.9, 1.2][:len(arb_cols)]
         for ci, w in enumerate(arb_widths):
             for cell in atbl.columns[ci].cells:
                 cell.width = Inches(w)
+
         doc.add_paragraph()
 
         fig = _chart_drug_loe(drug, drug_arb)
         if fig:
             _fig_to_docx(doc, fig, width_inches=5.0)
 
-    # LLM Narrative
+    # ── LLM Narrative ─────────────────────────────────────────────────────
     p   = doc.add_paragraph()
     run = p.add_run("Analysis")
-    run.bold = True; run.font.size = Pt(11)
-    run.font.name = "Calibri"; run.font.color.rgb = BRAND_BLUE
+    run.bold           = True
+    run.font.size      = Pt(11)
+    run.font.name      = "Calibri"
+    run.font.color.rgb = BRAND_BLUE
     _set_para_border_bottom(p, sz=6)
 
     prompt    = _build_drug_narrative_prompt(drug, drug_sl, drug_arb)
@@ -925,7 +945,7 @@ def _build_drug_report(drug, drug_sl, drug_arb, output_dir):
     time.sleep(1)
     _render_narrative(doc, narrative)
 
-    # Patent Expiry Summary (last)
+    # ── Patent Expiry Summary (new page) ──────────────────────────────────
     _page_break(doc)
     _patent_expiry_summary(doc, drug_sl)
 
@@ -935,40 +955,31 @@ def _build_drug_report(drug, drug_sl, drug_arb, output_dir):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  TERMINAL HELPERS
-# ═══════════════════════════════════════════════════════════════════════════
-def _get_output_dir() -> str:
-    while True:
-        path = input("\nEnter output DIRECTORY for per-drug reports: ").strip().strip('"').strip("'")
-        if not path:
-            print("  ✗ Path cannot be empty."); continue
-        if not os.path.isdir(path):
-            try:
-                os.makedirs(path, exist_ok=True)
-                print(f"  ✓ Created: {path}")
-            except OSError as e:
-                print(f"  ✗ Cannot create directory: {e}"); continue
-        else:
-            print(f"  ✓ Output dir: {path}")
-        return path
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════════════
 def main():
     print("=" * 60)
     print("  IPD PER-DRUG REPORT GENERATOR  —  Gemini 2.5 Flash")
-    print("  Data source: Google BigQuery")
-    print("  Output     : gs://cognito-gcs/Cognito_new/reports/{drug_name}/Loe_Report(Secondary_Market).pdf")
+    print("  Data source : Google BigQuery")
+    print("  PDF backend : LibreOffice (headless)")
+    print("  Output      : gs://cognito-gcs/Cognito_new/reports/"
+          "{drug_name}/Loe_Report(Secondary_Market).pdf")
     print("=" * 60)
 
     if not os.getenv("GEMINI_API_KEY"):
         print("  ✗ GEMINI_API_KEY not set — aborting.")
         sys.exit(1)
 
-    # Load data from BigQuery
-    print("\n  Loading data from BigQuery…")
+    # Verify LibreOffice is available before doing any heavy work
+    print("\n  Checking LibreOffice …", end=" ", flush=True)
+    try:
+        lo_bin = _find_libreoffice()
+        print(f"found at '{lo_bin}'")
+    except RuntimeError as exc:
+        print(f"NOT FOUND\n  ✗ {exc}")
+        sys.exit(1)
+
+    print("\n  Loading data from BigQuery …")
     shortlisted, arb_df = load_data_from_bigquery()
 
     if shortlisted.empty:
@@ -976,12 +987,11 @@ def main():
         sys.exit(1)
 
     if "Drug Name" not in shortlisted.columns:
-        print("  ✗ 'drug_name' column not found in shortlisted table — check mapping.")
+        print("  ✗ 'drug_name' column not found in shortlisted table.")
         sys.exit(1)
 
-    # Generate one report per drug
     drugs = sorted(shortlisted["Drug Name"].dropna().unique())
-    print(f"\n  Generating {len(drugs)} report(s)…\n")
+    print(f"\n  Generating {len(drugs)} report(s) …\n")
 
     uploaded_uris = []
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -995,14 +1005,16 @@ def main():
                 else pd.DataFrame()
             )
 
-            # Build DOCX in a per-drug subfolder to avoid filename collisions
-            drug_tmp = os.path.join(tmpdir, re.sub(r'[^\w\s-]', '', drug).strip().replace(' ', '_'))
+            drug_tmp = os.path.join(
+                tmpdir,
+                re.sub(r"[^\w\s-]", "", drug).strip().replace(" ", "_"),
+            )
             os.makedirs(drug_tmp, exist_ok=True)
 
             docx_path = _build_drug_report(drug, drug_sl, drug_arb, drug_tmp)
-            print(f"      ✓ DOCX built")
+            print("      ✓ DOCX built")
 
-            print(f"      Converting to PDF …", end=" ", flush=True)
+            print("      Converting to PDF (LibreOffice) …", end=" ", flush=True)
             try:
                 pdf_path = convert_docx_to_pdf(docx_path)
                 print("done")
@@ -1010,18 +1022,18 @@ def main():
                 print(f"FAILED\n      ✗ {exc}")
                 continue
 
-            print(f"      Uploading to GCS …", end=" ", flush=True)
+            print("      Uploading to GCS …", end=" ", flush=True)
             try:
                 uri = upload_to_gcs(pdf_path, drug)
                 uploaded_uris.append(uri)
             except Exception as exc:
                 print(f"FAILED\n      ✗ {exc}")
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  ✓ Done — {len(uploaded_uris)}/{len(drugs)} PDF(s) uploaded")
     for uri in uploaded_uris:
         print(f"    {uri}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
 
 if __name__ == "__main__":
