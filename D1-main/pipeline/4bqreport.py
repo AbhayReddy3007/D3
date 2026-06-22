@@ -13,6 +13,13 @@ Model: gemini-2.5-flash
 """
 
 
+import os
+import sys
+import io
+import re
+import time
+import tempfile
+
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
