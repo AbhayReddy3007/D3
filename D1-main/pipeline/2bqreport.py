@@ -34,14 +34,50 @@ except ImportError:
 import pandas as pd
 from google.cloud import bigquery
 from google.oauth2 import service_account
-from docx import Document
-from docx.shared import Inches, Pt, Cm, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.oxml.ns import qn
+
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm, inch
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+    HRFlowable, PageBreak, ListFlowable, ListItem,
+)
 
 from google import genai as genai_client
 from google.genai import types
+
+# ── Reportlab color palette ───────────────────────────────────────────────────
+_NAVY       = colors.HexColor("#1F3864")
+_BLUE       = colors.HexColor("#2F5496")
+_LIGHT_BLUE = colors.HexColor("#D6E4F0")
+_LGREY      = colors.HexColor("#F2F2F2")
+_WHITE      = colors.white
+_RED        = colors.HexColor("#CC0000")
+_GREEN      = colors.HexColor("#008000")
+_GREY       = colors.HexColor("#666666")
+
+def _rl_styles():
+    b = getSampleStyleSheet()
+    return {
+        "title":  ParagraphStyle("T",  parent=b["Title"],    fontSize=18, leading=22, textColor=_NAVY, spaceAfter=2),
+        "meta":   ParagraphStyle("M",  parent=b["Normal"],   fontSize=9, leading=11, textColor=_GREY, spaceAfter=6),
+        "h1":     ParagraphStyle("H1", parent=b["Heading2"], fontSize=13, leading=16, textColor=_NAVY, spaceBefore=8, spaceAfter=4),
+        "h2":     ParagraphStyle("H2", parent=b["Heading3"], fontSize=11, leading=14, textColor=_NAVY, spaceBefore=6, spaceAfter=2),
+        "h3":     ParagraphStyle("H3", parent=b["Heading4"], fontSize=10, leading=12, textColor=_BLUE, spaceBefore=4, spaceAfter=2),
+        "body":   ParagraphStyle("BD", parent=b["Normal"],   fontSize=9, leading=12, alignment=TA_JUSTIFY, spaceAfter=4),
+        "bullet": ParagraphStyle("BU", parent=b["Normal"],   fontSize=9, leading=12, spaceAfter=2, leftIndent=18, bulletIndent=6),
+        "legend": ParagraphStyle("LG", parent=b["Normal"],   fontSize=7, leading=9, textColor=_GREY, spaceAfter=1),
+        "th":     ParagraphStyle("TH", parent=b["Normal"],   fontSize=8, leading=10, textColor=_WHITE, alignment=TA_CENTER),
+        "td":     ParagraphStyle("TD", parent=b["Normal"],   fontSize=8, leading=10, alignment=TA_CENTER),
+        "tdl":    ParagraphStyle("TL", parent=b["Normal"],   fontSize=8, leading=10, alignment=TA_LEFT),
+        "footer": ParagraphStyle("FT", parent=b["Normal"],   fontSize=7, leading=9, textColor=_GREY, alignment=TA_CENTER),
+    }
+
+_SCORE_CLR = {
+    1: "#008000", 2: "#4CAF50", 3: "#CC9900", 4: "#E65100", 5: "#CC0000",
+}
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # Loaded from environment / .env file
@@ -61,22 +97,6 @@ BQ_COUNTRY_SCORE_TABLE = "patent_strength_country_score_table"
 GCS_BUCKET    = "cognito-gcs"
 GCS_BASE_PATH = "Cognito_new/reports"
 GCS_FILE_NAME = "Patent_Strength_Analysis.pdf"
-
-SCORE_COLOR_MAP = {
-    1: RGBColor(0x00, 0x80, 0x00),  # Green
-    2: RGBColor(0x4C, 0xAF, 0x50),  # Light green
-    3: RGBColor(0xCC, 0x99, 0x00),  # Amber
-    4: RGBColor(0xE6, 0x51, 0x00),  # Orange-red
-    5: RGBColor(0xCC, 0x00, 0x00),  # Red
-}
-
-SCORE_LABEL = {
-    1: "Very Robust",
-    2: "Robust",
-    3: "Moderate",
-    4: "Vulnerable",
-    5: "Highly Vulnerable",
-}
 
 REPORT_TITLE = "Patent Strength Scoring Analysis"
 
@@ -601,70 +621,83 @@ def write_timestamps_to_bigquery(drug_names: list, ts: datetime = None) -> None:
 
 # ── Document builder ──────────────────────────────────────────────────────────
 
-def set_cell_shading(cell, hex_color: str):
-    """Apply background shading to a table cell."""
-    shading = cell._element.get_or_add_tcPr()
-    shading_el = shading.makeelement(qn("w:shd"), {
-        qn("w:fill"): hex_color,
-        qn("w:val"): "clear",
-    })
-    shading.append(shading_el)
 
+# ── Reportlab rendering helpers ───────────────────────────────────────────────
 
-def _build_hsp_table(doc, hsp: dict, shade_color: str = "F9EBEB"):
-    """Build and return a two-column info table for a highest-score patent dict."""
+_SCORE_CLR = {
+    1: "#008000", 2: "#4CAF50", 3: "#CC9900", 4: "#E65100", 5: "#CC0000",
+}
+
+def _hsp_table(story, hsp: dict, st: dict, W: float):
+    """Render a Highest-Score-Patent info box as a reportlab Table."""
     try:
         score_label = SCORE_LABEL.get(int(round(float(hsp.get("weighted_score", 0)))), "N/A")
     except (ValueError, TypeError):
         score_label = "N/A"
-
-    hsp_items = [
-        ("Patent Number",                       hsp.get("patent_number", "N/A")),
-        ("Drug Name",                            hsp.get("drug", "N/A")),
-        ("Patent Type",                          hsp.get("patent_type", "N/A")),
-        ("Jurisdiction",                         hsp.get("jurisdiction", "N/A")),
-        ("Weighted Final Score",
-         f"{hsp.get('weighted_score', 'N/A')} / 5.0  —  {score_label}"),
-        ("SF1 Score (Novelty)",                  str(hsp.get("sf1", "N/A"))),
-        ("SF2 Score (Obvious-to-Combine)",       str(hsp.get("sf2", "N/A"))),
-        ("SF3 Score (Prosecution History)",      str(hsp.get("sf3", "N/A"))),
-        ("SF4 Score (Secondary Considerations)", str(hsp.get("sf4", "N/A"))),
+    items = [
+        ("Patent Number",                  hsp.get("patent_number", "N/A")),
+        ("Drug Name",                       hsp.get("drug", "N/A")),
+        ("Patent Type",                     hsp.get("patent_type", "N/A")),
+        ("Jurisdiction",                    hsp.get("jurisdiction", "N/A")),
+        ("Weighted Final Score",            f"{hsp.get('weighted_score', 'N/A')} / 5.0 — {score_label}"),
+        ("SF1 (Novelty)",                   str(hsp.get("sf1", "N/A"))),
+        ("SF2 (Obvious-to-Combine)",        str(hsp.get("sf2", "N/A"))),
+        ("SF3 (Prosecution History)",       str(hsp.get("sf3", "N/A"))),
+        ("SF4 (Secondary Considerations)",  str(hsp.get("sf4", "N/A"))),
     ]
+    rows = [[Paragraph(f"<b>{lbl}</b>", st["tdl"]), Paragraph(val, st["td"])] for lbl, val in items]
+    t = Table(rows, colWidths=[W * 0.38, W * 0.62])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",  (0, 0), (0, -1), _LGREY),
+        ("BOX",         (0, 0), (-1, -1), 0.5, _BLUE),
+        ("INNERGRID",   (0, 0), (-1, -1), 0.25, colors.lightgrey),
+        ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING",  (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 3),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 6))
 
-    tbl = doc.add_table(rows=len(hsp_items), cols=2)
-    tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
-    tbl.style = "Table Grid"
 
-    for i, (label, value) in enumerate(hsp_items):
-        cell_l = tbl.rows[i].cells[0]
-        cell_l.text = ""
-        p = cell_l.paragraphs[0]
-        run = p.add_run(label)
-        run.bold = True
-        run.font.size = Pt(9)
-        set_cell_shading(cell_l, shade_color)
-
-        cell_r = tbl.rows[i].cells[1]
-        cell_r.text = ""
-        p = cell_r.paragraphs[0]
-        run = p.add_run(value)
-        run.font.size = Pt(9)
-        if label == "Weighted Final Score":
-            run.bold = True
-            run.font.color.rgb = RGBColor(0xCC, 0x00, 0x00)
-
-    for row_obj in tbl.rows:
-        row_obj.cells[0].width = Inches(2.5)
-        row_obj.cells[1].width = Inches(4.2)
-
-    return tbl
+def _rl_data_table(headers, data_rows, col_widths, st, score_col_indices=None):
+    """Build a reportlab Table with navy header row and optional score coloring."""
+    score_col_indices = score_col_indices or []
+    tbl_rows = [[Paragraph(f"<b>{h}</b>", st["th"]) for h in headers]]
+    for dr in data_rows:
+        row = []
+        for ci, val in enumerate(dr):
+            s = str(val) if pd.notna(val) and str(val) not in ("nan", "None") else "N/A"
+            if ci in score_col_indices:
+                try:
+                    sc = int(round(float(val)))
+                    clr = _SCORE_CLR.get(sc, "#333333")
+                    row.append(Paragraph(f'<font color="{clr}"><b>{s}</b></font>', st["td"]))
+                    continue
+                except (ValueError, TypeError):
+                    pass
+            row.append(Paragraph(s, st["td"]))
+        tbl_rows.append(row)
+    t = Table(tbl_rows, colWidths=col_widths, repeatRows=1)
+    t.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, 0), _NAVY),
+        ("TEXTCOLOR",     (0, 0), (-1, 0), _WHITE),
+        ("BOX",           (0, 0), (-1, -1), 0.5, _BLUE),
+        ("INNERGRID",     (0, 0), (-1, -1), 0.25, colors.lightgrey),
+        ("ROWBACKGROUNDS",(0, 1), (-1, -1), [_WHITE, _LGREY]),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING",    (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+    ]))
+    return t
 
 
 def build_report(data: dict, output_path: str):
-    """Build the Word document."""
+    """Build the PDF report directly using reportlab."""
+    from reportlab.lib.pagesizes import letter as _letter
     df_final = data["final"]
     if df_final.empty:
-        print("ERROR: patent_strength_table is empty or missing. Cannot generate report.")
+        print("ERROR: patent_strength_table is empty or missing.")
         return
 
     df_country    = data.get("country_scores", pd.DataFrame())
@@ -674,585 +707,173 @@ def build_report(data: dict, output_path: str):
     print("Generating narrative with Gemini 2.5 Flash...")
     narrative = generate_executive_summary(stats, df_final, country_stats)
 
-    # ── Stamp rationale column onto df_final ──────────────────────────────────
     per_drug_narratives = narrative.get("per_drug_narratives", {})
     df_final = apply_rationale_column(df_final, per_drug_narratives)
-    # Propagate the updated df back into data so callers can use it
     data["final"] = df_final
 
     print("Writing rationale back to BigQuery...")
     write_rationale_to_bigquery(per_drug_narratives)
+    print("Writing timestamps back to BigQuery...")
+    drug_names_list = df_final["Drug Name"].dropna().unique().tolist() if not df_final.empty else []
+    write_timestamps_to_bigquery(drug_names_list)
 
-    print("Writing timestamps (created_at / updated_at) back to BigQuery...")
-    drug_names = df_final["Drug Name"].dropna().unique().tolist() if not df_final.empty else []
-    write_timestamps_to_bigquery(drug_names)
-
-    doc = Document()
-
-    # ── Page setup ────────────────────────────────────────────────────────────
-    section = doc.sections[0]
-    section.page_width    = Inches(8.5)
-    section.page_height   = Inches(11)
-    section.top_margin    = Inches(0.8)
-    section.bottom_margin = Inches(0.6)
-    section.left_margin   = Inches(0.9)
-    section.right_margin  = Inches(0.9)
-
-    # ── Default font ──────────────────────────────────────────────────────────
-    style = doc.styles["Normal"]
-    font  = style.font
-    font.name  = "Arial"
-    font.size  = Pt(10)
-    font.color.rgb = RGBColor(0x33, 0x33, 0x33)
-    style.paragraph_format.space_after  = Pt(4)
-    style.paragraph_format.space_before = Pt(0)
-
-    # ── Title ─────────────────────────────────────────────────────────────────
-    title = doc.add_paragraph()
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title.add_run(REPORT_TITLE)
-    run.bold = True
-    run.font.size = Pt(18)
-    run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-
-    sub = doc.add_paragraph()
-    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = sub.add_run(
-        f"Generated {datetime.now().strftime('%B %d, %Y')}  •  "
-        f"{stats['total_patents']} Blocking Patents  •  "
-        f"{len(stats['drugs'])} Drug(s)"
+    st  = _rl_styles()
+    doc = SimpleDocTemplate(
+        output_path, pagesize=_letter,
+        topMargin=18*mm, bottomMargin=14*mm, leftMargin=20*mm, rightMargin=20*mm,
+        title=REPORT_TITLE, author="ADK Pipeline",
     )
-    run.font.size = Pt(9)
-    run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
-    sub.paragraph_format.space_after = Pt(10)
+    W     = _letter[0] - 40*mm
+    story = []
 
-    p_line = doc.add_paragraph()
-    p_line.paragraph_format.space_after = Pt(6)
-    pBdr   = p_line._element.get_or_add_pPr().makeelement(qn("w:pBdr"), {})
-    bottom = pBdr.makeelement(qn("w:bottom"), {
-        qn("w:val"): "single", qn("w:sz"): "6",
-        qn("w:space"): "1", qn("w:color"): "1F3864",
-    })
-    pBdr.append(bottom)
-    p_line._element.get_or_add_pPr().append(pBdr)
+    # ── Title ──
+    story.append(Paragraph(REPORT_TITLE, st["title"]))
+    story.append(Paragraph(
+        f"Generated {datetime.now().strftime('%B %d, %Y')}&nbsp;&nbsp;•&nbsp;&nbsp;"
+        f"{stats['total_patents']} Blocking Patents&nbsp;&nbsp;•&nbsp;&nbsp;"
+        f"{len(stats['drugs'])} Drug(s)", st["meta"]))
+    story.append(HRFlowable(width="100%", thickness=1.5, color=_NAVY, spaceAfter=8))
 
-    # ── Executive Summary ─────────────────────────────────────────────────────
-    h = doc.add_heading("Executive Summary", level=2)
-    for run in h.runs:
-        run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-        run.font.size = Pt(13)
-    p = doc.add_paragraph(narrative.get("executive_summary", ""))
-    p.paragraph_format.space_after = Pt(6)
+    # ── Executive Summary ──
+    story.append(Paragraph("Executive Summary", st["h1"]))
+    story.append(Paragraph(narrative.get("executive_summary", ""), st["body"]))
+    story.append(Spacer(1, 6))
 
-    # ── Portfolio Overview ────────────────────────────────────────────────────
-    h = doc.add_heading("Portfolio Overview", level=2)
-    for run in h.runs:
-        run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-        run.font.size = Pt(13)
-
-    overview_items = [
+    # ── Portfolio Overview ──
+    story.append(Paragraph("Portfolio Overview", st["h1"]))
+    ov_items = [
         ("Total Patents Analysed", str(stats["total_patents"])),
         ("Drugs Covered",          ", ".join(stats["drugs"])),
         ("Average Weighted Score", f"{stats['avg_weighted']} / 5.0" if stats["avg_weighted"] else "N/A"),
     ]
-    sf_labels = [
-        ("avg_sf1_score", "Avg SF1 (Novelty)"),
-        ("avg_sf2_score", "Avg SF2 (Obvious-to-Combine)"),
-        ("avg_sf3_score", "Avg SF3 (Prosecution History)"),
-        ("avg_sf4_score", "Avg SF4 (Secondary Considerations)"),
-    ]
-    for key, label in sf_labels:
+    for key, label in [("avg_sf1_score","Avg SF1 (Novelty)"),("avg_sf2_score","Avg SF2 (Obvious-to-Combine)"),
+                       ("avg_sf3_score","Avg SF3 (Prosecution History)"),("avg_sf4_score","Avg SF4 (Secondary Considerations)")]:
         val = stats.get(key)
         if val is not None:
-            overview_items.append((label, f"{val} / 5.0"))
-
-    dist_parts = []
-    for s in range(1, 6):
-        count = stats["score_distribution"].get(s, 0)
-        if count > 0:
-            dist_parts.append(f"{SCORE_LABEL[s]}: {count}")
+            ov_items.append((label, f"{val} / 5.0"))
+    dist_parts = [f"{SCORE_LABEL[s]}: {stats['score_distribution'].get(s,0)}" for s in range(1,6) if stats["score_distribution"].get(s,0) > 0]
     if dist_parts:
-        overview_items.append(("Score Distribution", "; ".join(dist_parts)))
+        ov_items.append(("Score Distribution", "; ".join(dist_parts)))
+    ov_rows = [[Paragraph(f"<b>{lbl}</b>", st["tdl"]), Paragraph(val, st["td"])] for lbl, val in ov_items]
+    ov_t = Table(ov_rows, colWidths=[W*0.38, W*0.62])
+    ov_t.setStyle(TableStyle([("BACKGROUND",(0,0),(0,-1),colors.HexColor("#E8EDF3")),("BOX",(0,0),(-1,-1),0.5,_BLUE),
+        ("INNERGRID",(0,0),(-1,-1),0.25,colors.lightgrey),("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ("TOPPADDING",(0,0),(-1,-1),3),("BOTTOMPADDING",(0,0),(-1,-1),3)]))
+    story.append(ov_t)
+    story.append(Spacer(1, 8))
 
-    overview_table = doc.add_table(rows=len(overview_items), cols=2)
-    overview_table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    overview_table.style     = "Table Grid"
-    for i, (label, value) in enumerate(overview_items):
-        cell_l = overview_table.rows[i].cells[0]
-        cell_l.text = ""
-        p = cell_l.paragraphs[0]
-        run = p.add_run(label)
-        run.bold = True
-        run.font.size = Pt(9)
-        set_cell_shading(cell_l, "E8EDF3")
-
-        cell_r = overview_table.rows[i].cells[1]
-        cell_r.text = ""
-        p = cell_r.paragraphs[0]
-        run = p.add_run(value)
-        run.font.size = Pt(9)
-
-    for row_obj in overview_table.rows:
-        row_obj.cells[0].width = Inches(2.5)
-        row_obj.cells[1].width = Inches(4.2)
-
-    doc.add_paragraph("")
-
-    # ── Key Findings ──────────────────────────────────────────────────────────
-    h = doc.add_heading("Key Findings", level=2)
-    for run in h.runs:
-        run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-        run.font.size = Pt(13)
+    # ── Key Findings ──
+    story.append(Paragraph("Key Findings", st["h1"]))
     for finding in narrative.get("key_findings", []):
-        p = doc.add_paragraph(finding, style="List Bullet")
-        p.paragraph_format.space_after = Pt(2)
+        story.append(Paragraph(f"&bull; {finding}", st["bullet"]))
+    story.append(Spacer(1, 6))
 
-    # ── Patent Scores Table (now includes Rationale column) ───────────────────
-    h = doc.add_heading("Patent Score Summary", level=2)
-    for run in h.runs:
-        run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-        run.font.size = Pt(13)
-
-    cols         = ["Drug Name", "Patent Number", "SF1 Score", "SF2 Score",
-                    "SF3 Score", "SF4 Score", "Weighted Final Score"]
-    display_cols = ["Drug", "Patent No.", "SF1", "SF2", "SF3", "SF4", "Final"]
-
+    # ── Patent Score Summary Table ──
+    story.append(Paragraph("Patent Score Summary", st["h1"]))
+    tbl_cols = ["Drug Name","Patent Number","SF1 Score","SF2 Score","SF3 Score","SF4 Score","Weighted Final Score"]
+    tbl_disp = ["Drug","Patent No.","SF1","SF2","SF3","SF4","Final"]
+    cw = [W*0.19,W*0.19,W*0.1,W*0.1,W*0.1,W*0.1,W*0.12]
     df_table = df_final.copy()
-    ws_col   = "Weighted Final Score"
-    if ws_col in df_table.columns:
-        df_table["_ws_numeric"] = pd.to_numeric(df_table[ws_col], errors="coerce")
-        df_table = df_table.dropna(subset=["_ws_numeric"])
-        df_table = df_table.drop(columns=["_ws_numeric"])
+    if "Weighted Final Score" in df_table.columns:
+        df_table["_ws"] = pd.to_numeric(df_table["Weighted Final Score"], errors="coerce")
+        df_table = df_table.dropna(subset=["_ws"]).drop(columns=["_ws"])
+    dr = [[row.get(c,"") for c in tbl_cols] for _,row in df_table.iterrows()]
+    story.append(_rl_data_table(tbl_disp, dr, cw, st, score_col_indices=list(range(2,7))))
+    story.append(Spacer(1, 8))
 
-    table = doc.add_table(rows=1, cols=len(cols))
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.style     = "Table Grid"
-
-    for i, label in enumerate(display_cols):
-        cell = table.rows[0].cells[i]
-        cell.text = ""
-        p = cell.paragraphs[0]
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = p.add_run(label)
-        run.bold = True
-        run.font.size = Pt(8)
-        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-        set_cell_shading(cell, "1F3864")
-
-    for _, row in df_table.iterrows():
-        row_cells = table.add_row().cells
-        for i, col in enumerate(cols):
-            val  = row.get(col, "")
-            cell = row_cells[i]
-            cell.text = ""
-            p = cell.paragraphs[0]
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = p.add_run(str(val) if pd.notna(val) else "N/A")
-            run.font.size = Pt(8)
-            if i >= 2:
-                try:
-                    score_int = int(round(float(val)))
-                    if score_int in SCORE_COLOR_MAP:
-                        run.font.color.rgb = SCORE_COLOR_MAP[score_int]
-                        run.bold = True
-                except (ValueError, TypeError):
-                    pass
-
-    # Column widths
-    widths = [Inches(1.2), Inches(1.2), Inches(0.55), Inches(0.55),
-              Inches(0.55), Inches(0.55), Inches(0.65)]
-    for row_obj in table.rows:
-        for i, cell in enumerate(row_obj.cells):
-            cell.width = widths[i]
-
-    doc.add_paragraph("")
-
-    # ── Highest Weighted Score Patent (Overall) ───────────────────────────────
+    # ── Highest Weighted Score Patent ──
     hsp = stats.get("highest_score_patent")
     if hsp:
-        h = doc.add_heading("Highest Weighted Score Patent", level=2)
-        for run in h.runs:
-            run.font.color.rgb = RGBColor(0xCC, 0x00, 0x00)
-            run.font.size = Pt(13)
-
-        _build_hsp_table(doc, hsp, shade_color="F9EBEB")
-        doc.add_paragraph("")
-
+        story.append(Paragraph('<font color="#CC0000">Highest Weighted Score Patent</font>', st["h1"]))
+        _hsp_table(story, hsp, st, W)
         if hsp.get("vulnerabilities") and hsp["vulnerabilities"] != "N/A":
-            p = doc.add_paragraph()
-            run = p.add_run("Key Vulnerabilities: ")
-            run.bold = True
-            run.font.size = Pt(10)
-            run.font.color.rgb = RGBColor(0xCC, 0x00, 0x00)
-            p.add_run(hsp["vulnerabilities"]).font.size = Pt(10)
-
+            story.append(Paragraph(f'<font color="#CC0000"><b>Key Vulnerabilities:</b></font> {hsp["vulnerabilities"]}', st["body"]))
         if hsp.get("strengths") and hsp["strengths"] != "N/A":
-            p = doc.add_paragraph()
-            run = p.add_run("Key Strengths: ")
-            run.bold = True
-            run.font.size = Pt(10)
-            run.font.color.rgb = RGBColor(0x00, 0x80, 0x00)
-            p.add_run(hsp["strengths"]).font.size = Pt(10)
-
+            story.append(Paragraph(f'<font color="#008000"><b>Key Strengths:</b></font> {hsp["strengths"]}', st["body"]))
         if hsp.get("core_step") and hsp["core_step"] != "N/A":
-            p = doc.add_paragraph()
-            run = p.add_run("Core Inventive Step: ")
-            run.bold = True
-            run.font.size = Pt(10)
-            p.add_run(hsp["core_step"]).font.size = Pt(10)
+            story.append(Paragraph(f'<b>Core Inventive Step:</b> {hsp["core_step"]}', st["body"]))
+        hn = narrative.get("highest_score_narrative", "")
+        if hn:
+            story.append(Paragraph("<b>In-Depth Analysis</b>", st["h2"]))
+            story.append(Paragraph(hn, st["body"]))
+        story.append(Spacer(1, 8))
 
-        doc.add_paragraph("")
-
-        highest_narrative = narrative.get("highest_score_narrative", "")
-        if highest_narrative:
-            p = doc.add_paragraph()
-            run = p.add_run("In-Depth Analysis")
-            run.bold = True
-            run.font.size = Pt(11)
-            run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-            doc.add_paragraph(highest_narrative)
-
-        doc.add_paragraph("")
-
-    # ── Highest Weighted Score Patent per Jurisdiction ────────────────────────
+    # ── Highest Score per Jurisdiction ──
     hspj = stats.get("highest_score_per_jurisdiction") or {}
     if hspj:
-        h = doc.add_heading("Highest Weighted Score Patent by Jurisdiction", level=2)
-        for run in h.runs:
-            run.font.color.rgb = RGBColor(0xCC, 0x00, 0x00)
-            run.font.size = Pt(13)
-
-        p_intro = doc.add_paragraph(
-            "The table below identifies the most legally vulnerable patent within each "
-            "jurisdiction across the analysed portfolio."
-        )
-        p_intro.paragraph_format.space_after = Pt(6)
-
+        story.append(Paragraph('<font color="#CC0000">Highest Weighted Score Patent by Jurisdiction</font>', st["h1"]))
+        story.append(Paragraph("The table below identifies the most legally vulnerable patent within each jurisdiction.", st["body"]))
         for jur, jur_hsp in hspj.items():
-            h3 = doc.add_heading(f"Jurisdiction: {jur}", level=3)
-            for run in h3.runs:
-                run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-                run.font.size = Pt(11)
-            _build_hsp_table(doc, jur_hsp, shade_color="F9EBEB")
-            doc.add_paragraph("")
+            story.append(Paragraph(f"Jurisdiction: {jur}", st["h3"]))
+            _hsp_table(story, jur_hsp, st, W)
 
-    # ── Country-Weighted Score Section ────────────────────────────────────────
+    # ── Country-Weighted Scores ──
     if country_stats and country_stats.get("by_drug"):
-        h = doc.add_heading("Country-Weighted Patent Scores", level=2)
-        for run in h.runs:
-            run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-            run.font.size = Pt(13)
-
-        intro_p = doc.add_paragraph(
-            "The table below shows jurisdiction-level weighted scores from "
-            "patent_strength_country_score_table. Country weights reflect the "
-            "strategic commercial importance of each jurisdiction."
-        )
-        intro_p.paragraph_format.space_after = Pt(6)
-
+        story.append(PageBreak())
+        story.append(Paragraph("Country-Weighted Patent Scores", st["h1"]))
+        story.append(Paragraph("Jurisdiction-level weighted scores from patent_strength_country_score_table.", st["body"]))
+        ct_h = ["Jurisdiction","Country","Weight","# Patents","Avg Weighted Score","Country Weighted Score"]
+        ct_cw = [W*0.12,W*0.22,W*0.1,W*0.1,W*0.2,W*0.22]
         for drug, jur_map in country_stats["by_drug"].items():
-            h3 = doc.add_heading(drug, level=3)
-            for run in h3.runs:
-                run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-                run.font.size = Pt(11)
-
-            final_score = country_stats["final_scores"].get(drug)
-            if final_score is not None:
-                fs_p = doc.add_paragraph()
-                fs_run = fs_p.add_run(f"Final Patent Score (Drug Total): {round(float(final_score), 4)}")
-                fs_run.bold = True
-                fs_run.font.size = Pt(10)
-                fs_run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-
-            ct_headers = ["Jurisdiction", "Country", "Weight", "# Patents",
-                          "Avg Weighted Score", "Country Weighted Score"]
-            ct_widths  = [Inches(0.8), Inches(1.5), Inches(0.6), Inches(0.6),
-                          Inches(1.3), Inches(1.5)]
-
-            ct = doc.add_table(rows=1, cols=len(ct_headers))
-            ct.alignment = WD_TABLE_ALIGNMENT.CENTER
-            ct.style     = "Table Grid"
-            for i, label in enumerate(ct_headers):
-                cell = ct.rows[0].cells[i]
-                cell.text = ""
-                p = cell.paragraphs[0]
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                run = p.add_run(label)
-                run.bold = True
-                run.font.size = Pt(8)
-                run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-                set_cell_shading(cell, "1F3864")
-
-            for jur, jdata in sorted(jur_map.items(),
-                                     key=lambda x: -(x[1].get("country_weight") or 0)):
-                row_cells = ct.add_row().cells
-                vals = [
-                    jur,
-                    str(jdata.get("country_name", "")),
-                    str(jdata.get("country_weight", "")),
-                    str(jdata.get("patent_count", "")),
-                    str(jdata.get("avg_weighted_score", "N/A")),
-                    str(round(float(jdata["country_weighted_score"]), 4))
-                    if jdata.get("country_weighted_score") is not None else "N/A",
-                ]
-                for i, val in enumerate(vals):
-                    cell = row_cells[i]
-                    cell.text = ""
-                    p = cell.paragraphs[0]
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    run = p.add_run(val)
-                    run.font.size = Pt(8)
-                    if i == 4:
-                        try:
-                            s_int = int(round(float(val)))
-                            if s_int in SCORE_COLOR_MAP:
-                                run.font.color.rgb = SCORE_COLOR_MAP[s_int]
-                                run.bold = True
-                        except (ValueError, TypeError):
-                            pass
-
-            for row_obj in ct.rows:
-                for i, cell in enumerate(row_obj.cells):
-                    cell.width = ct_widths[i]
-
-            doc.add_paragraph("")
-
+            story.append(Paragraph(drug, st["h3"]))
+            fs = country_stats["final_scores"].get(drug)
+            if fs is not None:
+                story.append(Paragraph(f'<b>Final Patent Score (Drug Total): {round(float(fs),4)}</b>', st["body"]))
+            ct_rows = []
+            for jur, jd in sorted(jur_map.items(), key=lambda x:-(x[1].get("country_weight") or 0)):
+                ct_rows.append([jur, str(jd.get("country_name","")), str(jd.get("country_weight","")),
+                    str(jd.get("patent_count","")), str(jd.get("avg_weighted_score","N/A")),
+                    str(round(float(jd["country_weighted_score"]),4)) if jd.get("country_weighted_score") is not None else "N/A"])
+            story.append(_rl_data_table(ct_h, ct_rows, ct_cw, st, score_col_indices=[4]))
+            story.append(Spacer(1, 6))
         csn = narrative.get("country_score_narrative", "")
         if csn:
-            p = doc.add_paragraph()
-            run = p.add_run("Geographic Risk Analysis")
-            run.bold = True
-            run.font.size = Pt(11)
-            run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-            doc.add_paragraph(csn)
+            story.append(Paragraph("<b>Geographic Risk Analysis</b>", st["h2"]))
+            story.append(Paragraph(csn, st["body"]))
+        story.append(Spacer(1, 8))
 
-        doc.add_paragraph("")
-
-    # ── Sub-Factor Analysis ───────────────────────────────────────────────────
+    # ── Sub-Factor Analysis ──
     sf_text = narrative.get("sf_analysis", "")
     if sf_text:
-        h = doc.add_heading("Sub-Factor Analysis", level=2)
-        for run in h.runs:
-            run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-            run.font.size = Pt(13)
-        doc.add_paragraph(sf_text)
+        story.append(Paragraph("Sub-Factor Analysis", st["h1"]))
+        story.append(Paragraph(sf_text, st["body"]))
 
-    # ── Risk & Strength Highlights ────────────────────────────────────────────
-    h = doc.add_heading("Risk & Strength Analysis", level=2)
-    for run in h.runs:
-        run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-        run.font.size = Pt(13)
+    # ── Risk & Strength ──
+    story.append(Paragraph("Risk &amp; Strength Analysis", st["h1"]))
+    story.append(Paragraph('<font color="#CC0000"><b>Highest Risk Patents</b></font>', st["h2"]))
+    story.append(Paragraph(narrative.get("risk_highlights", "N/A"), st["body"]))
+    story.append(Paragraph('<font color="#008000"><b>Most Robust Patents</b></font>', st["h2"]))
+    story.append(Paragraph(narrative.get("strength_highlights", "N/A"), st["body"]))
 
-    p = doc.add_paragraph()
-    run = p.add_run("Highest Risk Patents")
-    run.bold = True
-    run.font.size = Pt(11)
-    run.font.color.rgb = RGBColor(0xCC, 0x00, 0x00)
-    doc.add_paragraph(narrative.get("risk_highlights", "N/A"))
-
-    p = doc.add_paragraph()
-    run = p.add_run("Most Robust Patents")
-    run.bold = True
-    run.font.size = Pt(11)
-    run.font.color.rgb = RGBColor(0x00, 0x80, 0x00)
-    doc.add_paragraph(narrative.get("strength_highlights", "N/A"))
-
-    # ── Per-Drug Breakdown ────────────────────────────────────────────────────
+    # ── Per-Drug Breakdown ──
     per_drug = narrative.get("per_drug_narratives", {})
     if per_drug:
-        h = doc.add_heading("Drug-Level Analysis", level=2)
-        for run in h.runs:
-            run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-            run.font.size = Pt(13)
+        story.append(PageBreak())
+        story.append(Paragraph("Drug-Level Analysis", st["h1"]))
+        for dn, dn_nar in per_drug.items():
+            story.append(Paragraph(dn, st["h3"]))
+            ds = stats.get("per_drug_stats",{}).get(dn,{})
+            if ds:
+                story.append(Paragraph(f'<i><font color="#666666">Patents: {ds.get("count","N/A")} | Avg: {ds.get("avg_score","N/A")} | Range: {ds.get("min_score","N/A")}–{ds.get("max_score","N/A")}</font></i>', st["body"]))
+            story.append(Paragraph(dn_nar, st["body"]))
+            story.append(Spacer(1, 4))
 
-        for drug_name, drug_narrative in per_drug.items():
-            h3 = doc.add_heading(drug_name, level=3)
-            for run in h3.runs:
-                run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-                run.font.size = Pt(11)
+    # ── Sub-Factor Framework Table ──
+    story.append(Paragraph("Sub-Factor Scoring Framework", st["h1"]))
+    sf_data = [("1","Novelty &amp; Non-Obviousness","Closeness of claimed invention to prior art.","40%"),
+               ("2","Obvious-to-Combine Risk","Likelihood of combining known elements with reasonable expectation of success.","30%"),
+               ("3","Prosecution History Vulnerability","Extent of claim narrowing during prosecution.","20%"),
+               ("4","Secondary Considerations","Objective evidence supporting non-obviousness.","10%")]
+    story.append(_rl_data_table(["SF #","Name","Description","Weight"], sf_data, [W*0.07,W*0.23,W*0.55,W*0.1], st))
+    story.append(Spacer(1, 8))
 
-            drug_stat = stats.get("per_drug_stats", {}).get(drug_name, {})
-            if drug_stat:
-                stat_p = doc.add_paragraph()
-                stat_run = stat_p.add_run(
-                    f"Patents: {drug_stat.get('count', 'N/A')}  |  "
-                    f"Avg Score: {drug_stat.get('avg_score', 'N/A')}  |  "
-                    f"Range: {drug_stat.get('min_score', 'N/A')} – {drug_stat.get('max_score', 'N/A')}"
-                )
-                stat_run.font.size = Pt(9)
-                stat_run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
-                stat_run.italic = True
+    legend = "  |  ".join(f"{k} = {v}" for k, v in SCORE_LABEL.items())
+    story.append(Paragraph(f'<font color="#666666"><b>Score Legend:</b> {legend}</font>', st["legend"]))
+    story.append(Spacer(1, 10))
+    story.append(Paragraph("<i>This report was auto-generated from Patent Legal Robustness Scorer output using Gemini 2.5 Flash.</i>", st["footer"]))
 
-            doc.add_paragraph(drug_narrative)
-
-    # ── Sub-Factor Weights Table ──────────────────────────────────────────────
-    h = doc.add_heading("Sub-Factor Scoring Framework", level=2)
-    for run in h.runs:
-        run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-        run.font.size = Pt(13)
-
-    sf_framework = [
-        ("1", "Novelty & Non-Obviousness",
-         "Closeness of the claimed invention to prior art structurally or conceptually.",
-         "40%"),
-        ("2", "Obvious-to-Combine Risk",
-         "Likelihood a skilled person would combine known elements with a reasonable expectation of success.",
-         "30%"),
-        ("3", "Prosecution History Vulnerability",
-         "Extent of claim narrowing or limiting arguments during prosecution that may weaken enforceability.",
-         "20%"),
-        ("4", "Secondary Considerations",
-         "Objective evidence supporting non-obviousness (e.g. commercial success, long-felt need).",
-         "10%"),
-    ]
-
-    sf_table    = doc.add_table(rows=1, cols=4)
-    sf_table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    sf_table.style     = "Table Grid"
-    sf_headers         = ["SF #", "Name", "Description", "Weight"]
-    sf_col_widths      = [Inches(0.45), Inches(1.6), Inches(3.7), Inches(0.65)]
-
-    for i, label in enumerate(sf_headers):
-        cell = sf_table.rows[0].cells[i]
-        cell.text = ""
-        p = cell.paragraphs[0]
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = p.add_run(label)
-        run.bold = True
-        run.font.size = Pt(9)
-        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-        set_cell_shading(cell, "1F3864")
-
-    for sf_num, sf_name, sf_desc, sf_weight in sf_framework:
-        row_cells = sf_table.add_row().cells
-
-        row_cells[0].text = ""
-        p = row_cells[0].paragraphs[0]
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = p.add_run(sf_num)
-        run.bold = True
-        run.font.size = Pt(9)
-        set_cell_shading(row_cells[0], "E8EDF3")
-
-        row_cells[1].text = ""
-        p = row_cells[1].paragraphs[0]
-        run = p.add_run(sf_name)
-        run.bold = True
-        run.font.size = Pt(9)
-
-        row_cells[2].text = ""
-        p = row_cells[2].paragraphs[0]
-        p.add_run(sf_desc).font.size = Pt(9)
-
-        row_cells[3].text = ""
-        p = row_cells[3].paragraphs[0]
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = p.add_run(sf_weight)
-        run.bold = True
-        run.font.size = Pt(9)
-        run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-
-    for row_obj in sf_table.rows:
-        for i, cell in enumerate(row_obj.cells):
-            cell.width = sf_col_widths[i]
-
-    doc.add_paragraph("")
-
-    # ── Score Legend ──────────────────────────────────────────────────────────
-    p = doc.add_paragraph()
-    p.paragraph_format.space_before = Pt(10)
-    run = p.add_run("Score Legend: ")
-    run.bold = True
-    run.font.size = Pt(8)
-    run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
-    legend_text = "  |  ".join(f"{k} = {v}" for k, v in SCORE_LABEL.items())
-    run = p.add_run(legend_text)
-    run.font.size = Pt(8)
-    run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
-
-    # ── Footer note ───────────────────────────────────────────────────────────
-    p = doc.add_paragraph()
-    run = p.add_run(
-        "This report was auto-generated from Patent Legal Robustness Scorer output "
-        "using Gemini 2.5 Flash for narrative analysis."
-    )
-    run.font.size = Pt(7)
-    run.font.italic = True
-    run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
-
-    # ── Save locally ──────────────────────────────────────────────────────────
-    doc.save(output_path)
-    print(f"\n✅ Report saved locally → {output_path}")
-
-
-# ── DOCX → PDF conversion ────────────────────────────────────────────────────
-
-def convert_docx_to_pdf(docx_path: str) -> str:
-    """
-    Convert a .docx file to PDF using:
-      mammoth   — converts .docx → HTML  (preserves structure)
-      xhtml2pdf — renders HTML → PDF     (pure pip, no LibreOffice needed)
-    """
-    try:
-        import mammoth
-        from xhtml2pdf import pisa
-    except ImportError:
-        raise RuntimeError(
-            "mammoth and/or xhtml2pdf are not installed.\n"
-            "Run: pip install mammoth xhtml2pdf --break-system-packages"
-        )
-
-    pdf_path = os.path.splitext(docx_path)[0] + ".pdf"
-
-    # Step 1: docx → HTML via mammoth
-    style_map = """
-        p[style-name='Heading 1'] => h1:fresh
-        p[style-name='Heading 2'] => h2:fresh
-        r[style-name='Strong']    => strong
-    """
-    with open(docx_path, "rb") as f:
-        result = mammoth.convert_to_html(f, style_map=style_map)
-    raw_html = result.value
-
-    full_html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  @page {{ margin: 1.8cm 2cm 2cm 2cm; }}
-  body  {{ font-family: Arial, sans-serif; font-size: 9pt; color: #222; margin:0; padding:0; }}
-  h1    {{ color: #1F3864; font-size: 14pt; border-bottom: 3px solid #2F5496; padding-bottom:4px; }}
-  h2    {{ color: #2F5496; font-size: 11pt; border-bottom: 1px solid #2F5496; padding-bottom:2px; margin:10px 0 3px 0; }}
-  h3    {{ color: #2F5496; font-size: 10pt; margin: 8px 0 3px 0; }}
-  p     {{ margin: 0 0 5px 0; line-height: 1.35; text-align: justify; }}
-  ul    {{ margin: 2px 0 6px 0; padding-left: 18px; }}
-  li    {{ margin-bottom: 2px; line-height: 1.3; }}
-  table {{ border-collapse: collapse; width: 100%; margin: 5px 0 8px 0; font-size: 8.5pt; }}
-  th    {{ background: #2F5496; color: #ffffff; font-weight: bold; text-align: center; padding: 4px 6px; border: 1px solid #2F5496; }}
-  td    {{ border: 1px solid #CCCCCC; padding: 4px 6px; vertical-align: top; }}
-  hr    {{ border: none; border-bottom: 2px solid #2F5496; margin: 10px 0 6px 0; }}
-</style>
-</head>
-<body>
-{raw_html}
-</body>
-</html>"""
-
-    # Step 2: HTML → PDF via xhtml2pdf
-    with open(pdf_path, "wb") as pdf_file:
-        result = pisa.CreatePDF(full_html.encode("utf-8"), dest=pdf_file,
-                                encoding="utf-8")
-    if result.err:
-        raise RuntimeError(f"xhtml2pdf conversion error code: {result.err}")
-
-    if not os.path.exists(pdf_path):
-        raise RuntimeError(f"PDF not created at expected path: {pdf_path}")
-
-    print(f"✅ Converted to PDF → {pdf_path}")
-    return pdf_path
-
-
-# ── GCS Upload ────────────────────────────────────────────────────────────────
+    doc.build(story)
+    print(f"\n✅ PDF report saved → {output_path}")
 
 def upload_to_gcs(local_path: str, drug_names: list) -> list:
     """
@@ -1300,6 +921,8 @@ def upload_to_gcs(local_path: str, drug_names: list) -> list:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate a detailed PDF report from BigQuery patent scorer tables"
@@ -1314,18 +937,7 @@ def main():
             "  GEMINI_API_KEY=your-key"
         )
     data = load_from_bigquery()
-
-    # Build the report as .docx first (the 1100+ lines of python-docx formatting
-    # are kept as-is), then convert to PDF for the final output.
-    docx_path = os.path.splitext(args.output)[0] + ".docx"
-    build_report(data, docx_path)
-    pdf_path = convert_docx_to_pdf(docx_path)
-
-    # Clean up intermediate .docx
-    try:
-        os.remove(docx_path)
-    except OSError:
-        pass
+    build_report(data, args.output)
 
     # ── Upload to GCS ─────────────────────────────────────────────────────────
     df_final   = data.get("final", pd.DataFrame())
@@ -1333,7 +945,7 @@ def main():
 
     if drug_names:
         print(f"\nUploading report to GCS for {len(drug_names)} drug(s)...")
-        gcs_uris = upload_to_gcs(pdf_path, drug_names)
+        gcs_uris = upload_to_gcs(args.output, drug_names)
 
         print(f"\n{'='*60}")
         print("  GCS Upload Summary:")
