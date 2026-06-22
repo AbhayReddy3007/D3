@@ -880,8 +880,7 @@ def _build_drug_report(drug, drug_sl, drug_arb, output_dir):
 
         arb_cols = ["Jurisdiction", "Product LOE (Year)", "Gap vs US (Years)",
                     "Gap vs Longest LOE (Years)", "Key Protection Gap",
-                    "Arbitrage Score", "Arbitrage Signal",
-                    "Rationale", "Created At", "Updated At"]
+                    "Arbitrage Score", "Arbitrage Signal"]
         arb_cols = [c for c in arb_cols if c in drug_arb.columns]
         arb_show = drug_arb[arb_cols].copy()
 
@@ -904,7 +903,7 @@ def _build_drug_report(drug, drug_sl, drug_arb, output_dir):
                     _score_cell(cell, val)
                 else:
                     _make_data_cell(cell, val, bg=bg)
-        arb_widths = [0.85, 0.9, 0.9, 1.0, 1.8, 0.8, 1.1, 2.2, 1.2, 1.2][:len(arb_cols)]
+        arb_widths = [1.0, 1.1, 1.0, 1.1, 2.0, 0.9, 1.2][:len(arb_cols)]
         for ci, w in enumerate(arb_widths):
             for cell in atbl.columns[ci].cells:
                 cell.width = Inches(w)
