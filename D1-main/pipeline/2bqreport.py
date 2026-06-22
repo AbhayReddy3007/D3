@@ -2,7 +2,7 @@
 generate_report.py
 ──────────────────
 Reads scored data from BigQuery tables produced by the Patent Legal Robustness Scorer
-and generates a professional detailed Word (.docx) report using Gemini 2.5 Flash
+and generates a professional detailed PDF report using Gemini 2.5 Flash
 for narrative generation and python-docx for document creation.
 
 Input tables (BigQuery):
@@ -14,7 +14,7 @@ Usage:
     # Create a .env file with:
     #   GEMINI_API_KEY=your-key
     #   GCS_CREDENTIALS=/path/to/service-account.json
-    python generate_report.py --output report.docx
+    python generate_report.py --output report.pdf
 """
 
 import os
@@ -60,7 +60,7 @@ BQ_COUNTRY_SCORE_TABLE = "patent_strength_country_score_table"
 # ── GCS Configuration ─────────────────────────────────────────────────────────
 GCS_BUCKET    = "cognito-gcs"
 GCS_BASE_PATH = "Cognito_new/reports"
-GCS_FILE_NAME = "Patent_Strength_Analysis.docx"
+GCS_FILE_NAME = "Patent_Strength_Analysis.pdf"
 
 SCORE_COLOR_MAP = {
     1: RGBColor(0x00, 0x80, 0x00),  # Green
@@ -1186,14 +1186,81 @@ def build_report(data: dict, output_path: str):
     print(f"\n✅ Report saved locally → {output_path}")
 
 
+# ── DOCX → PDF conversion ────────────────────────────────────────────────────
+
+def convert_docx_to_pdf(docx_path: str) -> str:
+    """
+    Convert a .docx file to PDF using:
+      mammoth   — converts .docx → HTML  (preserves structure)
+      xhtml2pdf — renders HTML → PDF     (pure pip, no LibreOffice needed)
+    """
+    try:
+        import mammoth
+        from xhtml2pdf import pisa
+    except ImportError:
+        raise RuntimeError(
+            "mammoth and/or xhtml2pdf are not installed.\n"
+            "Run: pip install mammoth xhtml2pdf --break-system-packages"
+        )
+
+    pdf_path = os.path.splitext(docx_path)[0] + ".pdf"
+
+    # Step 1: docx → HTML via mammoth
+    style_map = """
+        p[style-name='Heading 1'] => h1:fresh
+        p[style-name='Heading 2'] => h2:fresh
+        r[style-name='Strong']    => strong
+    """
+    with open(docx_path, "rb") as f:
+        result = mammoth.convert_to_html(f, style_map=style_map)
+    raw_html = result.value
+
+    full_html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  @page {{ margin: 1.8cm 2cm 2cm 2cm; }}
+  body  {{ font-family: Arial, sans-serif; font-size: 9pt; color: #222; margin:0; padding:0; }}
+  h1    {{ color: #1F3864; font-size: 14pt; border-bottom: 3px solid #2F5496; padding-bottom:4px; }}
+  h2    {{ color: #2F5496; font-size: 11pt; border-bottom: 1px solid #2F5496; padding-bottom:2px; margin:10px 0 3px 0; }}
+  h3    {{ color: #2F5496; font-size: 10pt; margin: 8px 0 3px 0; }}
+  p     {{ margin: 0 0 5px 0; line-height: 1.35; text-align: justify; }}
+  ul    {{ margin: 2px 0 6px 0; padding-left: 18px; }}
+  li    {{ margin-bottom: 2px; line-height: 1.3; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 5px 0 8px 0; font-size: 8.5pt; }}
+  th    {{ background: #2F5496; color: #ffffff; font-weight: bold; text-align: center; padding: 4px 6px; border: 1px solid #2F5496; }}
+  td    {{ border: 1px solid #CCCCCC; padding: 4px 6px; vertical-align: top; }}
+  hr    {{ border: none; border-bottom: 2px solid #2F5496; margin: 10px 0 6px 0; }}
+</style>
+</head>
+<body>
+{raw_html}
+</body>
+</html>"""
+
+    # Step 2: HTML → PDF via xhtml2pdf
+    with open(pdf_path, "wb") as pdf_file:
+        result = pisa.CreatePDF(full_html.encode("utf-8"), dest=pdf_file,
+                                encoding="utf-8")
+    if result.err:
+        raise RuntimeError(f"xhtml2pdf conversion error code: {result.err}")
+
+    if not os.path.exists(pdf_path):
+        raise RuntimeError(f"PDF not created at expected path: {pdf_path}")
+
+    print(f"✅ Converted to PDF → {pdf_path}")
+    return pdf_path
+
+
 # ── GCS Upload ────────────────────────────────────────────────────────────────
 
 def upload_to_gcs(local_path: str, drug_names: list) -> list:
     """
-    Upload the generated .docx to GCS under each drug's folder.
+    Upload the generated .pdf to GCS under each drug's folder.
 
     Destination path per drug:
-        gs://cognito-gcs/Cognito_new/reports/{drug_name}/Patent_Strength_Analysis.docx
+        gs://cognito-gcs/Cognito_new/reports/{drug_name}/Patent_Strength_Analysis.pdf
 
     Uses service account file or ADC (Cloud Run).
     Requires: pip install google-cloud-storage
@@ -1221,7 +1288,7 @@ def upload_to_gcs(local_path: str, drug_names: list) -> list:
             blob = bucket.blob(blob_name)
             blob.upload_from_filename(
                 local_path,
-                content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                content_type="application/pdf",
             )
             print(f"  Upload successful: {gcs_uri}")
             gcs_uris.append(gcs_uri)
@@ -1236,10 +1303,10 @@ def upload_to_gcs(local_path: str, drug_names: list) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate a detailed Word report from BigQuery patent scorer tables"
+        description="Generate a detailed PDF report from BigQuery patent scorer tables"
     )
-    parser.add_argument("--output", "-o", default="patent_robustness_report.docx",
-                        help="Output .docx path (default: patent_robustness_report.docx)")
+    parser.add_argument("--output", "-o", default="patent_robustness_report.pdf",
+                        help="Output .pdf path (default: patent_robustness_report.pdf)")
     args = parser.parse_args()
 
     if not API_KEY:
@@ -1248,7 +1315,18 @@ def main():
             "  GEMINI_API_KEY=your-key"
         )
     data = load_from_bigquery()
-    build_report(data, args.output)
+
+    # Build the report as .docx first (the 1100+ lines of python-docx formatting
+    # are kept as-is), then convert to PDF for the final output.
+    docx_path = os.path.splitext(args.output)[0] + ".docx"
+    build_report(data, docx_path)
+    pdf_path = convert_docx_to_pdf(docx_path)
+
+    # Clean up intermediate .docx
+    try:
+        os.remove(docx_path)
+    except OSError:
+        pass
 
     # ── Upload to GCS ─────────────────────────────────────────────────────────
     df_final   = data.get("final", pd.DataFrame())
@@ -1256,7 +1334,7 @@ def main():
 
     if drug_names:
         print(f"\nUploading report to GCS for {len(drug_names)} drug(s)...")
-        gcs_uris = upload_to_gcs(args.output, drug_names)
+        gcs_uris = upload_to_gcs(pdf_path, drug_names)
 
         print(f"\n{'='*60}")
         print("  GCS Upload Summary:")
