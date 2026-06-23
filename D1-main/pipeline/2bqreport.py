@@ -111,14 +111,31 @@ REPORT_TITLE = "Patent Strength Scoring Analysis"
 
 # ── Gemini helper ─────────────────────────────────────────────────────────────
 
-def call_gemini(prompt: str) -> str:
-    """Call Gemini 2.5 Flash and return plain text."""
+def call_gemini(prompt: str, retries: int = 5, backoff: float = 3.0) -> str:
+    """Call Gemini 2.5 Flash with retry + exponential backoff for 429s."""
+    import time as _time
     client = genai_client.Client(api_key=API_KEY)
     config = types.GenerateContentConfig(temperature=0.3)
-    response = client.models.generate_content(
-        model=MODEL, contents=prompt, config=config
-    )
-    return response.text.strip() if response.text else ""
+    for attempt in range(retries):
+        try:
+            response = client.models.generate_content(
+                model=MODEL, contents=prompt, config=config
+            )
+            return response.text.strip() if response.text else ""
+        except Exception as e:
+            err_str = str(e)
+            is_rate_limit = "429" in err_str or "rate" in err_str.lower() or "quota" in err_str.lower()
+            if attempt < retries - 1 and is_rate_limit:
+                wait = backoff * (2 ** attempt)
+                print(f"  ⚠ Gemini 429 rate-limit, retrying in {wait:.0f}s (attempt {attempt+1}/{retries})…")
+                _time.sleep(wait)
+            elif attempt < retries - 1:
+                wait = backoff * (attempt + 1)
+                print(f"  ⚠ Gemini error ({e}), retrying in {wait:.0f}s…")
+                _time.sleep(wait)
+            else:
+                print(f"  ✗ Gemini failed after {retries} attempts: {e}")
+                return ""
 
 
 def _extract_json(text: str):
