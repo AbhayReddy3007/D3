@@ -330,13 +330,20 @@ def _rl_styles():
     }
 
 
+def _esc(text):
+    """Escape text for reportlab Paragraph XML."""
+    if not isinstance(text, str):
+        text = str(text) if text is not None else ""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _rl_table(headers, data_rows, col_widths, st, signal_col=-1, score_col=-1):
     """Generic reportlab table with navy header row."""
     tbl_rows = [[Paragraph(f"<b>{h}</b>", st["th"]) for h in headers]]
     for ri, dr in enumerate(data_rows):
         row = []
         for ci, val in enumerate(dr):
-            s = str(val) if val is not None and str(val) not in ("nan","None","") else "—"
+            s = _esc(str(val)) if val is not None and str(val) not in ("nan","None","") else "—"
             if ci == signal_col:
                 hex_c = SIGNAL_HEX.get(s, "BDC3C7")
                 row.append(Paragraph(f'<font color="#{hex_c}"><b>{s}</b></font>', st["td"]))
@@ -389,9 +396,9 @@ def _render_narrative_rl(narrative: str, story, st):
         if "STRATEGIC RECOMMENDATIONS" in part.upper() or "RECOMMENDATION" in part.upper():
             continue
         if part in NARRATIVE_HEADERS:
-            story.append(Paragraph(f"<b>{part.title()}</b>", st["h2"]))
+            story.append(Paragraph(f"<b>{_esc(part.title())}</b>", st["h2"]))
         else:
-            story.append(Paragraph(part, st["body"]))
+            story.append(Paragraph(_esc(part), st["body"]))
 
 
 NARRATIVE_HEADERS = [
@@ -399,6 +406,142 @@ NARRATIVE_HEADERS = [
     "GEOGRAPHIC ARBITRAGE ANALYSIS",
     "KEY PROTECTION GAPS",
 ]
+
+
+def _build_drug_narrative_prompt(drug, drug_sl, drug_arb) -> str:
+    exp_lines = []
+    for _, r in drug_sl.iterrows():
+        jur    = JUR_FULL.get(str(r.get("Jurisdiction", "")), str(r.get("Jurisdiction", "")))
+        cat    = r.get("Step 1 Claim Category", "")
+        expiry = str(r.get("Adjusted Expiry (with PTE)", "N/A"))
+        gap    = str(r.get("Expiry Gap (Years)", "N/A"))
+        pte_st = r.get("PTE Status", "")
+        pte_m  = r.get("PTE Months (Granted)", "0")
+        pat_no = r.get("Patent Number", "N/A")
+        exp_lines.append(
+            f"  {jur} | Patent: {pat_no} | {cat} | Expiry: {expiry} | Gap: {gap} yrs"
+            f" | PTE: {pte_st} ({pte_m} months)"
+        )
+
+    arb_lines = []
+    dim4_score  = "N/A"
+    dim4_rating = "N/A"
+    if not drug_arb.empty:
+        dim4_score  = drug_arb["Dimension IV Score"].iloc[0]
+        dim4_rating = drug_arb["Dimension IV Rating"].iloc[0]
+        for _, r in drug_arb.iterrows():
+            jur         = JUR_FULL.get(str(r.get("Jurisdiction", "")), str(r.get("Jurisdiction", "")))
+            loe         = r.get("Product LOE (Year)", "N/A")
+            gap_us      = r.get("Gap vs US (Years)", "N/A")
+            gap_longest = r.get("Gap vs Longest LOE (Years)", "N/A")
+            signal      = r.get("Arbitrage Signal", "N/A")
+            gap_kp      = r.get("Key Protection Gap", "N/A")
+            arb_lines.append(
+                f"  {jur} | LOE: {loe} | Gap vs US: {gap_us} yrs"
+                f" | Gap vs Longest LOE: {gap_longest} yrs"
+                f" | Signal: {signal} | Protection gap: {gap_kp}"
+            )
+
+    jurs_in_data = set()
+    for _, r in drug_sl.iterrows():
+        jurs_in_data.add(str(r.get("Jurisdiction", "")))
+    if not drug_arb.empty:
+        for _, r in drug_arb.iterrows():
+            jurs_in_data.add(str(r.get("Jurisdiction", "")))
+
+    all_target_jurs   = {"CN", "IN", "BR", "AU", "RU", "US", "CA", "JP", "MX", "TW", "KR"}
+    jurs_present      = jurs_in_data & all_target_jurs
+    jurs_full_names   = ", ".join(sorted(JUR_FULL.get(j, j) for j in all_target_jurs))
+    jurs_analysed_names = ", ".join(sorted(JUR_FULL.get(j, j) for j in jurs_present))
+
+    return f"""
+You are a senior pharmaceutical patent analyst writing a drug-level patent
+assessment for an internal IP strategy report.
+
+DRUG: {drug}
+
+PATENT EXPIRY DATA (one row per jurisdiction):
+{chr(10).join(exp_lines) if exp_lines else '  No data.'}
+
+GEOGRAPHIC ARBITRAGE DATA (one row per jurisdiction):
+{chr(10).join(arb_lines) if arb_lines else '  No data.'}
+
+OVERALL DIMENSION IV SCORE: {dim4_score} — {dim4_rating}
+
+TARGET JURISDICTIONS CONSIDERED: {jurs_full_names}
+JURISDICTIONS WITH BLOCKING PATENTS ANALYSED: {jurs_analysed_names}
+
+TASK:
+Write a detailed, analytical drug-level narrative (220-280 words) structured
+into exactly these three sections. Use the exact plain-text section headers shown
+below on their own line (no markdown, no asterisks, no bullets):
+
+PATENT LANDSCAPE OVERVIEW
+Write 7-8 sentences summarising the breadth and strength of patent protection
+for this drug across all jurisdictions, including the range of expiry years
+and whether PTE extensions have been granted.
+Do NOT give analysis of US. It is only for reference. Analyse other jurisdictions
+based on the US information. Mention the Patent Numbers.
+Mention that patents from {jurs_full_names} were considered, but only the blocking
+ones were analysed. Jurisdictions not present in the analysis data lacked blocking
+patents — do NOT say "no data is available", instead say they were considered but
+not included as they lacked blocking patents.
+Highlight any jurisdictions with particularly strong or weak patent protection,
+and note the overall Dimension IV Score and Rating for the drug.
+
+GEOGRAPHIC ARBITRAGE ANALYSIS
+Write 10-12 sentences analysing where the strongest and weakest arbitrage
+opportunities exist. Reference specific jurisdictions, LOE years, gap vs US,
+gap vs longest LOE, and arbitrage signal ratings. Explain the strategic
+significance of the "Gap vs Longest LOE" metric — it measures how many years
+earlier a jurisdiction loses exclusivity compared to the jurisdiction with the
+longest protection.
+
+KEY PROTECTION GAPS
+Write 7-8 sentences identifying any missing claim categories or jurisdictions
+with weak or absent protection, and explain what this means for a potential
+generic or biosimilar entrant.
+
+Rules:
+- Do NOT include any recommendations or strategic advice sections.
+- Formal, precise tone. No filler phrases.
+- Do NOT give Analysis for US patents. Compare other Patents with the US information.
+- Use full jurisdiction names, not abbreviations.
+- Do NOT invent any numbers or dates — use only the data provided above.
+- Plain text only. No markdown, no bold, no asterisks, no bullet points.
+""".strip()
+
+
+def _chart_drug_loe(drug: str, drug_arb: pd.DataFrame):
+    df = drug_arb[drug_arb["Jurisdiction"] != "US"].copy()
+    df["LOE"] = pd.to_numeric(df["Product LOE (Year)"], errors="coerce")
+    df = df.dropna(subset=["LOE"]).sort_values("LOE")
+    if df.empty:
+        return None
+
+    today  = date.today().year
+    labels = [JUR_FULL.get(j, j) for j in df["Jurisdiction"]]
+    chart_colors = ["#" + SIGNAL_HEX.get(s, "BDC3C7") for s in df["Arbitrage Signal"]]
+
+    fig, ax = plt.subplots(figsize=(5.5, max(2.5, 0.55 * len(df) + 1)))
+    bars = ax.barh(labels, df["LOE"] - today, left=today,
+                   color=chart_colors, edgecolor="white", linewidth=0.8)
+    ax.axvline(x=today, color="#E74C3C", linestyle="--", linewidth=1.5, label="Today")
+    ax.set_xlabel("Year", fontsize=9)
+    ax.set_title(f"{drug} — Loss of Exclusivity by Jurisdiction",
+                 fontsize=10, fontweight="bold")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    for bar, loe in zip(bars, df["LOE"]):
+        ax.text(bar.get_x() + bar.get_width() - 0.2,
+                bar.get_y() + bar.get_height() / 2,
+                str(int(loe)), va="center", ha="right",
+                fontsize=8, fontweight="bold", color="white")
+
+    patches = [mpatches.Patch(color="#" + v, label=k) for k, v in SIGNAL_HEX.items()]
+    ax.legend(handles=patches, fontsize=7, loc="lower right", framealpha=0.8, ncol=1)
+    fig.tight_layout()
+    return fig
 
 
 def _build_drug_report(drug, drug_sl, drug_arb, output_dir):
