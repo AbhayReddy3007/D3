@@ -12,7 +12,7 @@ API key read from .env  →  GEMINI_API_KEY
 Model: gemini-2.5-flash
 """
 
-
+from docx.shared import RGBColor
 import os
 import sys
 import io
