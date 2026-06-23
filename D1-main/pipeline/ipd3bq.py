@@ -7,6 +7,13 @@ Processes NON-BLOCKING patents per drug:
   Section 3: Density & Diversity interpretations
   Section 4: Circumvention Analysis per Patent Category
              (uses AlloyDB patent chunks + Gemini + Google Search grounding)
+
+Changes from original:
+  - fetch_relevant_chunks: no longer scans all collections when a patent is
+    absent from the primary collection. Returns [] immediately.
+  - _analyse_one_category: when no AlloyDB chunks are found for a category,
+    runs a Google Search-grounded Gemini call to produce a full circumvention
+    narrative (same JSON shape as the normal path) instead of a bare placeholder.
 """
 
 import os
@@ -264,6 +271,53 @@ Return JSON:
 If no information found for a field, return an empty list for that field.
 """
 
+# ── Online Circumvention Prompt (used when no AlloyDB chunks are available) ───
+# Combines the chunk-based and search-based prompts into a single grounded call
+# so we still produce a full, consistent result when local patent text is absent.
+
+CIRCUMVENTION_ONLINE_PROMPT = """
+You are a pharmaceutical patent attorney specialising in 505(b)(2) regulatory
+strategy and patent design-around analysis.
+
+No patent text is available in the local database for the "{claim_category}"
+category patents of "{drug}" (patent numbers: {patent_numbers}).
+
+Using publicly available information — FDA Drugs@FDA, the FDA Orange Book,
+scientific literature, and patent databases (e.g. USPTO, Espacenet) — perform
+a full circumvention analysis for this category.
+
+Evaluation Steps:
+1. Identify the typical key claim limitations found in "{claim_category}" patents
+   for drugs like "{drug}" based on public patent databases.
+2. Evaluate whether alternative solutions exist that omit at least one key limitation.
+3. Consider known approaches from FDA Drugs@FDA approval packages, FDA Orange Book
+   listed patents, and scientific literature.
+4. Assess whether a non-infringing product modification could still be regulatorily
+   viable under a 505(b)(2) pathway.
+
+Return ONLY a valid JSON object — no markdown, no explanation outside the JSON:
+{{
+  "claim_category": "{claim_category}",
+  "key_claim_limitations": ["<limitation 1>", "<limitation 2>", "<limitation 3>"],
+  "design_around_strategies": [
+    {{
+      "strategy": "<concise description of the design-around approach>",
+      "rationale": "<why this avoids infringement — which claim limitation is omitted>",
+      "feasibility": "High / Medium / Low",
+      "regulatory_pathway": "<how this could work under 505(b)(2) or other pathway>",
+      "prior_art_support": "<any known precedent from FDA approvals, Orange Book, or literature>"
+    }}
+  ],
+  "white_space_opportunities": ["<opportunity 1>", "<opportunity 2>"],
+  "overall_circumvention_difficulty": "Easy / Moderate / Difficult",
+  "fda_precedents": ["<relevant FDA approval or product demonstrating an alternative approach>"],
+  "orange_book_gaps": ["<product feature or design element not covered by listed patents>"],
+  "literature_alternatives": ["<published alternative approach from scientific literature>"],
+  "regulatory_viability": "<assessment of whether non-infringing modifications are regulatorily feasible>",
+  "summary": "<2-3 sentence overall assessment of circumvention potential for this category, noting that analysis is based on public sources as patent text was unavailable in the local database>"
+}}
+"""
+
 # ── Thicket Score ─────────────────────────────────────────────────────────────
 HIGH_DOMAIN_CATEGORIES = {
     "chemistry", "device", "manufacturing", "software",
@@ -448,9 +502,9 @@ def fetch_relevant_chunks(client, drug: str, source_file: str,
     Fetch chunks from AlloyDB using the 'Source File' column value,
     which matches the 'filename' metadata field stored during ingestion.
 
-    Strategy:
-      1. Try the drug-specific collection (fast path): patents_{drug}
-      2. If not found, scan ALL collections.
+    Only the drug-specific collection (patents_{drug}) is searched.
+    If the patent is not found there, an empty list is returned immediately —
+    no fallback scan of all collections is performed.
     """
     if not source_file.strip():
         print(f"    [WARN] Empty source_file passed to fetch_relevant_chunks")
@@ -475,7 +529,7 @@ def fetch_relevant_chunks(client, drug: str, source_file: str,
         except Exception:
             pass
 
-        # Phase 2: filename-only filter (fallback)
+        # Phase 2: filename-only filter (fallback within the same collection)
         if not docs:
             try:
                 results = collection.get(
@@ -500,7 +554,7 @@ def fetch_relevant_chunks(client, drug: str, source_file: str,
             return sum(1 for kw in sections if kw in t)
         return sorted(docs, key=relevance_score, reverse=True)[:top_k]
 
-    # ── 1. Primary: drug-specific collection ─────────────────────────────────
+    # Primary collection only — no fallback scan of all collections
     primary_coll_name = collection_name(drug)
     try:
         primary_coll = _alloydb_client.get_collection(primary_coll_name)
@@ -509,35 +563,11 @@ def fetch_relevant_chunks(client, drug: str, source_file: str,
             print(f"    [INFO] Found {len(docs)} chunks in collection "
                   f"'{primary_coll_name}' for '{exact_filename}'")
             return _rank_and_slice(docs)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"    [WARN] Could not query collection '{primary_coll_name}': {e}")
 
     print(f"    [INFO] '{exact_filename}' not found in primary collection "
-          f"'{primary_coll_name}' — scanning all collections...")
-
-    # ── 2. Fallback: search every collection ─────────────────────────────────
-    try:
-        all_collections = _alloydb_client.list_collections()
-    except Exception as e:
-        print(f"    [ERROR] Cannot list collections: {e}")
-        return []
-
-    for coll_obj in all_collections:
-        coll_name = coll_obj.name if hasattr(coll_obj, "name") else str(coll_obj)
-        if coll_name == primary_coll_name:
-            continue
-        try:
-            coll = _alloydb_client.get_collection(coll_name)
-            docs = _query_collection(coll)
-            if docs:
-                print(f"    [INFO] Found {len(docs)} chunks in fallback collection "
-                      f"'{coll_name}' for '{exact_filename}'")
-                return _rank_and_slice(docs)
-        except Exception as e:
-            print(f"    [WARN] Could not search collection '{coll_name}': {e}")
-            continue
-
-    print(f"    [WARN] No chunks found for '{exact_filename}' in any collection")
+          f"'{primary_coll_name}' — skipping patent (no fallback scan).")
     return []
 
 # ── Gemini Helpers ────────────────────────────────────────────────────────────
@@ -600,7 +630,14 @@ async def _analyse_one_category(
     gemini_client,
     search_config,
 ) -> tuple[str, dict]:
-    """Analyse a single category — runs Gemini scoring + FDA search."""
+    """Analyse a single category — runs Gemini scoring + FDA search.
+
+    If no AlloyDB chunks are found for any patent in this category, falls
+    back to a Google Search-grounded Gemini call (CIRCUMVENTION_ONLINE_PROMPT)
+    that populates the same JSON fields so downstream consumers always receive
+    a consistent result. The fallback does NOT run a second supplementary
+    search call — the online prompt already requests all required fields.
+    """
     print(f"\n[Circumvention] Category: {category} ({len(patents)} patent(s))")
 
     patent_numbers = [p["patent_number"] for p in patents]
@@ -622,6 +659,7 @@ async def _analyse_one_category(
     loop = asyncio.get_event_loop()
 
     if all_chunks:
+        # ── Normal path: use patent chunks ───────────────────────────────────
         chunks_text = "\n\n---\n\n".join(
             f"[Chunk {i+1}]\n{c}" for i, c in enumerate(all_chunks[:15])
         )
@@ -640,44 +678,84 @@ async def _analyse_one_category(
                 "design_around_strategies": [],
                 "summary": f"Error: {e}",
             }
-    else:
-        print(f"    [WARN] No AlloyDB chunks found for {category} patents")
-        result = {
-            "claim_category": category,
-            "design_around_strategies": [],
-            "summary": "No patent text available in AlloyDB for analysis.",
-        }
 
-    print(f"    Searching FDA/literature for {category} alternatives...")
-    search_prompt = CIRCUMVENTION_SEARCH_PROMPT.format(
-        drug=drug_name,
-        claim_category=category,
-        claim_category_lower=category.lower(),
-    )
-    try:
-        search_resp = await gemini_client.aio.models.generate_content(
-            model="gemini-2.5-flash", contents=search_prompt, config=search_config
+        # Supplement with FDA/literature search
+        print(f"    Searching FDA/literature for {category} alternatives...")
+        search_prompt = CIRCUMVENTION_SEARCH_PROMPT.format(
+            drug=drug_name,
+            claim_category=category,
+            claim_category_lower=category.lower(),
         )
-        search_json = _extract_json_from_response(
-            search_resp.text.strip() if search_resp.text else ""
+        try:
+            search_resp = await gemini_client.aio.models.generate_content(
+                model="gemini-2.5-flash", contents=search_prompt, config=search_config
+            )
+            search_json = _extract_json_from_response(
+                search_resp.text.strip() if search_resp.text else ""
+            )
+            if search_json:
+                search_data = _repair_json(search_json)
+                if isinstance(search_data, str):
+                    search_data = json.loads(search_data)
+                result["fda_precedents"]         = search_data.get("fda_precedents", [])
+                result["orange_book_gaps"]        = search_data.get("orange_book_gaps", [])
+                result["literature_alternatives"] = search_data.get("literature_alternatives", [])
+                result["regulatory_viability"]    = search_data.get("regulatory_viability", "")
+        except Exception as e:
+            print(f"    [WARN] FDA/literature search error: {e}")
+            result["fda_precedents"]         = []
+            result["orange_book_gaps"]        = []
+            result["literature_alternatives"] = []
+            result["regulatory_viability"]    = f"Search error: {e}"
+
+    else:
+        # ── Fallback path: no chunks found in primary collection ──────────────
+        # Run a single Google Search-grounded Gemini call that populates ALL
+        # required fields in one shot (no second supplementary call needed).
+        print(f"    [INFO] No AlloyDB chunks for '{category}' patents of '{drug_name}' "
+              f"— generating circumvention narrative via online search...")
+
+        online_prompt = CIRCUMVENTION_ONLINE_PROMPT.format(
+            claim_category=category,
+            drug=drug_name,
+            patent_numbers=", ".join(str(x) for x in patent_numbers),
         )
-        if search_json:
-            search_data = _repair_json(search_json)
-            if isinstance(search_data, str):
-                search_data = json.loads(search_data)
-            result["fda_precedents"] = search_data.get("fda_precedents", [])
-            result["orange_book_gaps"] = search_data.get("orange_book_gaps", [])
-            result["literature_alternatives"] = search_data.get("literature_alternatives", [])
-            result["regulatory_viability"] = search_data.get("regulatory_viability", "")
-    except Exception as e:
-        print(f"    [WARN] FDA/literature search error: {e}")
-        result["fda_precedents"] = []
-        result["orange_book_gaps"] = []
-        result["literature_alternatives"] = []
-        result["regulatory_viability"] = f"Search error: {e}"
+        try:
+            online_resp = await gemini_client.aio.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=online_prompt,
+                config=search_config,  # Google Search grounding active
+            )
+            online_json = _extract_json_from_response(
+                online_resp.text.strip() if online_resp.text else ""
+            )
+            if online_json:
+                result = _repair_json(online_json)
+                if isinstance(result, str):
+                    result = json.loads(result)
+                print(f"    [INFO] Online narrative generated successfully for '{category}'")
+            else:
+                raise ValueError("Empty or unparseable response from online search prompt")
+        except Exception as e:
+            print(f"    [WARN] Online circumvention search error: {e}")
+            result = {
+                "claim_category": category,
+                "key_claim_limitations": [],
+                "design_around_strategies": [],
+                "white_space_opportunities": [],
+                "overall_circumvention_difficulty": "N/A",
+                "fda_precedents": [],
+                "orange_book_gaps": [],
+                "literature_alternatives": [],
+                "regulatory_viability": f"Search error: {e}",
+                "summary": (
+                    "Patent text was unavailable in the local database and the "
+                    "online search also failed. Manual review required."
+                ),
+            }
 
     result["patent_numbers"] = patent_numbers
-    result["patent_count"] = len(patents)
+    result["patent_count"]   = len(patents)
     print(f"    Found {len(result.get('design_around_strategies', []))} strategies")
 
     return category, result
