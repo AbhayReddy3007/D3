@@ -234,7 +234,11 @@ def load_data_from_bigquery() -> tuple[pd.DataFrame, pd.DataFrame]:
 # ═══════════════════════════════════════════════════════════════════════════
 #  GEMINI SETUP
 # ═══════════════════════════════════════════════════════════════════════════
-load_dotenv(override=True)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
+except ImportError:
+    pass  # Cloud Run: env vars set via job config, no .env needed
 GEMINI_MODEL = "gemini-2.5-flash"
 _genai_client = None
 
