@@ -51,6 +51,13 @@ _RED        = colors.HexColor("#CC0000")
 _GREEN      = colors.HexColor("#008000")
 _GREY       = colors.HexColor("#666666")
 
+def _esc(text):
+    """Escape text for reportlab Paragraph XML: & < > must be entities."""
+    if not isinstance(text, str):
+        text = str(text) if text is not None else ""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _rl_styles():
     b = getSampleStyleSheet()
     return {
@@ -754,7 +761,7 @@ def build_report(data: dict, output_path: str):
 
     # ── Executive Summary ──
     story.append(Paragraph("Executive Summary", st["h1"]))
-    story.append(Paragraph(narrative.get("executive_summary", ""), st["body"]))
+    story.append(Paragraph(_esc(narrative.get("executive_summary", "")), st["body"]))
     story.append(Spacer(1, 6))
 
     # ── Portfolio Overview ──
@@ -783,7 +790,7 @@ def build_report(data: dict, output_path: str):
     # ── Key Findings ──
     story.append(Paragraph("Key Findings", st["h1"]))
     for finding in narrative.get("key_findings", []):
-        story.append(Paragraph(f"&bull; {finding}", st["bullet"]))
+        story.append(Paragraph(f"&bull; {_esc(finding)}", st["bullet"]))
     story.append(Spacer(1, 6))
 
     # ── Patent Score Summary Table ──
@@ -813,7 +820,7 @@ def build_report(data: dict, output_path: str):
         hn = narrative.get("highest_score_narrative", "")
         if hn:
             story.append(Paragraph("<b>In-Depth Analysis</b>", st["h2"]))
-            story.append(Paragraph(hn, st["body"]))
+            story.append(Paragraph(_esc(hn), st["body"]))
         story.append(Spacer(1, 8))
 
     # ── Highest Score per Jurisdiction ──
@@ -847,21 +854,21 @@ def build_report(data: dict, output_path: str):
         csn = narrative.get("country_score_narrative", "")
         if csn:
             story.append(Paragraph("<b>Geographic Risk Analysis</b>", st["h2"]))
-            story.append(Paragraph(csn, st["body"]))
+            story.append(Paragraph(_esc(csn), st["body"]))
         story.append(Spacer(1, 8))
 
     # ── Sub-Factor Analysis ──
     sf_text = narrative.get("sf_analysis", "")
     if sf_text:
         story.append(Paragraph("Sub-Factor Analysis", st["h1"]))
-        story.append(Paragraph(sf_text, st["body"]))
+        story.append(Paragraph(_esc(sf_text), st["body"]))
 
     # ── Risk & Strength ──
     story.append(Paragraph("Risk &amp; Strength Analysis", st["h1"]))
     story.append(Paragraph('<font color="#CC0000"><b>Highest Risk Patents</b></font>', st["h2"]))
-    story.append(Paragraph(narrative.get("risk_highlights", "N/A"), st["body"]))
+    story.append(Paragraph(_esc(narrative.get("risk_highlights", "N/A")), st["body"]))
     story.append(Paragraph('<font color="#008000"><b>Most Robust Patents</b></font>', st["h2"]))
-    story.append(Paragraph(narrative.get("strength_highlights", "N/A"), st["body"]))
+    story.append(Paragraph(_esc(narrative.get("strength_highlights", "N/A")), st["body"]))
 
     # ── Per-Drug Breakdown ──
     per_drug = narrative.get("per_drug_narratives", {})
@@ -873,7 +880,7 @@ def build_report(data: dict, output_path: str):
             ds = stats.get("per_drug_stats",{}).get(dn,{})
             if ds:
                 story.append(Paragraph(f'<i><font color="#666666">Patents: {ds.get("count","N/A")} | Avg: {ds.get("avg_score","N/A")} | Range: {ds.get("min_score","N/A")}–{ds.get("max_score","N/A")}</font></i>', st["body"]))
-            story.append(Paragraph(dn_nar, st["body"]))
+            story.append(Paragraph(_esc(dn_nar), st["body"]))
             story.append(Spacer(1, 4))
 
     # ── Sub-Factor Framework Table ──
