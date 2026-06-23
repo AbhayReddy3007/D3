@@ -24,13 +24,6 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ── Load .env ─────────────────────────────────────────────────────────────────
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # Not needed on Cloud Run
-
 import pandas as pd
 from google.cloud import bigquery
 from google.oauth2 import service_account
