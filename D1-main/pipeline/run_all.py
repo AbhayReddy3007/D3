@@ -6,9 +6,9 @@ Runs the full LOE pipeline, parallelising drug-level work
 within each stage using a process pool.
 
 Drug discovery:
-  Drugs are sourced from the `clinical_efficacy` BigQuery table
-  (the same table used by phase_fetcher.py). Only drugs present
-  in that table are processed.
+  Drugs are sourced from the canonical GLP-1 universe query against
+  `vw_drug_details_full` (via cog/drug_filter.py). Only GLP-1 agonist
+  drugs present in that view are processed.
 
 Cloud Run Jobs support:
   When CLOUD_RUN_TASK_COUNT > 1 each container only processes its
@@ -134,14 +134,16 @@ def run_step(label, cmd, cwd=None, dry_run=False):
     print(f"  {GREEN}✓ Done in {elapsed:.1f}s{RESET}\n")
 
 
-# ── Drug discovery from BigQuery clinical_efficacy ────────────────────────────
+# ── Drug discovery from BigQuery vw_drug_details_full (GLP-1 universe) ─────────
 
 def discover_drugs():
     """
-    Discover drugs from the clinical_efficacy BigQuery table.
+    Discover drugs from the canonical GLP-1 drug universe query
+    (vw_drug_details_full via cog/drug_filter.py).
 
-    Returns a sorted list of distinct, non-empty molecule names.
-    Also identifies marketed drugs (highest phase = Marketed/Approved/Launched).
+    Returns a sorted list of distinct GLP-1 drug names.
+    Also identifies marketed drugs (highest phase = Marketed/Approved/Launched)
+    by querying clinical_efficacy for phase data.
     """
     try:
         from dotenv import load_dotenv
@@ -149,6 +151,21 @@ def discover_drugs():
     except ImportError:
         pass
 
+    from cog import drug_filter
+
+    # ── Pull drug list directly from the GLP-1 universe query ──────────────
+    print(f"[DISCOVERY] Querying GLP-1 drug universe from "
+          f"vw_drug_details_full ...")
+    drugs = drug_filter.fetch_allowed_drug_names()
+
+    if not drugs:
+        print(f"{RED}ERROR: No GLP-1 drugs found in vw_drug_details_full. "
+              f"Check BigQuery access and the drug universe view.{RESET}")
+        sys.exit(1)
+
+    print(f"[DISCOVERY] {len(drugs)} GLP-1 drug(s) found in the canonical universe")
+
+    # ── Identify marketed drugs from clinical_efficacy (phase data) ─────────
     from google.cloud import bigquery
     from google.oauth2 import service_account
 
@@ -160,76 +177,40 @@ def discover_drugs():
     dataset_id = os.getenv("BQ_DATASET_ID")
     table_name = os.getenv("BQ_TABLE_NAME", "clinical_efficacy")
 
-    if not project_id or not dataset_id:
-        print(f"{RED}ERROR: BQ_PROJECT_ID / PROJECT_ID and BQ_DATASET_ID must be set{RESET}")
-        sys.exit(1)
-
-    fq_table = f"{project_id}.{dataset_id}.{table_name}"
-    print(f"[DISCOVERY] Querying distinct drugs from {fq_table} ...")
-
-    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    if creds_path and os.path.exists(creds_path):
-        creds  = service_account.Credentials.from_service_account_file(creds_path)
-        client = bigquery.Client(credentials=creds, project=project_id)
-    else:
-        client = bigquery.Client(project=project_id)
-
-    query = f"""
-    SELECT DISTINCT TRIM(molecule_name) AS drug
-    FROM `{fq_table}`
-    WHERE molecule_name IS NOT NULL
-      AND TRIM(molecule_name) != ''
-    ORDER BY drug
-    """
-
-    try:
-        rows = client.query(query).result()
-        drugs = [row.drug for row in rows]
-    except Exception as e:
-        print(f"{RED}ERROR: Failed to query {fq_table}: {e}{RESET}")
-        sys.exit(1)
-
-    if not drugs:
-        print(f"{RED}ERROR: No drugs found in {fq_table}{RESET}")
-        sys.exit(1)
-
-    # ── Restrict to the GLP-1 drug universe ────────────────────────────────
-    # `clinical_efficacy` may contain drugs outside the GLP-1 scope (other
-    # therapy areas, legacy rows, etc). The canonical definition of "in
-    # scope" is the vw_drug_details_full query in cog/drug_filter.py — every
-    # downstream stage (patents, forecast, IPD, reports) is driven by the
-    # list returned here, so filtering happens once, up front.
-    from cog import drug_filter
-    before = len(drugs)
-    drugs = drug_filter.filter_allowed_drugs(drugs)
-    if before != len(drugs):
-        print(f"[DISCOVERY] {before - len(drugs)} non-GLP-1 drug(s) excluded "
-              f"from clinical_efficacy; {len(drugs)} remaining in scope")
-    if not drugs:
-        print(f"{RED}ERROR: No GLP-1 drugs remain after filtering {fq_table} "
-              f"against the canonical drug universe.{RESET}")
-        sys.exit(1)
-
-    # Identify marketed drugs
-    marketed_query = f"""
-    SELECT DISTINCT TRIM(molecule_name) AS drug
-    FROM `{fq_table}`
-    WHERE molecule_name IS NOT NULL
-      AND LOWER(TRIM(phase)) IN ('marketed', 'approved', 'launched', 'registered')
-    """
     global MARKETED_DRUGS
     MARKETED_DRUGS = set()
-    try:
-        marketed_rows = client.query(marketed_query).result()
-        MARKETED_DRUGS = {row.drug for row in marketed_rows}
-        if MARKETED_DRUGS:
-            print(f"[DISCOVERY] {len(MARKETED_DRUGS)} marketed drug(s) (will skip forecasting):")
-            for d in sorted(MARKETED_DRUGS):
-                print(f"    ⊘ {d}")
-    except Exception as e:
-        print(f"{YELLOW}[DISCOVERY] Could not identify marketed drugs: {e}{RESET}")
 
-    print(f"[DISCOVERY] {len(drugs)} drug(s) total, {len(drugs) - len(MARKETED_DRUGS)} eligible for forecast")
+    if project_id and dataset_id:
+        fq_table = f"{project_id}.{dataset_id}.{table_name}"
+
+        creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if creds_path and os.path.exists(creds_path):
+            creds  = service_account.Credentials.from_service_account_file(creds_path)
+            client = bigquery.Client(credentials=creds, project=project_id)
+        else:
+            client = bigquery.Client(project=project_id)
+
+        marketed_query = f"""
+        SELECT DISTINCT TRIM(molecule_name) AS drug
+        FROM `{fq_table}`
+        WHERE molecule_name IS NOT NULL
+          AND LOWER(TRIM(phase)) IN ('marketed', 'approved', 'launched', 'registered')
+        """
+        try:
+            marketed_rows = client.query(marketed_query).result()
+            MARKETED_DRUGS = {row.drug for row in marketed_rows}
+            if MARKETED_DRUGS:
+                print(f"[DISCOVERY] {len(MARKETED_DRUGS)} marketed drug(s) (will skip forecasting):")
+                for d in sorted(MARKETED_DRUGS):
+                    print(f"    ⊘ {d}")
+        except Exception as e:
+            print(f"{YELLOW}[DISCOVERY] Could not identify marketed drugs: {e}{RESET}")
+    else:
+        print(f"{YELLOW}[DISCOVERY] BQ_PROJECT_ID / BQ_DATASET_ID not set — "
+              f"cannot identify marketed drugs; all drugs will be forecast-eligible{RESET}")
+
+    print(f"[DISCOVERY] {len(drugs)} drug(s) total, "
+          f"{len(drugs) - len(MARKETED_DRUGS)} eligible for forecast")
     for i, d in enumerate(drugs):
         marker = " [MARKETED]" if d in MARKETED_DRUGS else ""
         print(f"  {i + 1:>3}. {d}{marker}")
