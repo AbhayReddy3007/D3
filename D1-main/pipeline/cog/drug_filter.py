@@ -161,6 +161,24 @@ def fetch_allowed_drugs(force_refresh: bool = False, project_id: str = None,
         return norm_set
 
 
+def fetch_allowed_drug_names(force_refresh: bool = False, project_id: str = None,
+                              dataset_id: str = None) -> List[str]:
+    """Return the sorted list of allowed GLP-1 drug names with original casing.
+
+    Unlike fetch_allowed_drugs() which returns normalized names for matching,
+    this returns the original-cased names from BigQuery's cleaned_generic_name
+    column — suitable for direct use as the pipeline's drug list.
+
+    Returns an empty list if the query fails or filtering is disabled.
+    """
+    fetch_allowed_drugs(force_refresh=force_refresh, project_id=project_id,
+                        dataset_id=dataset_id)
+    with _lock:
+        if _cached_display is None:
+            return []
+        return sorted(_cached_display.values())
+
+
 def is_allowed_drug(drug_name: str, allowed: Optional[Set[str]] = None) -> bool:
     """True if drug_name matches (fuzzy) a name returned by the GLP-1 query.
 
