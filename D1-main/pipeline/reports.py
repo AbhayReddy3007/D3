@@ -57,13 +57,13 @@ def _filter_drugs(drug_list):
 
 # Report manifest: (module_file, report_label, gcs_filename)
 REPORT_MANIFEST = [
-    ("1bqreport.py",      "LOE Primary Market",      "1.Primary Market Entry Horizon.pdf"),
-    ("2bqreport.py",      "Patent Strength",          "2.Patent Strength and Invalidity Opportunity.pdf"),
-    ("3bqreport.py",      "Patent Thicket",           "3.Patent Thicket and Circumvention Feasibility.pdf"),
-    ("4bqreport.py",      "Secondary Market LOE",     "4.Global Launch Sequencing & Arbitrage.pdf"),
-    ("PTE_analysis",      "PTE Analysis",             "5.PTE Analysis.pdf"),
-    ("bq_block.py",       "Blocking Analysis",        "6.Blocking Analysis.pdf"),
-    ("forecast_report.py","Forecast Report",          "7.Forecast_Report.pdf"),
+    ("1bqreport.py",      "LOE Primary Market",      "Primary Market Entry Horizon.pdf"),
+    ("2bqreport.py",      "Patent Strength",          "Patent Strength and Invalidity Opportunity.pdf"),
+    ("3bqreport.py",      "Patent Thicket",           "Patent Thicket and Circumvention Feasibility.pdf"),
+    ("4bqreport.py",      "Secondary Market LOE",     "Global Launch Sequencing & Arbitrage.pdf"),
+    ("PTE_analysis",      "PTE Analysis",             "PTE Analysis.pdf"),
+    ("bq_block.py",       "Blocking Analysis",        "Blocking Analysis.pdf"),
+    ("forecast_report.py","Forecast Report",          "Forecast_Report.pdf"),
 ]
 
 
@@ -245,8 +245,8 @@ def _patch_module_env(mod, filename: str):
     # Patch the GCS_FILE_NAME for modules that have one (1bqreport, 2bqreport)
     # so the internal upload also uses the new filename
     GCS_FILENAME_MAP = {
-        "1bqreport.py":  "1.Primary Market Entry Horizon.pdf",
-        "2bqreport.py":  "2.Patent Strength and Invalidity Opportunity.pdf",
+        "1bqreport.py":  "Primary Market Entry Horizon.pdf",
+        "2bqreport.py":  "Patent Strength and Invalidity Opportunity.pdf",
     }
     if filename in GCS_FILENAME_MAP and hasattr(mod, "GCS_FILE_NAME"):
         mod.GCS_FILE_NAME = GCS_FILENAME_MAP[filename]
